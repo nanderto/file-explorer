@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# gpui is pre-1.0 and tracks Zed's main branch; pin an exact rev and upgrade
+# only at milestone boundaries (see CLAUDE.md). This rev includes
+# VisualTestAppContext (real Metal rendering + deterministic TestDispatcher).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "fd82517a115d97a07835b52f0512b22b38e38ccf", default-features = false, features = ["font-kit", "windows-manifest"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fd82517a115d97a07835b52f0512b22b38e38ccf", features = ["font-kit"] }
+anyhow = "1.0.86"
+# Must stay semver-compatible with Zed's `image` so RgbaImage from
+# gpui::VisualTestAppContext::capture_screenshot unifies with ours.
+image = { version = "0.25.1", default-features = false, features = ["png"] }
+
+[profile.dev]
+# gpui is slow in unoptimized builds; keep dependencies optimized.
+[profile.dev.package."*"]
+opt-level = 2
