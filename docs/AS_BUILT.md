@@ -46,6 +46,17 @@ GPUI window skeleton and visual regression test infrastructure.
 ### theme (crate)
 - Not started (interim `theme` module lives inside `crates/app`).
 
+### Architecture (Phase A)
+- `docs/ARCHITECTURE.md` — the entity/module blueprint for M1–M8, produced by an
+  orchestrated workflow (4 source-research agents over Zed @ pinned rev,
+  gpui-component, adabraka-ui → 3 independent drafts → 3-judge panel →
+  synthesis). Contains the behavior→action traceability table (source of truth
+  for `keymap.rs`), entity graph, data-flow diagrams, threading model, fs-core
+  internals, widget build-list, testing map, and per-milestone build order.
+- `.claude/agents/` — Orchestrator/Proposer/Critic/Builder/Reviewer agent pack
+  used to drive milestone workflows (Phase B).
+- `docs/KICKOFF_PROMPT.md` — the standing build directive for new sessions.
+
 ## Deviations from the plan
 
 - Theme lives as a module in `crates/app` instead of its own crate until the
@@ -53,6 +64,13 @@ GPUI window skeleton and visual regression test infrastructure.
   near-empty crate.
 - Visual regression testing (not explicitly in the plan's testing section) was
   added ahead of M1, modeled on Zed's visual test runner.
+- **gpui-component is NOT adopted**, overturning plan §4: it floats on zed main
+  (no rev pin) which conflicts structurally with our `fd82517a` pin (required by
+  `VisualTestAppContext`), its dialogs/menus demand an all-or-nothing `Root`
+  runtime, and it drags heavy deps. Instead: ~6 hand-built widgets on gpui
+  primitives + adabraka-ui's MIT text input vendored via `crates/app/VENDORED.md`.
+  Full rationale and revisit conditions: ARCHITECTURE.md §7. Plan §4 amendment
+  pending.
 
 ## Change log
 
@@ -60,3 +78,4 @@ GPUI window skeleton and visual regression test infrastructure.
 |---|---|---|
 | 2026-08-22 | — | Repo bootstrapped: plan, CLAUDE.md, quality gate, hooks, CI, this file. |
 | 2026-08-22 | — | Cargo workspace + M0 window skeleton (`WorkspaceView`, dark/light `Theme`); GPUI visual regression tests (runner binary, unit-tested pixel diff, baselines dir, CI job, baseline-update workflow). |
+| 2026-08-22 | — | Phase A: `docs/ARCHITECTURE.md` via orchestrated research/draft/judge workflow; gpui-component rejected (see Deviations); agent pack (`.claude/agents/`) and kickoff prompt added. |
