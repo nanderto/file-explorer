@@ -1,0 +1,5 @@
+# Matches the toolchain Zed's pinned gpui rev is developed against.
+# Keep in sync when bumping the gpui rev in Cargo.toml.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

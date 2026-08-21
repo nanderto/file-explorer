@@ -18,6 +18,16 @@ A native macOS file manager in Rust on GPUI, with Windows File Explorer behavior
 - All tests: `cargo test --workspace`
 - One crate: `cargo test -p fs-core`
 - Full local gate (exactly what hooks/CI run): `bash scripts/gate.sh push`
+- Visual regression tests (macOS only): `cargo run -p file-explorer-app --bin visual_test_runner --features visual-tests`
+
+## Visual regression tests
+
+- Baselines live in `crates/app/test_fixtures/visual_tests/*.png`; the CI job `Visual regression tests (macOS)` renders off-screen windows with `gpui::VisualTestAppContext` and compares against them (≥99% pixel match, per-channel tolerance 3).
+- Scenarios are declared in `crates/app/src/bin/visual_test_runner.rs` (`scenarios()`); add one for every new UI state worth pinning.
+- When the UI **intentionally** changes, regenerate baselines from the PR branch — never hand-edit or locally regenerate them (this machine is Windows; baselines must come from the same macOS runner image CI compares on):
+  `gh workflow run update-visual-baselines.yml --ref <branch>` — it commits updated PNGs back to the branch.
+- A visual-test failure uploads the captured screenshots and red/dimmed diff images as the `visual-test-output` CI artifact — inspect those before touching baselines.
+- Keep renders deterministic: fixed window size (1200×760), fixed font (`Helvetica`), no wall-clock-dependent UI in captured states.
 
 ## Definition of done — every change, every PR
 

@@ -1,0 +1,30 @@
+[package]
+name = "file-explorer-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "file_explorer_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "file-explorer"
+path = "src/main.rs"
+
+# Visual regression test runner (macOS only at runtime; compiles everywhere).
+# Run:            cargo run -p file-explorer-app --bin visual_test_runner --features visual-tests
+# Update baseline: UPDATE_BASELINE=1 cargo run -p file-explorer-app --bin visual_test_runner --features visual-tests
+[[bin]]
+name = "visual_test_runner"
+path = "src/bin/visual_test_runner.rs"
+required-features = ["visual-tests"]
+
+[features]
+visual-tests = ["gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+image.workspace = true
