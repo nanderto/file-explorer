@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/format-rs.sh\"",
+            "timeout": 30,
+            "statusMessage": "rustfmt"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/scripts/hooks/pre-bash-gate.sh\"",
+            "timeout": 900,
+            "statusMessage": "Quality gate: build · clippy · fmt · tests · docs"
+          }
+        ]
+      }
+    ]
+  }
+}

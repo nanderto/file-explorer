@@ -1,0 +1,9 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Claude Code — personal overrides stay local
+.claude/settings.local.json

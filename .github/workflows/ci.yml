@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build, lint, test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect cargo workspace
+        id: detect
+        run: echo "has_cargo=$([ -f Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        if: steps.detect.outputs.has_cargo == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        if: steps.detect.outputs.has_cargo == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo fmt --all --check
+
+      - name: Build (workspace, all targets)
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy (warnings are errors)
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests (lib targets)
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo test --workspace --lib --bins
+
+      - name: Integration + UI tests (tests/ targets and #[gpui::test])
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo test --workspace
+
+  docs-and-tests-updated:
+    name: Docs & tests accompany code
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check AS_BUILT.md and tests were updated with code
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-checks') }}
+        run: bash scripts/gate.sh ci-diff "origin/${{ github.base_ref }}"
+
+  # Aggregate check — the ONLY required status check in branch protection.
+  # Requiring this single "CI" context means adding/renaming jobs above never
+  # requires touching the branch-protection config (just add them to `needs`).
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [build-and-test, docs-and-tests-updated]
+    if: always()
+    steps:
+      - name: Verify required jobs
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "job results: $results"
+          for r in $results; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "A required job failed or was cancelled"; exit 1 ;;
+            esac
+          done

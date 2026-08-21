@@ -1,0 +1,5 @@
+# Shell scripts must stay LF — CRLF breaks bash (hooks, gate, CI) on every platform.
+*.sh text eol=lf
+# Everything else: normalize in the repo, platform-native in working copies.
+* text=auto
+*.png binary
