@@ -32,7 +32,7 @@ fn main() {
 mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
     use file_explorer_app::{Theme, WorkspaceView, visual_diff};
-    use gpui::{AnyWindowHandle, VisualTestAppContext, px, size};
+    use gpui::{AnyWindowHandle, AppContext as _, VisualTestAppContext, px, size};
     use std::path::PathBuf;
 
     /// Minimum fraction of matching pixels for a test to pass.
