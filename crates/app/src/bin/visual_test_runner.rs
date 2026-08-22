@@ -172,7 +172,6 @@ mod macos {
 
     fn run(update_baseline: bool) -> Result<()> {
         let mut cx = VisualTestAppContext::new(gpui_platform::current_platform(false));
-        install_fixture_vfs(&mut cx);
         cx.update(|cx| {
             keymap::init(cx);
         });
@@ -328,6 +327,14 @@ mod macos {
         setup: Setup,
         update_baseline: bool,
     ) -> Result<ScenarioResult> {
+        // Fresh fixture + job spine per scenario. The queue and `JobsModel`
+        // are globals, so a single install would let one scenario's state
+        // bleed into every later one — `conflict_dialog` parks a job forever,
+        // which would paint its titlebar "1 job" indicator into the baselines
+        // of every scenario declared after it. Same reason the window is
+        // closed below: scenarios must not depend on declaration order.
+        install_fixture_vfs(cx);
+
         let mut workspace_slot: Option<Entity<Workspace>> = None;
         let window = cx
             .open_offscreen_window(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), |window, cx| {

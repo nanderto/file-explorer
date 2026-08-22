@@ -124,8 +124,11 @@ scenarios remain. 182 tests green (88 fs-core unit + 3 integration + 91 app).
   and preselects the **stem** via `fs_core::split_name` (now `pub`, so the
   split is shared rather than re-implemented), focuses it and subscribes to
   its focus loss. `views/details_list.rs` swaps that row's name cell for the
-  editor, wiring `Confirm`/`Cancel` plus the vendored input's editing actions
-  in a row-level `TextInput` key context (same pattern as `address_bar.rs`);
+  editor (the Size / Date cells stay filled — only the name cell changes,
+  which is what Explorer does; `size_cell` is shared by both row renderers so
+  the column can't diverge), wiring `Confirm`/`Cancel` plus the vendored
+  input's editing actions in a row-level `TextInput` key context (same
+  pattern as `address_bar.rs`);
   the row `track_focus`es the editor's handle so those actions actually
   resolve. `Confirm` validates locally (nonempty, no path separator, trimmed;
   an unchanged name just closes), then submits `FileOp::Rename` and shows the
@@ -257,10 +260,13 @@ scenarios remain. 182 tests green (88 fs-core unit + 3 integration + 91 app).
   `/home/Documents`, then `begin_rename`s `report.pdf` so the row editor
   renders with the stem selected). The runner installs the FakeVfs fixture
   **and** a fixture settings file (two favorites) via
-  `settings::init_with_path`, so all content is deterministic. The
-  `conflict_dialog` and `details_rename_editing` baselines must be generated
-  via the update-visual-baselines workflow on the PR branch; existing
-  baselines are unchanged (the jobs indicator renders nothing while idle).
+  `settings::init_with_path`, so all content is deterministic. The fixture +
+  job spine are installed **per scenario**, not once for the run: the queue
+  and `JobsModel` are globals, so a single install let `conflict_dialog`'s
+  permanently parked job paint its titlebar "1 job" indicator into every
+  scenario declared after it (caught the first time a scenario was added
+  below it). Baselines for new scenarios must be generated via the
+  update-visual-baselines workflow on the PR branch.
 - CI: `Visual regression tests (macOS)` job runs the comparison per PR;
   `update-visual-baselines.yml` (manual dispatch, non-main branches) regenerates
   baselines on the same runner image and commits them to the branch.
@@ -504,10 +510,11 @@ component sections; this list is the scannable index.
   creates `"New Folder"` / `"New Folder 2"` via `next_available_name` and
   leaves it named. Now that the rename editor exists, wiring the create path
   to open it on the new row is a small follow-up. *M3 remainder.*
-- **`details_rename_editing` baseline not yet generated** — the scenario is
-  declared in `visual_test_runner.rs`, but its PNG must come from the macOS
-  runner (`gh workflow run update-visual-baselines.yml`), so the visual job
-  fails until that runs. *Immediately, on this branch.*
+- **`details_rename_editing` baseline needs regenerating** — the first
+  generated PNG carried `conflict_dialog`'s leaked "1 job" indicator and the
+  rename row's then-empty Size/Date cells; both are fixed, so the baseline
+  must be re-dispatched (`gh workflow run update-visual-baselines.yml`) and
+  the other eight confirmed unchanged. *Immediately, on this branch.*
 
 - **Symlink copy policy** — copy dereferences file links; symlink-to-dir inside
   a copied tree fails the job (details under fs-core). *Revisit when a

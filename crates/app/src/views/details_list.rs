@@ -152,11 +152,7 @@ fn render_row(
     // in the FsContext clipboard at render).
     let cut_pending = FsContext::global(cx).clipboard.is_cut(&entry.path);
     let name: SharedString = SharedString::new(entry.name.clone());
-    let size: SharedString = if entry.is_dir_like() {
-        SharedString::new_static("—")
-    } else {
-        SharedString::new(format_bytes(entry.size))
-    };
+    let size = size_cell(entry);
     let modified: SharedString = SharedString::new(format_modified(entry.modified));
     let click_entry = entry.clone();
 
@@ -246,6 +242,16 @@ fn render_row(
     styled_row
 }
 
+/// The Size column's text: folders show an em dash, files their byte size.
+/// Shared by the normal and the rename row so the column can't diverge.
+fn size_cell(entry: &fs_core::FileEntry) -> SharedString {
+    if entry.is_dir_like() {
+        SharedString::new_static("—")
+    } else {
+        SharedString::new(format_bytes(entry.size))
+    }
+}
+
 /// The row of the entry being renamed (ARCHITECTURE.md §4c/§8): the name
 /// cell is the vendored [`ti`] editor (or, once `Confirm` has submitted the
 /// op, the plain pending name — not editable); `Confirm`/`Cancel` and the
@@ -267,6 +273,10 @@ fn render_rename_row(
     let processing = rename.processing().cloned();
     let error = rename.error().cloned();
     let depth = row.depth;
+    // Explorer keeps the Size / Date columns filled while a row is being
+    // renamed — only the name cell becomes the editor.
+    let size = size_cell(&row.entry);
+    let modified: SharedString = SharedString::new(format_modified(row.entry.modified));
 
     let name_area: gpui::AnyElement = if let Some(pending) = processing {
         div()
@@ -351,8 +361,24 @@ fn render_rename_row(
         .child(div().w(px(depth as f32 * DISCLOSURE_WIDTH)).flex_none())
         .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
         .child(name_area)
-        .child(div().w(px(SIZE_COL_WIDTH)).flex_none())
-        .child(div().w(px(DATE_COL_WIDTH)).flex_none());
+        .child(
+            div()
+                .w(px(SIZE_COL_WIDTH))
+                .flex_none()
+                .flex()
+                .justify_end()
+                .text_color(theme.muted)
+                .child(size),
+        )
+        .child(
+            div()
+                .w(px(DATE_COL_WIDTH))
+                .flex_none()
+                .flex()
+                .justify_end()
+                .text_color(theme.muted)
+                .child(modified),
+        );
 
     if let Some(message) = error {
         styled_row = styled_row.child(deferred(
@@ -439,6 +465,28 @@ mod tests {
         assert_eq!(format_modified(at(1_709_208_000)), "2024-02-29 12:00");
         // Pre-epoch times must not panic and stay calendar-correct.
         assert_eq!(format_modified(at(-86_400)), "1969-12-31 00:00");
+    }
+
+    #[test]
+    fn size_cell_dashes_folders_and_formats_files() {
+        let entry = |kind, size| fs_core::FileEntry {
+            path: std::sync::Arc::from(std::path::Path::new("/root/x")),
+            name: std::sync::Arc::from("x"),
+            kind,
+            size,
+            modified: at(0),
+            created: None,
+            hidden: false,
+        };
+        assert_eq!(
+            size_cell(&entry(fs_core::EntryKind::Dir, 4096)).as_ref(),
+            "—",
+            "folders never show a byte count"
+        );
+        assert_eq!(
+            size_cell(&entry(fs_core::EntryKind::File, 10)).as_ref(),
+            "10 B"
+        );
     }
 
     #[test]
