@@ -130,7 +130,9 @@ pub fn keep_both_candidates(name: &str) -> impl Iterator<Item = String> + '_ {
 
 /// Split `"report.pdf"` into `("report", ".pdf")`. Dotfiles and extensionless
 /// names keep the whole name as the stem: `(".env", "")`, `("folder", "")`.
-fn split_name(name: &str) -> (&str, &str) {
+/// `pub`: also the basis of the app's rename stem preselection
+/// (ARCHITECTURE.md §4c) — one split, reused rather than re-implemented.
+pub fn split_name(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(ix) if ix > 0 => name.split_at(ix),
         _ => (name, ""),

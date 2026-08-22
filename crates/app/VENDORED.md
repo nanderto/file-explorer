@@ -27,5 +27,11 @@ of a dependency update.
      selection — surprising append semantics for a setter).
   7. `#[allow(dead_code)]` on `shake_count` (we don't render adabraka's shake
      animation).
+  8. Added `pub fn select_range` (M3): programmatic arbitrary-range
+     selection for the inline rename editor's stem preselect — upstream only
+     exposes whole-content selection via `select_all`.
+  9. Added `pub fn selected_range` (M3): read access to the current
+     selection, so callers (and tests) can assert on it — upstream keeps it
+     private.
   Everything else (actions, `EntityInputHandler` impl, `InputTextElement`
   shaping/paint, validation, masking, IME marked-range handling) is unmodified.

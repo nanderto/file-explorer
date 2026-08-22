@@ -322,6 +322,14 @@ impl Pane {
     /// the fresh `list_dir` always runs on the background executor and
     /// replaces it, guarded by the generation counter.
     fn load(&mut self, path: Arc<Path>, restore: Option<NavEntry>, cx: &mut Context<Self>) {
+        // §4c "navigating away tears the editor down cleanly": in-place
+        // reloads (refresh, sort flip, hidden toggle, cache-miss back/
+        // forward to the *same* dir) keep an open rename; actually leaving
+        // the directory does not.
+        if self.path.as_deref() != Some(path.as_ref()) {
+            self.dir_view
+                .update(cx, |dir_view, cx| dir_view.cancel_rename_for_navigation(cx));
+        }
         self.generation += 1;
         let generation = self.generation;
         self.path = Some(path.clone());

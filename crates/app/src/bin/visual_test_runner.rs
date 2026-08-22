@@ -76,6 +76,9 @@ mod macos {
         /// Navigate, then submit a copy that parks on a conflict so the
         /// workspace opens the conflict modal (M3).
         ConflictDialogOpen(&'static str),
+        /// Navigate, then open the inline rename editor on one entry with its
+        /// stem preselected (M3, §4c).
+        RenameEditing(&'static str, &'static str),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -110,6 +113,11 @@ mod macos {
                 "conflict_dialog",
                 Theme::dark(),
                 Setup::ConflictDialogOpen("/home"),
+            ),
+            (
+                "details_rename_editing",
+                Theme::dark(),
+                Setup::RenameEditing("/home/Documents", "/home/Documents/report.pdf"),
             ),
         ]
     }
@@ -164,7 +172,6 @@ mod macos {
 
     fn run(update_baseline: bool) -> Result<()> {
         let mut cx = VisualTestAppContext::new(gpui_platform::current_platform(false));
-        install_fixture_vfs(&mut cx);
         cx.update(|cx| {
             keymap::init(cx);
         });
@@ -289,6 +296,26 @@ mod macos {
                     });
                 });
             }
+            Setup::RenameEditing(path, target) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                let dir_view = cx.read(|cx| pane.read(cx).dir_view().clone());
+                cx.update_window(handle, |_, window, cx| {
+                    dir_view.update(cx, |dir_view, cx| {
+                        let target = Path::new(target);
+                        let entry = dir_view
+                            .projected_rows(cx)
+                            .into_iter()
+                            .find(|row| row.entry.path.as_ref() == target)
+                            .map(|row| row.entry)
+                            .expect("rename target is listed in the fixture");
+                        dir_view.set_cursor(Some(entry.id()), cx);
+                        dir_view.begin_rename(&entry, window, cx);
+                    });
+                })
+                .map_err(|e| anyhow!("rename setup failed: {e:?}"))?;
+            }
         }
         Ok(())
     }
@@ -300,6 +327,14 @@ mod macos {
         setup: Setup,
         update_baseline: bool,
     ) -> Result<ScenarioResult> {
+        // Fresh fixture + job spine per scenario. The queue and `JobsModel`
+        // are globals, so a single install would let one scenario's state
+        // bleed into every later one — `conflict_dialog` parks a job forever,
+        // which would paint its titlebar "1 job" indicator into the baselines
+        // of every scenario declared after it. Same reason the window is
+        // closed below: scenarios must not depend on declaration order.
+        install_fixture_vfs(cx);
+
         let mut workspace_slot: Option<Entity<Workspace>> = None;
         let window = cx
             .open_offscreen_window(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), |window, cx| {

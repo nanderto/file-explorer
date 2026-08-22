@@ -29,6 +29,14 @@
 //! sorted/filtered at projection time with the snapshot's current
 //! `SortSpec`/hidden flag, so sort flips and the hidden toggle stay
 //! consistent without reloading children.
+//!
+//! **Inline rename (M3, §4c):** the view owns the rename state machine as a
+//! field (`rename: Option<RenameState>`, see [`crate::rename`]) — never its
+//! own entity. `RenameSelected` (`f2`) and the §0 *slow second click* both
+//! call `begin_rename`; while it is up the root key context gains the
+//! `renaming` token, which every `DirView && !renaming` binding is guarded
+//! by. `Duplicate` (`cmd-d`) submits `FileOp::Duplicate` for the selection
+//! (keep-both names planned by ops).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -37,17 +45,19 @@ use std::time::Duration;
 
 use fs_core::{ClipboardMode, EntryId, FileEntry, FileOp, ListingSnapshot, SortSpec, list_dir};
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
-    ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, div, point, prelude::*, px,
+    App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, Modifiers,
+    Render, ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, div, point,
+    prelude::*, px,
 };
 
 use crate::actions::{
-    CollapseSelected, Copy, Cut, DeleteToTrash, ExpandSelected, ExtendSelectionNext,
-    ExtendSelectionPrev, OpenSelected, PageDown, PageUp, Paste, SelectAll, SelectFirst, SelectLast,
-    SelectNext, SelectPrev,
+    CollapseSelected, Copy, Cut, DeleteToTrash, Duplicate, ExpandSelected, ExtendSelectionNext,
+    ExtendSelectionPrev, OpenSelected, PageDown, PageUp, Paste, RenameSelected, SelectAll,
+    SelectFirst, SelectLast, SelectNext, SelectPrev,
 };
 use crate::app_state::FsContext;
 use crate::pane::Pane;
+use crate::rename::RenameState;
 use crate::selection::SelectionModel;
 use crate::theme::Theme;
 use crate::views::details_list;
@@ -55,6 +65,14 @@ use crate::views::details_list;
 /// Quiet period after which the type-ahead prefix resets. Every keystroke
 /// restarts it (the previous timer task is dropped, cancelling it).
 pub const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// How long after a plain click the same row becomes *rename-armed* — the §0
+/// "slow second click" trigger. A second click that lands before this is a
+/// double-click (gpui reports `click_count >= 2`, which opens the entry and
+/// cancels the pending arm), so only a genuinely separate later click starts
+/// the inline editor. Runs on [`fs_core::Spawner::timer`], so tests drive it
+/// with fake time.
+pub const RENAME_CLICK_ARM_DELAY: Duration = Duration::from_millis(500);
 
 /// Rows to move on PageUp/PageDown when the list has not been laid out yet.
 const FALLBACK_PAGE_ROWS: usize = 20;
@@ -101,6 +119,16 @@ pub struct DirView {
     /// Dropping this cancels the pending reset — replacing it on every
     /// keystroke is what makes the timeout restart.
     _type_ahead_reset: Option<Task<()>>,
+    /// The in-flight inline rename (§4c), if any — a field, not an entity.
+    /// `pub(crate)` because `views/details_list.rs` renders the row swap and
+    /// [`crate::rename`] drives the machine.
+    pub(crate) rename: Option<RenameState>,
+    /// The row a slow second click would rename (§0 Rename trigger): set by
+    /// the arming timer a beat after a plain click selected it, cleared by any
+    /// other interaction.
+    rename_armed: Option<EntryId>,
+    /// Dropping this cancels a pending arm.
+    _rename_arm: Option<Task<()>>,
 }
 
 impl DirView {
@@ -117,6 +145,9 @@ impl DirView {
             scroll_handle: UniformListScrollHandle::new(),
             type_ahead: String::new(),
             _type_ahead_reset: None,
+            rename: None,
+            rename_armed: None,
+            _rename_arm: None,
         }
     }
 
@@ -259,6 +290,19 @@ impl DirView {
         };
         FsContext::global(cx).queue.submit(op);
         cx.notify();
+    }
+
+    /// `cmd-d` / the toolbar's "Duplicate selection": copy each root-most
+    /// selected item next to itself. The keep-both names (`"name copy.ext"`,
+    /// `"name copy 2.ext"`) are resolved by op planning, not here (§4b).
+    pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
+        let sources = self.selection.selected_paths_rootmost();
+        if sources.is_empty() {
+            return;
+        }
+        FsContext::global(cx)
+            .queue
+            .submit(FileOp::Duplicate { sources });
     }
 
     /// `delete`: move the selection to the trash (undoable via restore).
@@ -454,7 +498,7 @@ impl DirView {
     // Cursor movement over the projection
     // ------------------------------------------------------------------
 
-    fn cursor_ix(&self, rows: &[ProjectedRow]) -> Option<usize> {
+    pub(crate) fn cursor_ix(&self, rows: &[ProjectedRow]) -> Option<usize> {
         let cursor = self.selection.cursor()?;
         rows.iter().position(|row| row.entry.id() == *cursor)
     }
@@ -556,6 +600,63 @@ impl DirView {
     /// Row single-click (details list): select, path-keyed.
     pub(crate) fn select_entry(&mut self, entry: &FileEntry, cx: &mut Context<Self>) {
         self.set_cursor(Some(entry.id()), cx);
+    }
+
+    /// The one dispatcher for every row click (`views/details_list.rs` calls
+    /// it): the §0 selection rows (double-click opens, `cmd`-click toggles,
+    /// `shift`-click ranges from the anchor, plain click selects) plus the §0
+    /// Rename trigger — a **slow second click** on a row already armed by an
+    /// earlier click starts the inline editor instead of re-selecting.
+    /// Anything that is not a plain click cancels a pending or standing arm,
+    /// so a double-click never renames.
+    pub(crate) fn handle_row_click(
+        &mut self,
+        entry: &FileEntry,
+        modifiers: Modifiers,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if click_count >= 2 {
+            self.disarm_rename_click();
+            self.open_entry(entry, cx);
+            return;
+        }
+        if modifiers.platform {
+            self.disarm_rename_click();
+            self.toggle_entry_selection(entry, cx);
+            return;
+        }
+        if modifiers.shift {
+            self.disarm_rename_click();
+            self.range_select_to(entry, cx);
+            return;
+        }
+        if self.rename_armed.as_ref() == Some(&entry.id()) {
+            self.disarm_rename_click();
+            self.begin_rename(entry, window, cx);
+            return;
+        }
+        self.select_entry(entry, cx);
+        self.arm_rename_click(entry.id(), cx);
+    }
+
+    /// Arm `id` for a slow second click once the double-click interval has
+    /// passed. Replacing the task cancels any previous pending arm, so only
+    /// the most recently clicked row is ever armed.
+    fn arm_rename_click(&mut self, id: EntryId, cx: &mut Context<Self>) {
+        self.rename_armed = None;
+        let spawner = FsContext::global(cx).spawner.clone();
+        self._rename_arm = Some(cx.spawn(async move |this, cx| {
+            spawner.timer(RENAME_CLICK_ARM_DELAY).await;
+            this.update(cx, |this, _| this.rename_armed = Some(id)).ok();
+        }));
+    }
+
+    /// Drop both the standing arm and any pending one.
+    pub(crate) fn disarm_rename_click(&mut self) {
+        self.rename_armed = None;
+        self._rename_arm = None;
     }
 
     // ------------------------------------------------------------------
@@ -694,7 +795,15 @@ impl Render for DirView {
 
         div()
             .track_focus(&self.focus_handle)
-            .key_context("DirView")
+            // §0: while the inline editor is up the context gains `renaming`,
+            // which every `DirView && !renaming` binding is guarded by — the
+            // rename row's own `TextInput` context still resolves, because it
+            // sits *below* this node in the dispatch chain.
+            .key_context(if self.rename.is_some() {
+                "DirView renaming"
+            } else {
+                "DirView"
+            })
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| this.open_selected(cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step_cursor(1, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.step_cursor(-1, cx)))
@@ -732,6 +841,14 @@ impl Render for DirView {
             .on_action(
                 cx.listener(|this, _: &DeleteToTrash, _, cx| this.delete_selection_to_trash(cx)),
             )
+            // §0 rename (M3): `f2` here, slow second click in `handle_row_click`.
+            .on_action(
+                cx.listener(|this, _: &RenameSelected, window, cx| {
+                    this.rename_selected(window, cx)
+                }),
+            )
+            // §0 toolbar row (M3): duplicate with keep-both names.
+            .on_action(cx.listener(|this, _: &Duplicate, _, cx| this.duplicate_selection(cx)))
             .on_key_down(cx.listener(Self::handle_key_down))
             .flex()
             .flex_col()

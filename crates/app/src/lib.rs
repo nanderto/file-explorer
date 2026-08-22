@@ -13,6 +13,7 @@ pub mod jobs_model;
 pub mod jobs_ui;
 pub mod keymap;
 pub mod pane;
+pub mod rename;
 pub mod selection;
 pub mod settings;
 pub mod sidebar;

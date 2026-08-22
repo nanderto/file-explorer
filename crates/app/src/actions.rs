@@ -40,6 +40,8 @@ actions!(
         DeletePermanently,
         NewFolder,
         NewFile,
+        RenameSelected,
+        Duplicate,
         // view
         ToggleHiddenFiles,
         // editing-mode (address bar / rename editor / dialogs)
