@@ -4,13 +4,17 @@
 //! M1 scope (read-only browsing): the executor seam ([`exec::Spawner`]), file
 //! entries ([`entry::FileEntry`]), the [`vfs::Vfs`] trait with its real and fake
 //! implementations, natural sorting ([`sort`]), directory listings + LRU cache
-//! ([`listing`]), and the debounced watcher wrapper ([`watcher`]). File
-//! operations, undo, clipboard, and the platform trait land in later milestones
-//! and grow this crate additively.
+//! ([`listing`]), and the debounced watcher wrapper ([`watcher`]).
+//!
+//! M2 adds the OS-services seam ([`platform::Platform`]: volumes + eject, with
+//! a macOS implementation and a portable deterministic stub) and the
+//! persistence primitives `Vfs::load` / `Vfs::atomic_write`. File operations,
+//! undo, and clipboard land in later milestones and grow this crate additively.
 
 pub mod entry;
 pub mod exec;
 pub mod listing;
+pub mod platform;
 pub mod sort;
 pub mod vfs;
 pub mod watcher;
@@ -18,6 +22,9 @@ pub mod watcher;
 pub use entry::{EntryId, EntryKind, EntryMeta, FileEntry, TargetKind};
 pub use exec::{Spawner, SpawnerExt};
 pub use listing::{ListingCache, ListingPatch, ListingSnapshot, list_dir, patch_listing};
+#[cfg(target_os = "macos")]
+pub use platform::MacPlatform;
+pub use platform::{Platform, StubPlatform, VolumeId, VolumeInfo, watch_volumes};
 pub use sort::{SortDirection, SortKey, SortSpec, natural_cmp};
 pub use vfs::{RealVfs, Vfs, VolumeKey};
 pub use watcher::{PathEvent, PathEventKind, WatchGuard};

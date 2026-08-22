@@ -4,6 +4,10 @@ name: Update visual baselines
 # uses for comparison, and commits them to the branch the workflow was run on.
 # Trigger it (from a feature branch, never main) when the UI intentionally
 # changes:   gh workflow run update-visual-baselines.yml --ref <branch>
+#
+# NOTE: the baseline commit is pushed with GITHUB_TOKEN, which GitHub excludes
+# from triggering workflows (recursion guard) — push any normal commit
+# afterwards so the required CI check runs on the new HEAD.
 on:
   workflow_dispatch:
 

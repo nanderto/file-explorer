@@ -10,6 +10,8 @@ pub mod dir_view;
 pub mod input;
 pub mod keymap;
 pub mod pane;
+pub mod settings;
+pub mod sidebar;
 pub mod theme;
 pub mod views;
 pub mod visual_diff;

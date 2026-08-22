@@ -1,8 +1,8 @@
 //! Every user command, as a gpui action (ARCHITECTURE.md §3).
 //!
-//! The list is exactly the Action column of the §0 traceability table's **M1
-//! rows** — later milestones grow it additively in the same PR that adds the
-//! table rows. Keymap bindings (`crate::keymap`), context menus (M3), and the
+//! The list is exactly the Action column of the §0 traceability table's M1
+//! and M2 rows — later milestones grow it additively in the same PR that adds
+//! the table rows. Keymap bindings (`crate::keymap`), context menus (M3), and the
 //! native menu bar (M8) all dispatch these same boxed actions, so each
 //! command's logic exists exactly once.
 
@@ -29,6 +29,8 @@ actions!(
         ExtendSelectionPrev,
         PageUp,
         PageDown,
+        ExpandSelected,
+        CollapseSelected,
         // view
         ToggleHiddenFiles,
         // editing-mode (address bar / rename editor / dialogs)

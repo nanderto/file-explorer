@@ -59,6 +59,16 @@ pub trait Vfs: Send + Sync {
     /// Stat a single path. A missing path is `Ok(None)`, not an error.
     async fn metadata(&self, path: &Path) -> Result<Option<EntryMeta>>;
 
+    /// Read the entire contents of a file.
+    async fn load(&self, path: &Path) -> Result<Vec<u8>>;
+
+    /// Atomically replace `path` with `data`: write to a temp file **in the
+    /// same directory**, sync it, then rename it over the destination — a
+    /// crash or failure part-way leaves either the old contents or the new,
+    /// never a truncated mix. Missing parent directories are created (settings
+    /// write into a config dir that may not exist yet).
+    async fn atomic_write(&self, path: &Path, data: Vec<u8>) -> Result<()>;
+
     /// The volume a path lives on (lane routing; status line grouping).
     fn volume_key(&self, path: &Path) -> VolumeKey;
 
@@ -179,6 +189,37 @@ impl Vfs for RealVfs {
             .await
     }
 
+    async fn load(&self, path: &Path) -> Result<Vec<u8>> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || Ok(std::fs::read(&path)?))
+            .await
+    }
+
+    async fn atomic_write(&self, path: &Path, data: Vec<u8>) -> Result<()> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                use std::io::Write as _;
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("atomic_write: {} has no parent directory", path.display())
+                    })?;
+                std::fs::create_dir_all(parent)?;
+                // Temp file in the destination's own directory so the final
+                // rename stays on one filesystem (that is what makes it atomic).
+                let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+                temp.write_all(&data)?;
+                temp.as_file().sync_all()?;
+                temp.persist(&path)
+                    .map_err(|persist_error| anyhow::Error::from(persist_error.error))?;
+                Ok(())
+            })
+            .await
+    }
+
     fn volume_key(&self, path: &Path) -> VolumeKey {
         volume_key_for(path)
     }
@@ -221,6 +262,7 @@ mod fake {
         kind: EntryKind,
         size: u64,
         modified: SystemTime,
+        contents: Vec<u8>,
     }
 
     struct FakeWatchSub {
@@ -279,6 +321,7 @@ mod fake {
                     kind: EntryKind::File,
                     size,
                     modified,
+                    contents: vec![0; size as usize],
                 },
             );
             let kind = if existed {
@@ -300,6 +343,7 @@ mod fake {
                     kind: EntryKind::Dir,
                     size: 0,
                     modified,
+                    contents: Vec::new(),
                 },
             );
             emit_locked(&mut state, path_event(&path, PathEventKind::Created));
@@ -376,6 +420,7 @@ mod fake {
                         kind: EntryKind::Dir,
                         size: 0,
                         modified,
+                        contents: Vec::new(),
                     },
                 );
                 for (name, child) in children {
@@ -389,6 +434,7 @@ mod fake {
                         kind: EntryKind::File,
                         size: contents.len() as u64,
                         modified,
+                        contents: contents.as_bytes().to_vec(),
                     },
                 );
             }
@@ -455,6 +501,81 @@ mod fake {
                 return Err(anyhow!("{message}"));
             }
             Ok(state.tree.get(path).map(|node| node_meta(path, node)))
+        }
+
+        async fn load(&self, path: &Path) -> Result<Vec<u8>> {
+            let state = self.state.lock().unwrap();
+            if let Some(message) = state.errors.get(path) {
+                return Err(anyhow!("{message}"));
+            }
+            let node = state
+                .tree
+                .get(path)
+                .ok_or_else(|| anyhow!("no such file: {}", path.display()))?;
+            if !matches!(node.kind, EntryKind::File) {
+                return Err(anyhow!("not a file: {}", path.display()));
+            }
+            Ok(node.contents.clone())
+        }
+
+        async fn atomic_write(&self, path: &Path, data: Vec<u8>) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(message) = state.errors.get(path) {
+                return Err(anyhow!("{message}"));
+            }
+            if let Some(existing) = state.tree.get(path)
+                && !matches!(existing.kind, EntryKind::File)
+            {
+                return Err(anyhow!("not a file: {}", path.display()));
+            }
+            // Create missing ancestors, mirroring RealVfs::atomic_write's
+            // create_dir_all — but fail like it does when an ancestor is a file.
+            let mut missing: Vec<PathBuf> = Vec::new();
+            let mut cursor = path.parent();
+            while let Some(dir) = cursor {
+                if dir.as_os_str().is_empty() {
+                    break;
+                }
+                if let Some(node) = state.tree.get(dir) {
+                    if !matches!(node.kind, EntryKind::Dir) {
+                        return Err(anyhow!("not a directory: {}", dir.display()));
+                    }
+                    break;
+                }
+                missing.push(dir.to_path_buf());
+                cursor = dir.parent();
+            }
+            for dir in missing.into_iter().rev() {
+                let modified = next_mtime(&mut state);
+                state.tree.insert(
+                    dir.clone(),
+                    FakeNode {
+                        kind: EntryKind::Dir,
+                        size: 0,
+                        modified,
+                        contents: Vec::new(),
+                    },
+                );
+                emit_locked(&mut state, path_event(&dir, PathEventKind::Created));
+            }
+            let existed = state.tree.contains_key(path);
+            let modified = next_mtime(&mut state);
+            state.tree.insert(
+                path.to_path_buf(),
+                FakeNode {
+                    kind: EntryKind::File,
+                    size: data.len() as u64,
+                    modified,
+                    contents: data,
+                },
+            );
+            let kind = if existed {
+                PathEventKind::Changed
+            } else {
+                PathEventKind::Created
+            };
+            emit_locked(&mut state, path_event(path, kind));
+            Ok(())
         }
 
         fn volume_key(&self, path: &Path) -> VolumeKey {
@@ -579,6 +700,93 @@ mod tests {
         vfs.set_free_space(1234);
         assert_eq!(block_on(vfs.free_space(Path::new("/"))).unwrap(), 1234);
         assert!(vfs.is_fake());
+    }
+
+    #[test]
+    fn fake_vfs_load_and_atomic_write_round_trip() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree("/root", json!({ "a.txt": "abc" }));
+
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/a.txt"))).unwrap(),
+            b"abc"
+        );
+        assert!(block_on(vfs.load(Path::new("/root/missing"))).is_err());
+        assert!(
+            block_on(vfs.load(Path::new("/root"))).is_err(),
+            "loading a directory is an error"
+        );
+
+        // New file, with missing parents created (mirrors RealVfs).
+        block_on(vfs.atomic_write(Path::new("/root/cfg/settings.json"), b"{}".to_vec())).unwrap();
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/cfg/settings.json"))).unwrap(),
+            b"{}"
+        );
+        let parent = block_on(vfs.metadata(Path::new("/root/cfg")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.kind, EntryKind::Dir);
+
+        // Overwrite replaces contents (and size) wholesale.
+        block_on(vfs.atomic_write(Path::new("/root/cfg/settings.json"), b"[1,2]".to_vec()))
+            .unwrap();
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/cfg/settings.json"))).unwrap(),
+            b"[1,2]"
+        );
+
+        // Writing "under" a file fails like create_dir_all does.
+        assert!(block_on(vfs.atomic_write(Path::new("/root/a.txt/child"), b"x".to_vec())).is_err());
+        // Error injection applies to atomic_write too.
+        vfs.set_error("/root/locked.json", "no space");
+        let err =
+            block_on(vfs.atomic_write(Path::new("/root/locked.json"), b"x".to_vec())).unwrap_err();
+        assert!(err.to_string().contains("no space"));
+    }
+
+    #[test]
+    fn real_vfs_atomic_write_round_trips_and_cleans_up_temp_files() {
+        let spawner: Arc<dyn Spawner> = Arc::new(TestSpawner::new());
+        let vfs = RealVfs::new(spawner);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+
+        block_on(vfs.atomic_write(&target, b"first".to_vec())).unwrap();
+        assert_eq!(block_on(vfs.load(&target)).unwrap(), b"first");
+
+        block_on(vfs.atomic_write(&target, b"second, longer".to_vec())).unwrap();
+        assert_eq!(block_on(vfs.load(&target)).unwrap(), b"second, longer");
+
+        // The temp file was renamed away, not left behind: the directory holds
+        // exactly the destination.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(leftovers.len(), 1, "no temp files left: {leftovers:?}");
+
+        // Missing parent directories are created.
+        let nested = dir.path().join("deep/nested/settings.json");
+        block_on(vfs.atomic_write(&nested, b"nested".to_vec())).unwrap();
+        assert_eq!(block_on(vfs.load(&nested)).unwrap(), b"nested");
+    }
+
+    #[test]
+    fn real_vfs_atomic_write_failure_never_corrupts_the_destination() {
+        let spawner: Arc<dyn Spawner> = Arc::new(TestSpawner::new());
+        let vfs = RealVfs::new(spawner);
+        let dir = tempfile::tempdir().unwrap();
+
+        // A write whose "parent directory" is actually a file fails before the
+        // destination is ever touched (temp-then-rename: no partial states).
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"precious").unwrap();
+        let bad_target = occupied.join("settings.json");
+        assert!(block_on(vfs.atomic_write(&bad_target, b"new".to_vec())).is_err());
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            b"precious",
+            "existing data is untouched by a failed atomic_write"
+        );
+        assert!(block_on(vfs.load(&Path::new("/").join("nonexistent-file"))).is_err());
     }
 
     #[test]
