@@ -32,6 +32,16 @@ Additional M1 notes:
   `keymap.rs` forwarding to `input_state`-namespace actions; `set_value` was
   fixed to replace the whole content (see VENDORED.md mods 5–7).
 
+Known M1 gaps (follow-up):
+- Details-view rows flow name→size→date instead of aligning cells under the
+  Size / Date Modified column headers (visible in `listing_populated`
+  baseline). Fix with fixed-width columns when M2 touches the row layout for
+  disclosure triangles; baselines regenerate then.
+- Process note: baseline commits pushed by the update-visual-baselines
+  workflow use `GITHUB_TOKEN`, which GitHub excludes from triggering CI —
+  after baselines land on a branch, push any normal commit to get the
+  required `CI` check on the new HEAD.
+
 ## Components
 
 ### Workspace / build tooling
