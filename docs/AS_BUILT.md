@@ -460,9 +460,11 @@ Each entry names the milestone expected to resolve it. Mechanics live in the
 component sections; this list is the scannable index.
 
 - **M3 remaining UI surfaces**: inline rename (F2 + slow-second-click),
-  context menus, drag & drop, rubber-band marquee, and the
-  `rename_editing` / `context_menu_open` / `cut_dimmed` / `marquee_active`
-  visual scenarios. *Next work item on the M3 branch.*
+  `Duplicate` (`cmd-d`), context menus, drag & drop, rubber-band marquee, and
+  the `rename_editing` / `context_menu_open` / `cut_dimmed` / `marquee_active`
+  visual scenarios. A §0-vs-`keymap.rs` audit confirms the other 12 M3 rows
+  are bound; only `RenameSelected` and `Duplicate` are unimplemented.
+  *Next work item on the M3 branch.*
 
 - **Symlink copy policy** — copy dereferences file links; symlink-to-dir inside
   a copied tree fails the job (details under fs-core). *Revisit when a
