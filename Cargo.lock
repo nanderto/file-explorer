@@ -1743,6 +1743,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "fs-core",
  "fs4",
  "futures",
  "notify",

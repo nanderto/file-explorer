@@ -8,25 +8,43 @@
 //!
 //! M2 adds the OS-services seam ([`platform::Platform`]: volumes + eject, with
 //! a macOS implementation and a portable deterministic stub) and the
-//! persistence primitives `Vfs::load` / `Vfs::atomic_write`. File operations,
-//! undo, and clipboard land in later milestones and grow this crate additively.
+//! persistence primitives `Vfs::load` / `Vfs::atomic_write`.
+//!
+//! M3 grows the mutation surface: the [`vfs::Vfs`] trait's
+//! `create_dir`/`create_file`/`copy`/`rename`/`remove`/`trash`/`restore`
+//! methods (trash as a `.fake-trash` directory everywhere but macOS, so the
+//! whole flow tests on Windows), file operations with planning and the
+//! destination-volume job queue ([`ops`]), inverse-op undo with fingerprint
+//! invalidation ([`undo`]), and the cut/copy clipboard ([`clipboard`]).
 
+pub mod clipboard;
 pub mod entry;
 pub mod exec;
 pub mod listing;
+pub mod ops;
 pub mod platform;
 pub mod sort;
+pub mod undo;
 pub mod vfs;
 pub mod watcher;
 
+pub use clipboard::{ClipboardMode, FileClipboard};
 pub use entry::{EntryId, EntryKind, EntryMeta, FileEntry, TargetKind};
 pub use exec::{Spawner, SpawnerExt};
 pub use listing::{ListingCache, ListingPatch, ListingSnapshot, list_dir, patch_listing};
+pub use ops::{
+    Conflict, ConflictChoice, FileOp, JobEvent, JobId, JobInfo, JobKind, JobQueue, OpReceipt,
+    Resolution, keep_both_candidates, plan_keep_both_names,
+};
 #[cfg(target_os = "macos")]
 pub use platform::MacPlatform;
 pub use platform::{Platform, StubPlatform, VolumeId, VolumeInfo, watch_volumes};
 pub use sort::{SortDirection, SortKey, SortSpec, natural_cmp};
-pub use vfs::{RealVfs, Vfs, VolumeKey};
+pub use undo::{Fingerprint, UndoEntry, UndoOutcome, UndoStack};
+pub use vfs::{
+    CopyCancelled, CreateOptions, ProgressFn, RealVfs, RemoveOptions, RenameOptions, TrashId,
+    TrashRestoreError, Vfs, VolumeKey,
+};
 pub use watcher::{PathEvent, PathEventKind, WatchGuard};
 
 #[cfg(any(test, feature = "test-support"))]

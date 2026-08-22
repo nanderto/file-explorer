@@ -10,46 +10,18 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
 
 ## Status
 
-**Current milestone:** M2 in progress — details-view **in-place folder
-expansion** (`ExpandSelected`/`CollapseSelected`: right/left keys + disclosure
-triangles over a flat row projection with depth-based indentation) and the M1
-column-alignment fix (details rows now render fixed-width Size / Date cells
-aligned under the headers) are built and tested (88 unit/gpui tests green on
-Windows). Previously in M2: the sidebar entity (`sidebar.rs`:
-Devices/Favorites/folder-tree sections, `SidebarEvent` wiring into the
-Workspace, live volume list, favorites persisted immediately) and hand-built
-resizable splitters (sidebar + info-panel widths, clamped), 83 tests at that
-point. Earlier in M2: fs-core
-platform trait (volumes/eject: `MacPlatform` via objc2 + `StubPlatform`),
-`Vfs::load`/`Vfs::atomic_write` persistence primitives, `settings.rs`
-favorites stub global, and the `FsContext.platform` handle (77 tests at that
-point). Previously: M1 code-complete — fs-core crate (M1 subset:
-exec/entry/vfs/sort/listing/watcher), app state layer
-(actions/keymap/FsContext/Workspace/Pane), details view
-(`dir_view.rs` + `views/details_list.rs`), and the address bar
-(`address_bar.rs` + vendored `input/text_input.rs`, see `crates/app/VENDORED.md`)
-are all built and tested (68 unit/gpui tests green on Windows). Visual
-scenarios `listing_populated`, `listing_sorted_by_size`, `address_bar_editing`
-added to the runner on deterministic FakeVfs fixtures; all five baselines
-(incl. the two M0 ones — the new address-bar chrome row intentionally changes
-the workspace layout) regenerate via the update-visual-baselines workflow.
+**M3 in progress** — part 1 (the fs-core file-operations engine) is done; part 2
+(the app UI surfaces) is the next workflow on this branch. 141 tests green
+(88 fs-core unit + 3 integration + 50 app).
 
-Additional M1 notes:
-- Address bar: breadcrumb rendered by the Pane (clickable segments; blank-space
-  click or `cmd-l` enters editing); `AddressBar` entity owns the vendored
-  `InputState`, background-listed autocomplete (dirs-only, prefix,
-  generation-guarded), `tab` accept-in-place, background `Confirm` validation
-  with inline errors, `escape` cancel; both outcomes return focus to the pane.
-- `Theme` gained an `error` color (both palettes).
-- Vendored input drives editing keys via `TextInput`-context bindings in
-  `keymap.rs` forwarding to `input_state`-namespace actions; `set_value` was
-  fixed to replace the whole content (see VENDORED.md mods 5–7).
-
-Known M1 gaps (follow-up):
-- Process note: baseline commits pushed by the update-visual-baselines
-  workflow use `GITHUB_TOKEN`, which GitHub excludes from triggering CI —
-  after baselines land on a branch, push any normal commit to get the
-  required `CI` check on the new HEAD.
+| Milestone | State |
+|---|---|
+| M0 skeleton + visual-test infra | ✅ merged (#1) |
+| Phase A architecture | ✅ merged (#3) |
+| M1 read-only browsing | ✅ merged (#4) |
+| M2 sidebar + in-place expansion | ✅ merged (#5) |
+| M3 file operations | 🔄 part 1 (fs-core engine) built; part 2 (UI) next |
+| M4 icon view + dual pane → M8 ship | not started |
 
 ## Components
 
@@ -201,14 +173,139 @@ Known M1 gaps (follow-up):
 - CI: `Visual regression tests (macOS)` job runs the comparison per PR;
   `update-visual-baselines.yml` (manual dispatch, non-main branches) regenerates
   baselines on the same runner image and commits them to the branch.
+- Address bar (M1): breadcrumb rendered by the Pane (clickable segments;
+  blank-space click or `cmd-l` enters editing); `AddressBar` entity owns the
+  vendored `InputState`, background-listed autocomplete (dirs-only, prefix,
+  generation-guarded), `tab` accept-in-place, background `Confirm` validation
+  with inline errors, `escape` cancel; both outcomes return focus to the pane.
+  `Theme` gained an `error` color (both palettes). The vendored input drives
+  editing keys via `TextInput`-context bindings in `keymap.rs` forwarding to
+  `input_state`-namespace actions; `set_value` replaces the whole content
+  (VENDORED.md mods 5–7).
 
 ### fs-core
 - Crate `crates/fs-core` (edition 2024, **no gpui dependency**, builds/tests
   headless on Windows). M1 subset per ARCHITECTURE.md §6/§10 plus the M2
-  platform/persistence additions below; ops/undo/clipboard are deliberately
-  absent (M3, additive growth — no stubs). Feature `test-support` exposes
-  `FakeVfs`/`TestSpawner` to downstream crates; this crate's own tests see
-  them via `cfg(any(test, feature))`.
+  platform/persistence additions and the M3 ops/undo/clipboard modules below.
+  Feature `test-support` exposes `FakeVfs`/`TestSpawner` to downstream crates;
+  this crate's own tests see them via `cfg(any(test, feature))`, and the
+  crate's integration tests get them via a self dev-dependency enabling the
+  feature.
+- `Vfs` M3 mutation surface (§6 names/signatures): `create_dir`
+  (`create_dir_all` semantics so folder merges replay), `create_file(path,
+  CreateOptions{overwrite})`, `copy(from, to, ProgressFn)` (single-file,
+  chunked — 1 MiB chunks in `RealVfs`, 1 KiB in `FakeVfs`; the callback
+  returns `bool`, `false` aborts between chunks, removes the partial
+  destination, and fails with the typed `CopyCancelled` marker; the cleanup is
+  scoped to failures *after* the destination was created — a failure before
+  the first write (missing source, pre-copy cancel) never touches a
+  pre-existing destination — and directories
+  are expanded by op planning, never by `copy`), `rename(from, to,
+  RenameOptions{overwrite})` (subtree move, mtimes preserved),
+  `remove(path, RemoveOptions{recursive})` (missing path is an error),
+  `trash(path) -> TrashId { original, trashed }`, and
+  `restore(TrashId) -> Result<PathBuf, TrashRestoreError>` with the §6 typed
+  variants. `RealVfs` implements everything via `SpawnerExt::unblock` and
+  holds an in-memory consumed-token set (the `AlreadyRestored` double-undo
+  guard). `FakeVfs` mirrors all mutations against its in-memory tree with
+  watcher events, keeps rename mtimes, and gained a `snapshot()` helper for
+  exact-tree undo assertions; per-path error injection covers the new methods.
+- Trash mechanism: on macOS, `platform/macos.rs::trash_item_blocking` uses
+  `NSFileManager trashItemAtURL:resultingItemURL:error:` (the resulting trash
+  URL becomes `TrashId::trashed`); everywhere else
+  `platform/trash.rs::fake_trash_blocking` moves the item into
+  `<parent>/.fake-trash/<n>-<name>/<name>` with a sidecar meta file (original
+  path + mtime fingerprint, per §6). Restore is shared
+  (`platform/trash.rs::restore_blocking`): typed checks
+  (NotFound/Collision), rename back, `.fake-trash` entry cleanup. All three
+  `TrashRestoreError` variants are unit-tested on Windows through both
+  `FakeVfs` and `RealVfs` (§9); the real-macOS trash path is compile-checked
+  by macOS CI and exercised by the per-milestone Mac checklist.
+- `ops/` (M3): `FileOp { Copy, Move, Rename, TrashOp, Restore, CreateDir,
+  CreateFile, Duplicate, Delete }` — `Delete` (permanent removal, empty
+  receipt so it is never undoable) is additive to §6's abbreviated list; it
+  backs the §0 `DeletePermanently` row and copy-undo. `plan_keep_both_names
+  (sources, dest_dir, existing) -> Vec<(src, final_dest)>` is the pure,
+  unit-tested keep-both resolver (`"name copy.ext"`, `"name copy 2.ext"`, …;
+  batch-internal reservations; dotfiles keep the whole name as stem).
+  `ops/job.rs`: `JobId`, `JobKind`, `JobInfo`, `Conflict{source, dest,
+  src_meta, dest_meta}`, `Resolution{choice: Replace|Skip|KeepBoth,
+  apply_to_all}`, `OpReceipt{op, created, moved, trashed, restored}`, and the
+  `JobEvent` enum
+  (Started/Progress/NeedsDecision/Completed/Failed/Cancelled).
+- `ops/queue.rs`: `JobQueue::new(vfs, spawner)` (deviation from §6's
+  abbreviated `new(spawner)` sketch: execution needs the Vfs, which the
+  sketch omits) — `submit(op) -> JobId` routes to one serial lane per
+  **destination** volume (`volume_key(op.lane_path())`; lanes are spawned
+  worker loops holding a `Weak` back-reference so a dropped queue ends
+  them); `subscribe()` returns the single-consumer event receiver;
+  `resolve(id, Resolution)` un-parks a conflict oneshot; `cancel(id)` trips
+  an `AtomicBool` checked between files and, via the copy progress callback,
+  between chunks (and wakes a parked conflict). Copy jobs plan first
+  (same-folder paste and Duplicate get keep-both names at planning time —
+  §4b; directory sources expand into parent-before-child actions with total
+  bytes), then execute with runtime conflict parking (existing dirs merge
+  silently; Skip prunes the subtree, runtime KeepBoth remaps descendant
+  destinations; merged pre-existing top-level dirs are *not* recorded in
+  `receipt.created`, so copy-undo can never delete pre-existing data). Move
+  renames per source (same-folder move is a no-op; conflicts park like
+  copy) with a copy-tree + remove fallback for cross-volume moves, cleaning
+  the partial destination if cancelled mid-fallback. Copy and Move reject a
+  destination inside (or equal to) one of their sources up front (`Failed`,
+  nothing touched) — past the rename failure, the move fallback would
+  otherwise copy the tree into itself and then recursively remove source
+  *and* destination. CreateDir/CreateFile
+  fail on pre-existing paths (undo safety). An RAII `JobTracker` guarantees
+  exactly one terminal event per job even on panic. Non-copy jobs report
+  item-count progress in the bytes fields.
+- `undo.rs` (M3): `UndoEntry { inverse: Vec<FileOp>, redo: Vec<FileOp>,
+  fingerprints }` built by `UndoEntry::from_receipt` (moves invert to
+  `Rename` back-pairs in reverse order; created paths invert to `Delete`;
+  trash inverts to `Restore`; restores invert to `TrashOp`; `Delete`
+  receipts have no inverse). `UndoStack::undo/redo` validate fingerprints
+  via `Vfs::metadata` (mismatch/missing → `UndoOutcome::Invalidated { entry,
+  reason }` — the entry is skipped and handed back for the toast, never
+  applied), then submit through the `JobQueue`; a successful apply pushes
+  the inverted entry (fingerprints remapped through rename pairs, since
+  renames preserve mtimes) onto the opposite stack; `push` truncates redo.
+- `clipboard.rs` (M3): `FileClipboard { entries: Vec<EntryId>, mode:
+  Copy|Cut }` plain struct — `is_cut(path)` for render dimming,
+  `take_for_paste()` (cut empties after paste, copy pastes repeatedly), and
+  `paste_op(dest_dir) -> Option<FileOp>` — the §4b handoff turning a paste
+  into `FileOp::Copy` (copy-mode) or `FileOp::Move` (cut-mode, consuming);
+  submitting the op reaches ops planning, where paste-into-same-folder
+  keep-both names are resolved (unit-tested end-to-end through the
+  `JobQueue` against `FakeVfs`).
+- Integration tests `crates/fs-core/tests/torture.rs` (plan §7 M3 acceptance
+  + the §9 fs-core-integration row): the torture sequence is one scripted
+  function run twice — against `RealVfs` on a `tempfile` tree **and** against
+  `FakeVfs` (the world is seeded and walked through the `Vfs` itself, so the
+  script is implementation-generic) — copy a tree onto a destination with
+  pre-seeded conflicts resolved **mixed** (keep-both a, skip b, replace c with
+  apply-to-all — the pump asserts conflicts park in name order, that d is
+  replaced *without* a fourth prompt, and that merged dirs never enter
+  `receipt.created`), cancel a second copy mid-flight (parked-on-conflict via
+  `JobQueue::cancel`, and between copy chunks via the progress callback —
+  typed `CopyCancelled`, no partial file), move a **directory** then undo it,
+  and delete-to-trash then undo (restore), both undone LIFO through one real
+  `UndoStack`; the final assertion walks the entire tree and compares
+  path-by-path, byte-by-byte (which also proves no partial/temp/`.fake-trash`
+  leftovers survive anywhere). Plus: every `FileOp` variant end-to-end
+  through the `JobQueue` against `RealVfs` (CreateDir/CreateFile/Duplicate/
+  Copy/Move/Rename/TrashOp→Restore via the on-disk `.fake-trash`/Delete).
+- Known M3-part-1 limitations (accepted, revisit if a milestone needs them):
+  **symlinks** — Move/Rename/Trash relocate the link itself (rename-based);
+  `copy` of a file symlink copies the *target's* bytes (dereferences), and a
+  symlink-to-directory inside a copied tree fails the job (planned as a file,
+  unopenable) — no link-preserving copy exists yet. **Fingerprints** are
+  `(path, mtime)` per §6 — same-mtime content edits and changes deep inside a
+  copied/created directory (which don't touch the top-level mtime) escape
+  invalidation. **Failed jobs carry no receipt** (`JobEvent::Failed { id,
+  error }`), so the completed part of a multi-source op that fails midway is
+  not undoable — the watcher keeps listings truthful, and part 2's JobsModel
+  owns any richer contract. **Names** pass through `to_string_lossy` (the M1
+  `Arc<str>` naming decision), so keep-both planning on a non-Unicode filename
+  would target the lossy spelling.
 - `platform/` (M2): `Platform` trait — the M2 surface only (`volumes() ->
   Vec<VolumeInfo { volume_id, name, path, total, free, ejectable }>`,
   `eject(&VolumeId)`); later milestones add tags/thumbnail/open/reveal
@@ -300,6 +397,31 @@ Known M1 gaps (follow-up):
   used to drive milestone workflows (Phase B).
 - `docs/KICKOFF_PROMPT.md` — the standing build directive for new sessions.
 
+## Known gaps
+
+Each entry names the milestone expected to resolve it. Mechanics live in the
+component sections; this list is the scannable index.
+
+- **Symlink copy policy** — copy dereferences file links; symlink-to-dir inside
+  a copied tree fails the job (details under fs-core). *Revisit when a
+  milestone needs link-preserving copy.*
+- **Undo fingerprints are `(path, mtime)`, top-level only** — same-mtime or
+  deep-in-tree edits escape invalidation (accepted per ARCHITECTURE §6). *M7+
+  if ever.*
+- **`JobEvent::Failed` carries no receipt** — the completed part of a midway-
+  failed multi-source op is not undoable. *M3 part 2 (JobsModel contract).*
+- **Undo/redo stacks are optimistic** — they flip before the inverse jobs
+  complete. *M3 part 2 (JobsModel integration).*
+- **Favorites reordering** deferred. *M3 part 2 (drag infrastructure).*
+- **Settings boot-race merge semantics** (early mutation can suppress the disk
+  load for a session). *M7 settings store.*
+- **Sidebar/dir-view child caches never invalidate** (stale after ejects /
+  external changes). *M3 part 2 watcher re-projection.*
+- **Eject errors only logged**, no UI surfacing. *M5-ish polish / Mac checklist.*
+- **Process**: baseline commits are pushed with `GITHUB_TOKEN`, which never
+  triggers CI — after baselines land, push a normal commit so the required `CI`
+  check runs on the new HEAD. *Standing procedure.*
+
 ## Deviations from the plan
 
 - Theme lives as a module in `crates/app` instead of its own crate until the
@@ -319,14 +441,10 @@ Known M1 gaps (follow-up):
 
 | Date | PR | Change |
 |---|---|---|
-| 2026-08-22 | — | Repo bootstrapped: plan, CLAUDE.md, quality gate, hooks, CI, this file. |
-| 2026-08-22 | — | Cargo workspace + M0 window skeleton (`WorkspaceView`, dark/light `Theme`); GPUI visual regression tests (runner binary, unit-tested pixel diff, baselines dir, CI job, baseline-update workflow). |
-| 2026-08-22 | — | Phase A: `docs/ARCHITECTURE.md` via orchestrated research/draft/judge workflow; gpui-component rejected (see Deviations); agent pack (`.claude/agents/`) and kickoff prompt added. |
-| 2026-08-22 | — | M1: `crates/fs-core` created (exec/entry/vfs/sort/listing/watcher, `test-support` feature with FakeVfs + TestSpawner, 33 unit tests). Deps: futures, async-channel, async-trait, notify, serde, fs4; serde_json/tempfile for tests. |
-| 2026-08-22 | — | M1 app state layer: `actions.rs` + `keymap.rs` (§0 M1 rows) with per-context dispatch tests, `app_state.rs` (`FsContext` global + `GpuiSpawner` executor adapter), `workspace_view.rs` refactored into `workspace.rs` (`Workspace` entity, `Vec<Entity<Pane>>`), `pane.rs` (`NavHistory`/`NavEntry` restore, `ListingCache` cached-then-fresh loads, generation guard, status-line data). 28 app tests (`#[gpui::test]` + unit). App deps: + fs-core, futures; dev: gpui test-support, fs-core test-support, serde_json. |
-| 2026-08-22 | — | M1 details view (`dir_view.rs`, `views/details_list.rs`: uniform_list, sortable headers, cursor selection, type-ahead on fake time, hidden toggle, open via Enter/double-click) and address bar (`address_bar.rs` + vendored adabraka `input/text_input.rs` per `VENDORED.md`; breadcrumb in Pane, editor entity with background autocomplete/validation). `Theme` + `error` color. Visual runner: FakeVfs fixture scenarios (`listing_populated`, `listing_sorted_by_size`, `address_bar_editing`). 68 tests green. Deps: + regex, once_cell, unicode-segmentation; serde_json optional under `visual-tests`. |
-| 2026-08-22 | — | M2 fs-core platform + persistence: `platform/` (`Platform` trait volumes/eject, `VolumeInfo`/`VolumeId`, `MacPlatform` via objc2-foundation NSFileManager + `diskutil eject` deviation, portable deterministic `StubPlatform`, polling `watch_volumes`), `Vfs::load` + `Vfs::atomic_write` (tempfile-in-same-dir + persist; FakeVfs gained file contents), app `settings.rs` stub global (favorites JSON via atomic_write off the UI thread, injectable path), `FsContext.platform` handle. 77 tests green (39 fs-core + 38 app). Deps: fs-core + tempfile, objc2-foundation (macOS only); app + serde, serde_json (now unconditional), dirs. |
-| 2026-08-22 | — | M2 sidebar + splitters: `sidebar.rs` (`Sidebar` entity — Devices via live `watch_volumes` with eject affordance, Favorites from `AppSettings` with add-current-folder `+` / per-row `✕` persisted immediately, Explorer folder tree as a flat projection over `uniform_list`, collapsible section headers, `SidebarEvent::{NavigateTo, Eject}`); `workspace.rs` owns/renders `Entity<Sidebar>`, subscribes (NavigateTo → active pane, Eject → `Platform::eject` on the background spawner), and gains hand-built resizable splitters (drag strips over the sidebar/info-panel borders, widths clamped 160–400 / 180–420). Visual runner: `sidebar_tree_expanded` scenario + fixture settings file; all baselines need workflow regeneration. 83 tests green (39 fs-core + 44 app). |
-| 2026-08-22 | — | M2 details-view in-place expansion + M1 column-alignment fix: `ExpandSelected`/`CollapseSelected` actions bound to `right`/`left` in `DirView && !renaming` (§0 M2 rows; dispatch tests extended); `dir_view.rs` gains `expanded`/cached children/flat projection (children sorted + hidden-filtered at projection time), left-on-child moves cursor to the parent row, collapse pulls a subtree-bound cursor up; `details_list.rs` renders depth indents + disclosure triangles and fixes body rows to `w_full` with `flex_none` fixed-width cells so columns align under the headers (Known-M1-gap closed); pane cursor retention consults injected rows. Visual runner: `details_folder_expanded` scenario; every listing baseline changes — regenerate via workflow. 88 tests green (39 fs-core + 49 app). |
-| 2026-08-22 | — | M2 review fix: `Sidebar` now holds a `cx.observe_global::<AppSettings>` subscription — render reads the global for Favorites rows, and the boot-time background load (`settings::init`) swaps it in after first paint, so without the observer persisted favorites could stay invisible until an unrelated repaint (and visual baselines could race). Regression test added. 89 tests green (39 fs-core + 50 app). |
-| 2026-08-22 | — | macOS CI fix: objc2-foundation associated-constant naming (`NSVolumeEnumerationOptions::SkipHiddenVolumes`); M2 baselines regenerated on macos-latest (7 scenarios). |
+| 2026-08-22 | #1,#2 | Bootstrap + M0: plan, CLAUDE.md, gate/hooks/CI, workspace, `WorkspaceView`, visual-test infra. |
+| 2026-08-22 | #3 | Phase A: ARCHITECTURE.md (research→draft→judge workflow); gpui-component rejected; agent pack. |
+| 2026-08-22 | #4 | M1: fs-core (listings/sort/watcher), app shell, details view, address bar, vendored TextInput. 68 tests. |
+| 2026-08-22 | #5 | M2: Platform trait (volumes/eject), favorites persistence, sidebar + splitters, in-place expansion, M1 column fix. 89 tests. |
+| 2026-08-22 | #5 | M2 review fix (sidebar observes `AppSettings`); objc2 constant-name CI fix; baselines regenerated. |
+| 2026-08-22 | — | M3 part 1: Vfs mutation surface, ops/JobQueue (keep-both, conflict lanes, cancel), undo, clipboard, trash, torture test. 138 tests. |
+| 2026-08-22 | — | M3 part 1 review: into-itself data-loss guard; copy-cleanup scoping; macOS dead_code fix; FakeVfs restore events. 141 tests. |

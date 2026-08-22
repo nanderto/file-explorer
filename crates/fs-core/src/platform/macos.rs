@@ -65,6 +65,30 @@ impl Platform for MacPlatform {
     }
 }
 
+/// Move `path` to the real macOS trash via `NSFileManager
+/// trashItemAtURL:resultingItemURL:error:` (plan §4's prescribed mechanism).
+/// Blocking — [`crate::RealVfs::trash`] calls it through `unblock`. The
+/// resulting trash URL becomes [`TrashId::trashed`], so restore is a plain
+/// rename back (`platform::trash::restore_blocking`).
+#[allow(unused_unsafe)] // see volumes_blocking below
+pub(crate) fn trash_item_blocking(path: &std::path::Path) -> Result<crate::vfs::TrashId> {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+    let manager = unsafe { NSFileManager::defaultManager() };
+    let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())) };
+    let mut resulting = None;
+    unsafe { manager.trashItemAtURL_resultingItemURL_error(&url, Some(&mut resulting)) }
+        .map_err(|error| anyhow!("trash {}: {error}", path.display()))?;
+    let trashed = resulting
+        .and_then(|trash_url| unsafe { trash_url.path() })
+        .map(|s| PathBuf::from(s.to_string()))
+        .ok_or_else(|| anyhow!("trash {}: no resulting URL returned", path.display()))?;
+    Ok(crate::vfs::TrashId {
+        original: path.to_path_buf(),
+        trashed,
+    })
+}
+
 /// Enumerate mounted volumes with name, capacity, and ejectability resource
 /// values. Blocking — always called through `unblock`.
 #[allow(unused_unsafe)] // objc2's generated bindings flip between safe and
