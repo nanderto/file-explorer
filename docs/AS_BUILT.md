@@ -510,11 +510,13 @@ component sections; this list is the scannable index.
   creates `"New Folder"` / `"New Folder 2"` via `next_available_name` and
   leaves it named. Now that the rename editor exists, wiring the create path
   to open it on the new row is a small follow-up. *M3 remainder.*
-- **`details_rename_editing` baseline needs regenerating** — the first
-  generated PNG carried `conflict_dialog`'s leaked "1 job" indicator and the
-  rename row's then-empty Size/Date cells; both are fixed, so the baseline
-  must be re-dispatched (`gh workflow run update-visual-baselines.yml`) and
-  the other eight confirmed unchanged. *Immediately, on this branch.*
+- **`UPDATE_BASELINE=1` rewrites every scenario, so unrelated PNGs churn by a
+  byte or two per regeneration** — the M3 rename run rewrote 6 baselines with
+  0–1 byte deltas (text-heavy scenarios only; `workspace_dark`/`light` were
+  byte-identical), consistent with macOS text-rasterization noise between
+  runner instances, which is what the ≥99% / tolerance-3 comparison exists to
+  absorb. Harmless but it makes baseline commits noisy to review. *Revisit if
+  a regeneration ever flips a comparison result: write only changed files.*
 
 - **Symlink copy policy** — copy dereferences file links; symlink-to-dir inside
   a copied tree fails the job (details under fs-core). *Revisit when a
