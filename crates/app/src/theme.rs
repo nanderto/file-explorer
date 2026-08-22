@@ -33,6 +33,8 @@ pub struct Theme {
     pub accent: Hsla,
     /// Hairline borders between regions.
     pub border: Hsla,
+    /// Errors and destructive emphasis (invalid path, failed operation).
+    pub error: Hsla,
 }
 
 impl Theme {
@@ -48,6 +50,7 @@ impl Theme {
             muted: hsla(0.0, 0.0, 0.55, 1.0),
             accent: hsla(210.0 / 360.0, 0.90, 0.55, 1.0),
             border: hsla(0.0, 0.0, 0.0, 0.35),
+            error: hsla(0.0, 0.75, 0.58, 1.0),
         }
     }
 
@@ -63,6 +66,7 @@ impl Theme {
             muted: hsla(0.0, 0.0, 0.45, 1.0),
             accent: hsla(210.0 / 360.0, 0.90, 0.45, 1.0),
             border: hsla(0.0, 0.0, 0.0, 0.12),
+            error: hsla(0.0, 0.72, 0.45, 1.0),
         }
     }
 }

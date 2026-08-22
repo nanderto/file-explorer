@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app"]
+members = ["crates/app", "crates/fs-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,10 @@ publish = false
 gpui = { git = "https://github.com/zed-industries/zed", rev = "fd82517a115d97a07835b52f0512b22b38e38ccf", default-features = false, features = ["font-kit", "windows-manifest"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fd82517a115d97a07835b52f0512b22b38e38ccf", features = ["font-kit"] }
 anyhow = "1.0.86"
+futures = "0.3"
+once_cell = "1"
+regex = "1"
+unicode-segmentation = "1"
 # Must stay semver-compatible with Zed's `image` so RgbaImage from
 # gpui::VisualTestAppContext::capture_screenshot unifies with ours.
 image = { version = "0.25.1", default-features = false, features = ["png"] }

@@ -31,9 +31,13 @@ fn main() {
 #[cfg(target_os = "macos")]
 mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
-    use file_explorer_app::{Theme, WorkspaceView, visual_diff};
-    use gpui::{AnyWindowHandle, AppContext as _, VisualTestAppContext, px, size};
-    use std::path::PathBuf;
+    use file_explorer_app::app_state::{FsContext, GpuiSpawner, LoggingOpener};
+    use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
+    use fs_core::{FakeVfs, SortKey, Spawner, Vfs};
+    use gpui::{AnyWindowHandle, AppContext as _, Entity, VisualTestAppContext, px, size};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     /// Minimum fraction of matching pixels for a test to pass.
     const MATCH_THRESHOLD: f64 = 0.99;
@@ -53,24 +57,89 @@ mod macos {
         }
     }
 
-    /// Every visual scenario: (name, theme). Add new UI states here.
-    fn scenarios() -> Vec<(&'static str, Theme)> {
+    /// UI state a scenario sets up after the window opens (§9 testing map).
+    #[derive(Clone, Copy)]
+    enum Setup {
+        /// The boot state: no folder open.
+        None,
+        /// Navigate the active pane to a fixture directory.
+        Navigate(&'static str),
+        /// Navigate, then sort by a column.
+        NavigateSorted(&'static str, SortKey),
+        /// Navigate, then swap the breadcrumb for the path editor
+        /// (prefilled + autocomplete popup from the fixture).
+        AddressBarEditing(&'static str),
+    }
+
+    /// Every visual scenario: (name, theme, setup). Add new UI states here.
+    /// All content comes from the deterministic FakeVfs fixture below — fixed
+    /// sizes, counter-based mtimes, no wall clock.
+    fn scenarios() -> Vec<(&'static str, Theme, Setup)> {
         vec![
-            ("workspace_dark", Theme::dark()),
-            ("workspace_light", Theme::light()),
+            ("workspace_dark", Theme::dark(), Setup::None),
+            ("workspace_light", Theme::light(), Setup::None),
+            ("listing_populated", Theme::dark(), Setup::Navigate("/home")),
+            (
+                "listing_sorted_by_size",
+                Theme::dark(),
+                Setup::NavigateSorted("/home", SortKey::Size),
+            ),
+            (
+                "address_bar_editing",
+                Theme::dark(),
+                Setup::AddressBarEditing("/home/Documents"),
+            ),
         ]
+    }
+
+    /// The fixture tree every scenario renders. Sizes are chosen so
+    /// sort-by-size differs visibly from sort-by-name.
+    fn install_fixture_vfs(cx: &mut VisualTestAppContext) {
+        cx.update(|cx| {
+            let spawner: Arc<dyn Spawner> =
+                Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
+            let vfs = FakeVfs::new(spawner.clone());
+            vfs.insert_tree(
+                "/",
+                json!({
+                    "home": {
+                        "Documents": {
+                            "notes.txt": "0123456789",
+                            "report.pdf": "This is a much longer fixture file body.",
+                        },
+                        "Downloads": {},
+                        "Desktop": {},
+                        "Pictures": {},
+                        "archive.zip": "zip",
+                        "big-video.mov": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                        "readme.md": "hello world",
+                        ".hidden-config": "secret",
+                    }
+                }),
+            );
+            let vfs: Arc<dyn Vfs> = vfs;
+            cx.set_global(FsContext {
+                vfs,
+                spawner,
+                opener: Arc::new(LoggingOpener),
+            });
+        });
     }
 
     fn run(update_baseline: bool) -> Result<()> {
         let mut cx = VisualTestAppContext::new(gpui_platform::current_platform(false));
+        install_fixture_vfs(&mut cx);
+        cx.update(|cx| {
+            keymap::init(cx);
+        });
 
         let mut passed = 0u32;
         let mut updated = 0u32;
         let mut failures: Vec<String> = Vec::new();
 
-        for (name, theme) in scenarios() {
+        for (name, theme, setup) in scenarios() {
             println!("visual test: {name}");
-            match run_scenario(&mut cx, name, theme, update_baseline) {
+            match run_scenario(&mut cx, name, theme, setup, update_baseline) {
                 Ok(ScenarioResult::Passed) => {
                     println!("  PASS");
                     passed += 1;
@@ -101,19 +170,70 @@ mod macos {
         BaselineUpdated,
     }
 
+    /// Drive the workspace into the scenario's UI state. Navigation loads run
+    /// on the (deterministic) background executor; callers `run_until_parked`
+    /// after this returns.
+    fn apply_setup(
+        cx: &mut VisualTestAppContext,
+        handle: AnyWindowHandle,
+        workspace: &Entity<Workspace>,
+        setup: Setup,
+    ) -> Result<()> {
+        let navigate = |cx: &mut VisualTestAppContext, path: &str| {
+            let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+            cx.update_window(handle, |_, _, cx| {
+                pane.update(cx, |pane, cx| pane.navigate_to(Path::new(path), cx));
+            })
+            .map_err(|e| anyhow!("navigate failed: {e:?}"))
+        };
+
+        match setup {
+            Setup::None => {}
+            Setup::Navigate(path) => {
+                navigate(cx, path)?;
+            }
+            Setup::NavigateSorted(path, key) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                cx.update_window(handle, |_, _, cx| {
+                    pane.update(cx, |pane, cx| pane.sort_by(key, cx));
+                })
+                .map_err(|e| anyhow!("sort failed: {e:?}"))?;
+            }
+            Setup::AddressBarEditing(path) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                cx.update_window(handle, |_, window, cx| {
+                    pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+                })
+                .map_err(|e| anyhow!("focus_address_bar failed: {e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
     fn run_scenario(
         cx: &mut VisualTestAppContext,
         name: &str,
         theme: Theme,
+        setup: Setup,
         update_baseline: bool,
     ) -> Result<ScenarioResult> {
+        let mut workspace_slot: Option<Entity<Workspace>> = None;
         let window = cx
-            .open_offscreen_window(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), |_, cx| {
-                cx.new(|_| WorkspaceView::new(theme))
+            .open_offscreen_window(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(theme, window, cx));
+                workspace_slot = Some(workspace.clone());
+                workspace
             })
             .map_err(|e| anyhow!("failed to open off-screen window: {e:?}"))?;
         let handle: AnyWindowHandle = window.into();
+        let workspace = workspace_slot.expect("window build ran");
 
+        cx.run_until_parked();
+        apply_setup(cx, handle, &workspace, setup)?;
         cx.run_until_parked();
         cx.update_window(handle, |_, window, _| window.refresh())
             .map_err(|e| anyhow!("failed to refresh window: {e:?}"))?;
