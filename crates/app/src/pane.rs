@@ -368,7 +368,7 @@ impl Pane {
     fn apply_restore(&mut self, restore: Option<NavEntry>, cx: &mut Context<Self>) {
         match restore {
             Some(entry) => {
-                let cursor = entry.cursor.filter(|id| self.snapshot_contains(id));
+                let cursor = entry.cursor.filter(|id| self.listing_contains(id, cx));
                 self.scroll_top = entry.scroll_top;
                 let scroll_top = entry.scroll_top;
                 self.dir_view.update(cx, |dir_view, cx| {
@@ -378,7 +378,7 @@ impl Pane {
             }
             None => {
                 if let Some(cursor) = self.cursor(cx)
-                    && !self.snapshot_contains(&cursor)
+                    && !self.listing_contains(&cursor, cx)
                 {
                     self.dir_view
                         .update(cx, |dir_view, cx| dir_view.set_cursor(None, cx));
@@ -387,10 +387,14 @@ impl Pane {
         }
     }
 
-    fn snapshot_contains(&self, id: &EntryId) -> bool {
+    /// Whether a path is visible in the listing: in the snapshot, or injected
+    /// by the DirView's in-place expansion (M2) — so a cursor sitting on an
+    /// expanded folder's child survives fresh loads and refreshes.
+    fn listing_contains(&self, id: &EntryId, cx: &App) -> bool {
         self.snapshot
             .as_ref()
             .is_some_and(|snap| snap.entries.iter().any(|entry| entry.id() == *id))
+            || self.dir_view.read(cx).injected_contains(id)
     }
 
     fn current_nav_entry(&self, cx: &App) -> Option<NavEntry> {
@@ -723,6 +727,7 @@ mod tests {
                 vfs: vfs.clone(),
                 spawner,
                 opener: Arc::new(LoggingOpener),
+                platform: Arc::new(fs_core::StubPlatform::new()),
             });
             vfs
         })

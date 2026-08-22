@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use file_explorer_app::{Theme, Workspace, app_state, keymap};
+use file_explorer_app::{Theme, Workspace, app_state, keymap, settings};
 use gpui::{App, AppContext as _, Bounds, Focusable as _, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
 
 fn main() {
     application().run(|cx: &mut App| {
         app_state::init(cx);
+        settings::init(cx);
         keymap::init(cx);
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         let window = cx

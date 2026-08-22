@@ -69,6 +69,10 @@ mod macos {
         /// Navigate, then swap the breadcrumb for the path editor
         /// (prefilled + autocomplete popup from the fixture).
         AddressBarEditing(&'static str),
+        /// Navigate, then expand sidebar folder-tree nodes (M2).
+        SidebarTreeExpanded(&'static str, &'static [&'static str]),
+        /// Navigate, then expand folders in place in the details view (M2).
+        DetailsFolderExpanded(&'static str, &'static [&'static str]),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -88,6 +92,16 @@ mod macos {
                 "address_bar_editing",
                 Theme::dark(),
                 Setup::AddressBarEditing("/home/Documents"),
+            ),
+            (
+                "sidebar_tree_expanded",
+                Theme::dark(),
+                Setup::SidebarTreeExpanded("/home", &["/", "/home"]),
+            ),
+            (
+                "details_folder_expanded",
+                Theme::dark(),
+                Setup::DetailsFolderExpanded("/home", &["/home/Documents"]),
             ),
         ]
     }
@@ -114,6 +128,10 @@ mod macos {
                         "big-video.mov": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
                         "readme.md": "hello world",
                         ".hidden-config": "secret",
+                    },
+                    "config": {
+                        // Deterministic sidebar favorites for every scenario.
+                        "settings.json": r#"{"favorites": ["/home/Documents", "/home/Downloads"]}"#,
                     }
                 }),
             );
@@ -122,7 +140,12 @@ mod macos {
                 vfs,
                 spawner,
                 opener: Arc::new(LoggingOpener),
+                platform: Arc::new(fs_core::StubPlatform::new()),
             });
+            file_explorer_app::settings::init_with_path(
+                cx,
+                PathBuf::from("/config/settings.json"),
+            );
         });
     }
 
@@ -209,6 +232,37 @@ mod macos {
                     pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
                 })
                 .map_err(|e| anyhow!("focus_address_bar failed: {e:?}"))?;
+            }
+            Setup::SidebarTreeExpanded(path, expand) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let sidebar = cx.read(|cx| workspace.read(cx).sidebar().clone());
+                for node in expand {
+                    cx.update_window(handle, |_, _, cx| {
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.toggle_expanded(Path::new(node), cx);
+                        });
+                    })
+                    .map_err(|e| anyhow!("tree expand failed: {e:?}"))?;
+                    // Each expansion's children load before the next level.
+                    cx.run_until_parked();
+                }
+            }
+            Setup::DetailsFolderExpanded(path, expand) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                let dir_view = cx.read(|cx| pane.read(cx).dir_view().clone());
+                for node in expand {
+                    cx.update_window(handle, |_, _, cx| {
+                        dir_view.update(cx, |dir_view, cx| {
+                            dir_view.toggle_expanded(Path::new(node), cx);
+                        });
+                    })
+                    .map_err(|e| anyhow!("details expand failed: {e:?}"))?;
+                    // Each expansion's children load before the next level.
+                    cx.run_until_parked();
+                }
             }
         }
         Ok(())

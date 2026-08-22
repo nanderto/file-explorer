@@ -379,6 +379,7 @@ mod tests {
                 vfs: fake,
                 spawner: Arc::new(GpuiSpawner::new(cx.background_executor().clone())),
                 opener: Arc::new(LoggingOpener),
+                platform: Arc::new(fs_core::StubPlatform::new()),
             });
         });
         let (bar, cx) = cx.add_window_view(|_, cx| AddressBar::new(Theme::dark(), cx));

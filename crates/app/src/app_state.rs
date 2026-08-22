@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fs_core::exec::UnblockClosure;
-use fs_core::{RealVfs, Spawner, Vfs};
+use fs_core::{Platform, RealVfs, Spawner, Vfs};
 use futures::future::BoxFuture;
 use gpui::{App, BackgroundExecutor, Global};
 
@@ -33,12 +33,13 @@ impl Opener for LoggingOpener {
 }
 
 /// Global filesystem context. M1 carries the Vfs, Spawner, and the opener
-/// stub; the job queue, undo stack, clipboard, and `JobsModel` handle join at
-/// M3 (additive).
+/// stub; M2 adds the [`Platform`] handle (volumes + eject); the job queue,
+/// undo stack, clipboard, and `JobsModel` handle join at M3 (additive).
 pub struct FsContext {
     pub vfs: Arc<dyn Vfs>,
     pub spawner: Arc<dyn Spawner>,
     pub opener: Arc<dyn Opener>,
+    pub platform: Arc<dyn Platform>,
 }
 
 impl Global for FsContext {}
@@ -54,10 +55,15 @@ impl FsContext {
 pub fn init(cx: &mut App) {
     let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
     let vfs: Arc<dyn Vfs> = Arc::new(RealVfs::new(spawner.clone()));
+    #[cfg(target_os = "macos")]
+    let platform: Arc<dyn Platform> = Arc::new(fs_core::MacPlatform::new(spawner.clone()));
+    #[cfg(not(target_os = "macos"))]
+    let platform: Arc<dyn Platform> = Arc::new(fs_core::StubPlatform::new());
     cx.set_global(FsContext {
         vfs,
         spawner,
         opener: Arc::new(LoggingOpener),
+        platform,
     });
 }
 

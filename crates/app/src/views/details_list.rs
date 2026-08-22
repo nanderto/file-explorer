@@ -1,15 +1,17 @@
 //! Details-list rendering for [`DirView`] (ARCHITECTURE.md §8 "Details
 //! list"): a `uniform_list` of fixed-height rows with Name / Size / Date
 //! Modified columns, and a sortable header row whose cells dispatch
-//! [`SortBy`] (with an arrow indicator on the active column). Folders-first
-//! ordering comes from the snapshot's [`SortSpec`] — rows render in snapshot
-//! order. Every color reads the [`Theme`]; no literals.
+//! [`SortBy`] (with an arrow indicator on the active column). Rows render in
+//! the DirView's flat projection order (snapshot order plus expanded
+//! folders' injected children, M2 §8); disclosure triangles and indentation
+//! render from each row's depth field. Header and body cells share the
+//! column-width constants below, so values align under their headers. Every
+//! color reads the [`Theme`]; no literals.
 
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs_core::{FileEntry, ListingSnapshot, SortDirection, SortKey, SortSpec};
+use fs_core::{SortDirection, SortKey, SortSpec};
 use gpui::{
     ClickEvent, Context, Hsla, IntoElement, SharedString, Stateful, UniformList, div, prelude::*,
     px, uniform_list,
@@ -22,8 +24,13 @@ use crate::theme::Theme;
 
 /// Fixed row height (uniform_list requirement) shared by header and rows.
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
+/// Column widths shared by the header row and every body row — the single
+/// source of the details view's column alignment.
 const SIZE_COL_WIDTH: f32 = 90.0;
 const DATE_COL_WIDTH: f32 = 150.0;
+/// Width of the disclosure-triangle slot (also the per-depth indent), part
+/// of the Name column.
+const DISCLOSURE_WIDTH: f32 = 16.0;
 /// Selection tint: the theme accent at partial alpha, so selected-row text
 /// keeps its normal contrast in both appearances.
 const SELECTION_ALPHA: f32 = 0.35;
@@ -45,11 +52,19 @@ pub(crate) fn render_header(
         .border_color(theme.border)
         .text_size(px(11.0))
         .text_color(theme.muted)
+        // Spacer over the body rows' disclosure-triangle slot so "Name"
+        // aligns with depth-0 names.
+        .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
         .child(header_cell("Name", SortKey::Name, sort, true, cx))
-        .child(header_cell("Size", SortKey::Size, sort, false, cx).w(px(SIZE_COL_WIDTH)))
+        .child(
+            header_cell("Size", SortKey::Size, sort, false, cx)
+                .w(px(SIZE_COL_WIDTH))
+                .flex_none(),
+        )
         .child(
             header_cell("Date Modified", SortKey::DateModified, sort, false, cx)
-                .w(px(DATE_COL_WIDTH)),
+                .w(px(DATE_COL_WIDTH))
+                .flex_none(),
         )
 }
 
@@ -89,20 +104,19 @@ fn header_cell(
     cell
 }
 
-/// The virtualized row list over the snapshot (only the visible range
-/// renders).
-pub(crate) fn render_rows(
-    dir_view: &DirView,
-    snapshot: Arc<ListingSnapshot>,
-    cx: &mut Context<DirView>,
-) -> UniformList {
-    let item_count = snapshot.entries.len();
+/// The virtualized row list over the DirView's flat projection (only the
+/// visible range renders; expansion just changes the projection length).
+pub(crate) fn render_rows(dir_view: &DirView, cx: &mut Context<DirView>) -> UniformList {
+    let item_count = dir_view.flat_rows().len();
     uniform_list(
         "details-rows",
         item_count,
         cx.processor(move |this, range: Range<usize>, _window, cx| {
             range
-                .map(|ix| render_row(this, &snapshot.entries[ix], ix, cx))
+                .filter_map(|ix| {
+                    let row = this.flat_rows().get(ix)?.clone();
+                    Some(render_row(this, &row, ix, cx))
+                })
                 .collect::<Vec<_>>()
         }),
     )
@@ -112,10 +126,11 @@ pub(crate) fn render_rows(
 
 fn render_row(
     this: &mut DirView,
-    entry: &FileEntry,
+    row: &crate::dir_view::ProjectedRow,
     ix: usize,
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
+    let entry = &row.entry;
     let theme = this.theme().clone();
     let selected = this.cursor() == Some(&entry.id());
     let name: SharedString = SharedString::new(entry.name.clone());
@@ -127,11 +142,39 @@ fn render_row(
     let modified: SharedString = SharedString::new(format_modified(entry.modified));
     let click_entry = entry.clone();
 
-    let mut row = div()
+    // The Name column: per-depth indent, then a disclosure-triangle slot
+    // (folders only — files keep an empty slot so names stay aligned), then
+    // the truncating name.
+    let disclosure: gpui::AnyElement = if entry.is_dir_like() {
+        let toggle_path = entry.path.clone();
+        div()
+            .id(("dir-row-disclosure", ix))
+            .debug_selector(|| format!("dir-row-disclosure-{ix}"))
+            .w(px(DISCLOSURE_WIDTH))
+            .flex_none()
+            .text_color(theme.muted)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                window.focus(this.focus_handle_ref(), cx);
+                this.toggle_expanded(&toggle_path, cx);
+            }))
+            .child(SharedString::new_static(if row.expanded {
+                "▾"
+            } else {
+                "▸"
+            }))
+            .into_any_element()
+    } else {
+        div().w(px(DISCLOSURE_WIDTH)).flex_none().into_any_element()
+    };
+
+    let mut styled_row = div()
         .id(ix)
         .debug_selector(|| format!("dir-row-{ix}"))
         .flex()
         .items_center()
+        .w_full()
         .h(px(ROW_HEIGHT))
         .px(px(8.0))
         .text_size(px(13.0))
@@ -149,10 +192,13 @@ fn render_row(
                 this.select_entry(&click_entry, cx);
             }
         }))
+        .child(div().w(px(row.depth as f32 * DISCLOSURE_WIDTH)).flex_none())
+        .child(disclosure)
         .child(div().flex_1().truncate().child(name))
         .child(
             div()
                 .w(px(SIZE_COL_WIDTH))
+                .flex_none()
                 .flex()
                 .justify_end()
                 .text_color(theme.muted)
@@ -161,15 +207,16 @@ fn render_row(
         .child(
             div()
                 .w(px(DATE_COL_WIDTH))
+                .flex_none()
                 .flex()
                 .justify_end()
                 .text_color(theme.muted)
                 .child(modified),
         );
     if selected {
-        row = row.bg(selection_color(&theme));
+        styled_row = styled_row.bg(selection_color(&theme));
     }
-    row
+    styled_row
 }
 
 /// The selection background, derived from the active theme's accent (no

@@ -21,17 +21,18 @@ path = "src/bin/visual_test_runner.rs"
 required-features = ["visual-tests"]
 
 [features]
-# fs-core/test-support + serde_json: the visual runner renders deterministic
-# FakeVfs fixture trees, never the real filesystem (ARCHITECTURE.md §9).
+# fs-core/test-support: the visual runner renders deterministic FakeVfs
+# fixture trees, never the real filesystem (ARCHITECTURE.md §9).
 visual-tests = [
     "gpui/test-support",
     "gpui_platform/test-support",
     "fs-core/test-support",
-    "dep:serde_json",
 ]
 
 [dependencies]
 anyhow.workspace = true
+# Platform config dir for settings.json (env lookup only — no disk I/O).
+dirs = "6"
 fs-core = { path = "../fs-core" }
 futures.workspace = true
 gpui.workspace = true
@@ -39,7 +40,8 @@ gpui_platform.workspace = true
 image.workspace = true
 once_cell.workspace = true
 regex.workspace = true
-serde_json = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

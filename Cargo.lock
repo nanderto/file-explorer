@@ -1565,6 +1565,7 @@ name = "file-explorer-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "fs-core",
  "futures",
  "gpui",
@@ -1572,6 +1573,7 @@ dependencies = [
  "image",
  "once_cell",
  "regex",
+ "serde",
  "serde_json",
  "unicode-segmentation",
 ]
@@ -1744,6 +1746,7 @@ dependencies = [
  "fs4",
  "futures",
  "notify",
+ "objc2-foundation 0.3.2",
  "serde",
  "serde_json",
  "tempfile",

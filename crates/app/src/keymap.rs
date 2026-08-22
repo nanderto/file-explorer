@@ -1,7 +1,7 @@
 //! Default key bindings, transcribed 1:1 from the ARCHITECTURE.md §0
-//! traceability table (M1 rows). When a binding changes, the table changes in
-//! the same PR. JSON user overrides are deferred to M7; this table stays
-//! authoritative for defaults.
+//! traceability table (M1 + M2 rows). When a binding changes, the table
+//! changes in the same PR. JSON user overrides are deferred to M7; this table
+//! stays authoritative for defaults.
 //!
 //! Key contexts (§3): `Workspace` (root), `Pane`, `DirView` (+ dynamic
 //! `renaming` token), `AddressBar`, `TextInput`. Every context is guarded by
@@ -46,6 +46,12 @@ pub fn init(cx: &mut App) {
         ),
         KeyBinding::new("pageup", PageUp, Some("DirView && !renaming")),
         KeyBinding::new("pagedown", PageDown, Some("DirView && !renaming")),
+        // §0 Views (M2): in-place folder expansion. The §0 "triangle click"
+        // trigger is row-targeted mouse dispatch (like SortBy header clicks):
+        // it calls DirView::toggle_expanded, the same single implementation
+        // these cursor-relative actions funnel into.
+        KeyBinding::new("right", ExpandSelected, Some("DirView && !renaming")),
+        KeyBinding::new("left", CollapseSelected, Some("DirView && !renaming")),
         // §0 Hidden files (M1)
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some("Workspace")),
         // §0 Refresh (M1)
@@ -129,6 +135,8 @@ mod tests {
                 .on_action(record!(ExtendSelectionPrev, "ExtendSelectionPrev"))
                 .on_action(record!(PageUp, "PageUp"))
                 .on_action(record!(PageDown, "PageDown"))
+                .on_action(record!(ExpandSelected, "ExpandSelected"))
+                .on_action(record!(CollapseSelected, "CollapseSelected"))
                 .on_action(record!(AcceptSuggestion, "AcceptSuggestion"))
                 .on_action(record!(Confirm, "Confirm"))
                 .on_action(record!(Cancel, "Cancel"))
@@ -159,7 +167,7 @@ mod tests {
     fn dir_view_context_dispatches_every_m1_binding(cx: &mut TestAppContext) {
         let (fired, cx) = probe(cx, "DirView");
         cx.simulate_keystrokes("enter backspace alt-up cmd-a down up home end pageup pagedown");
-        cx.simulate_keystrokes("shift-down shift-up");
+        cx.simulate_keystrokes("shift-down shift-up right left");
         assert_eq!(
             *fired.borrow(),
             vec![
@@ -175,6 +183,8 @@ mod tests {
                 "PageDown",
                 "ExtendSelectionNext",
                 "ExtendSelectionPrev",
+                "ExpandSelected",
+                "CollapseSelected",
             ]
         );
     }
