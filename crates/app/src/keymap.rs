@@ -1,10 +1,12 @@
 //! Default key bindings, transcribed 1:1 from the ARCHITECTURE.md §0
-//! traceability table (M1 + M2 rows). When a binding changes, the table
+//! traceability table (M1/M2 rows + the M3 job-spine rows). When a binding
+//! changes, the table
 //! changes in the same PR. JSON user overrides are deferred to M7; this table
 //! stays authoritative for defaults.
 //!
 //! Key contexts (§3): `Workspace` (root), `Pane`, `DirView` (+ dynamic
-//! `renaming` token), `AddressBar`, `TextInput`. Every context is guarded by
+//! `renaming` token), `AddressBar`, `TextInput`, and (M3) the modal
+//! `ConflictDialog` / `ConfirmDialog` contexts. Every context is guarded by
 //! a dispatch test — the tripwire for a missing `track_focus` on the node
 //! carrying `key_context`, which gpui fails silently, not at compile time.
 
@@ -52,10 +54,37 @@ pub fn init(cx: &mut App) {
         // these cursor-relative actions funnel into.
         KeyBinding::new("right", ExpandSelected, Some("DirView && !renaming")),
         KeyBinding::new("left", CollapseSelected, Some("DirView && !renaming")),
+        // §0 Cut/paste (M3): cut sources render dimmed; paste moves on cut
+        KeyBinding::new("cmd-x", Cut, Some("DirView && !renaming")),
+        KeyBinding::new("cmd-c", Copy, Some("DirView && !renaming")),
+        KeyBinding::new("cmd-v", Paste, Some("DirView && !renaming")),
+        // §0 Delete (M3): plain delete → trash; shift-delete bypasses the
+        // trash behind the ConfirmDialog guard
+        KeyBinding::new("delete", DeleteToTrash, Some("DirView && !renaming")),
+        KeyBinding::new(
+            "shift-delete",
+            DeletePermanently,
+            Some("DirView && !renaming"),
+        ),
+        // §0 New folder (M3); New ▸ Text file… is context-menu only (no key)
+        KeyBinding::new("cmd-shift-n", NewFolder, Some("Pane")),
         // §0 Hidden files (M1)
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some("Workspace")),
         // §0 Refresh (M1)
         KeyBinding::new("cmd-r", Refresh, Some("Pane")),
+        // §0 Undo / Redo (M3)
+        KeyBinding::new("cmd-z", Undo, Some("Workspace")),
+        KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),
+        // §0 Conflict dialog (M3)
+        KeyBinding::new("r", ConflictReplace, Some("ConflictDialog")),
+        KeyBinding::new("s", ConflictSkip, Some("ConflictDialog")),
+        KeyBinding::new("k", ConflictKeepBoth, Some("ConflictDialog")),
+        KeyBinding::new("a", ToggleApplyToAll, Some("ConflictDialog")),
+        KeyBinding::new("enter", Confirm, Some("ConflictDialog")),
+        KeyBinding::new("escape", Cancel, Some("ConflictDialog")),
+        // §0 Delete-permanently confirmation dialog (M3)
+        KeyBinding::new("enter", Confirm, Some("ConfirmDialog")),
+        KeyBinding::new("escape", Cancel, Some("ConfirmDialog")),
     ]);
 
     // Editing keys inside the vendored text input (its own action namespace,
@@ -137,9 +166,21 @@ mod tests {
                 .on_action(record!(PageDown, "PageDown"))
                 .on_action(record!(ExpandSelected, "ExpandSelected"))
                 .on_action(record!(CollapseSelected, "CollapseSelected"))
+                .on_action(record!(Cut, "Cut"))
+                .on_action(record!(Copy, "Copy"))
+                .on_action(record!(Paste, "Paste"))
+                .on_action(record!(DeleteToTrash, "DeleteToTrash"))
+                .on_action(record!(DeletePermanently, "DeletePermanently"))
+                .on_action(record!(NewFolder, "NewFolder"))
                 .on_action(record!(AcceptSuggestion, "AcceptSuggestion"))
                 .on_action(record!(Confirm, "Confirm"))
                 .on_action(record!(Cancel, "Cancel"))
+                .on_action(record!(Undo, "Undo"))
+                .on_action(record!(Redo, "Redo"))
+                .on_action(record!(ConflictReplace, "ConflictReplace"))
+                .on_action(record!(ConflictSkip, "ConflictSkip"))
+                .on_action(record!(ConflictKeepBoth, "ConflictKeepBoth"))
+                .on_action(record!(ToggleApplyToAll, "ToggleApplyToAll"))
                 .size_full()
         }
     }
@@ -168,6 +209,7 @@ mod tests {
         let (fired, cx) = probe(cx, "DirView");
         cx.simulate_keystrokes("enter backspace alt-up cmd-a down up home end pageup pagedown");
         cx.simulate_keystrokes("shift-down shift-up right left");
+        cx.simulate_keystrokes("cmd-x cmd-c cmd-v delete shift-delete");
         assert_eq!(
             *fired.borrow(),
             vec![
@@ -185,14 +227,31 @@ mod tests {
                 "ExtendSelectionPrev",
                 "ExpandSelected",
                 "CollapseSelected",
+                "Cut",
+                "Copy",
+                "Paste",
+                "DeleteToTrash",
+                "DeletePermanently",
             ]
         );
+    }
+
+    // §9 dispatch guard for the `Pane` `cmd-shift-n` row (the real-entity
+    // creation flow is covered in `pane.rs` tests).
+    #[gpui::test]
+    fn pane_context_dispatches_new_folder(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "Pane");
+        cx.simulate_keystrokes("cmd-shift-n");
+        assert_eq!(*fired.borrow(), vec!["NewFolder"]);
     }
 
     #[gpui::test]
     fn renaming_token_suppresses_dir_view_bindings(cx: &mut TestAppContext) {
         let (fired, cx) = probe(cx, "DirView renaming");
+        // §0 guard: every DirView row — including delete and the clipboard
+        // keys — must stay dead while the rename editor is up.
         cx.simulate_keystrokes("enter backspace cmd-a");
+        cx.simulate_keystrokes("cmd-x cmd-c cmd-v delete shift-delete");
         assert!(
             fired.borrow().is_empty(),
             "`!renaming` guard must block DirView bindings while renaming, got {:?}",
@@ -212,5 +271,41 @@ mod tests {
         let (fired, cx) = probe(cx, "TextInput");
         cx.simulate_keystrokes("enter escape");
         assert_eq!(*fired.borrow(), vec!["Confirm", "Cancel"]);
+    }
+
+    // §9 dispatch guard for the `ConflictDialog` context: every §0 conflict
+    // row (r/s/k/a/enter/escape) must reach a handler. The real entity is
+    // additionally exercised end-to-end in `workspace.rs` tests.
+    #[gpui::test]
+    fn conflict_dialog_context_dispatches_every_m3_binding(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "ConflictDialog");
+        cx.simulate_keystrokes("r s k a enter escape");
+        assert_eq!(
+            *fired.borrow(),
+            vec![
+                "ConflictReplace",
+                "ConflictSkip",
+                "ConflictKeepBoth",
+                "ToggleApplyToAll",
+                "Confirm",
+                "Cancel",
+            ]
+        );
+    }
+
+    // §9 dispatch guard for the `ConfirmDialog` context (enter/escape).
+    #[gpui::test]
+    fn confirm_dialog_context_dispatches_confirm_and_cancel(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "ConfirmDialog");
+        cx.simulate_keystrokes("enter escape");
+        assert_eq!(*fired.borrow(), vec!["Confirm", "Cancel"]);
+    }
+
+    // §9 dispatch guard for the M3 `Workspace` undo/redo rows.
+    #[gpui::test]
+    fn workspace_context_dispatches_undo_and_redo(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "Workspace");
+        cx.simulate_keystrokes("cmd-z cmd-shift-z");
+        assert_eq!(*fired.borrow(), vec!["Undo", "Redo"]);
     }
 }

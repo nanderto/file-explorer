@@ -365,7 +365,7 @@ impl Render for AddressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::{FsContext, GpuiSpawner, LoggingOpener};
+    use crate::app_state::{GpuiSpawner, LoggingOpener};
     use fs_core::{FakeVfs, Spawner};
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -375,12 +375,13 @@ mod tests {
         let fake = fake_vfs(cx);
         cx.update(|cx| {
             crate::keymap::init(cx);
-            cx.set_global(FsContext {
-                vfs: fake,
-                spawner: Arc::new(GpuiSpawner::new(cx.background_executor().clone())),
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(fs_core::StubPlatform::new()),
-            });
+            crate::app_state::install(
+                cx,
+                fake,
+                Arc::new(GpuiSpawner::new(cx.background_executor().clone())),
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
         });
         let (bar, cx) = cx.add_window_view(|_, cx| AddressBar::new(Theme::dark(), cx));
         (bar, cx)

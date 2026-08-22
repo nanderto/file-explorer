@@ -7,8 +7,10 @@
 //! an in-memory tree built from `json!` fixtures with pausable/flushable
 //! watcher events.
 
-use std::path::{Component, Path};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,6 +20,7 @@ use futures::stream::BoxStream;
 
 use crate::entry::{EntryKind, EntryMeta, FileEntry, TargetKind};
 use crate::exec::{Spawner, SpawnerExt as _};
+use crate::platform::trash as trash_engine;
 use crate::watcher::{self, PathEvent, WatchGuard};
 
 /// Identifies the volume a path lives on. Used for job-lane routing (M3);
@@ -47,6 +50,84 @@ pub fn volume_key_for(path: &Path) -> VolumeKey {
     }
 }
 
+/// Options for [`Vfs::create_file`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreateOptions {
+    /// Replace an existing file instead of failing.
+    pub overwrite: bool,
+}
+
+/// Options for [`Vfs::rename`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenameOptions {
+    /// Replace an existing destination instead of failing.
+    pub overwrite: bool,
+}
+
+/// Options for [`Vfs::remove`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemoveOptions {
+    /// Remove non-empty directories (and their contents).
+    pub recursive: bool,
+}
+
+/// Progress callback for [`Vfs::copy`]: `(bytes_done, bytes_total)` — invoked
+/// before the first chunk and after every chunk. Returning `false` aborts the
+/// copy between chunks (the M3 cancellation point *inside* a file): the
+/// partial destination is removed and `copy` fails with [`CopyCancelled`].
+pub type ProgressFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
+
+/// Marker error returned by [`Vfs::copy`] when the [`ProgressFn`] aborted the
+/// copy. Downcast with `error.is::<CopyCancelled>()` to tell cancellation from
+/// real I/O failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyCancelled;
+
+impl fmt::Display for CopyCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "copy cancelled by progress callback")
+    }
+}
+
+impl std::error::Error for CopyCancelled {}
+
+/// Undo token returned by [`Vfs::trash`] and consumed by [`Vfs::restore`]
+/// (ARCHITECTURE.md §6: `trash(path) -> Result<TrashId>`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TrashId {
+    /// Where the item lived before it was trashed — the restore target.
+    pub original: PathBuf,
+    /// Where the trashed payload lives now: a `.fake-trash` entry on the
+    /// portable scheme, or the real trash URL's path on macOS.
+    pub trashed: PathBuf,
+}
+
+/// Typed restore failures (ARCHITECTURE.md §6) — each variant has distinct UX
+/// (toast / conflict-style prompt / silent no-op) and is directly assertable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrashRestoreError {
+    /// Trash item gone (emptied externally).
+    NotFound,
+    /// Original path now occupied.
+    Collision(PathBuf),
+    /// Token consumed (double-undo race).
+    AlreadyRestored,
+}
+
+impl fmt::Display for TrashRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "item is no longer in the trash"),
+            Self::Collision(path) => {
+                write!(f, "original location is occupied: {}", path.display())
+            }
+            Self::AlreadyRestored => write!(f, "item was already restored"),
+        }
+    }
+}
+
+impl std::error::Error for TrashRestoreError {}
+
 /// The only door to the disk. Every implementation is safe to call from any
 /// thread; `RealVfs` performs all blocking work on the background executor via
 /// the [`Spawner`] it was constructed with.
@@ -58,6 +139,45 @@ pub trait Vfs: Send + Sync {
 
     /// Stat a single path. A missing path is `Ok(None)`, not an error.
     async fn metadata(&self, path: &Path) -> Result<Option<EntryMeta>>;
+
+    /// Create a directory with `create_dir_all` semantics: missing ancestors
+    /// are created, an existing directory succeeds (folder merges replay it),
+    /// a file in the way fails.
+    async fn create_dir(&self, path: &Path) -> Result<()>;
+
+    /// Create an empty file. Fails if `path` exists unless
+    /// [`CreateOptions::overwrite`] is set; the parent directory must exist.
+    async fn create_file(&self, path: &Path, opts: CreateOptions) -> Result<()>;
+
+    /// Copy one file's bytes from `from` to `to`. Directories are expanded
+    /// into per-file copies by op planning ([`crate::ops`]), never here.
+    /// Cancellation-safe: when `on_progress` returns `false` the copy aborts
+    /// between chunks, the partial destination is removed, and the call fails
+    /// with [`CopyCancelled`] — no partial file survives.
+    async fn copy(&self, from: &Path, to: &Path, on_progress: ProgressFn) -> Result<()>;
+
+    /// Move `from` to `to` (file or whole subtree; same-volume rename, so
+    /// mtimes are preserved). Fails if `to` exists unless
+    /// [`RenameOptions::overwrite`] is set.
+    async fn rename(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()>;
+
+    /// Permanently remove a file or directory. A non-empty directory requires
+    /// [`RemoveOptions::recursive`]; a missing path is an error (callers know
+    /// what they expect to delete).
+    async fn remove(&self, path: &Path, opts: RemoveOptions) -> Result<()>;
+
+    /// Move `path` to the trash, returning the undo token [`restore`]
+    /// consumes. The real macOS trash sits behind `cfg(target_os = "macos")`;
+    /// everywhere else (and in `FakeVfs`) a `.fake-trash` directory holds
+    /// restorable subtrees so trash→restore and undo-of-delete run as tests on
+    /// Windows CI (ARCHITECTURE.md §6/§9).
+    ///
+    /// [`restore`]: Vfs::restore
+    async fn trash(&self, path: &Path) -> Result<TrashId>;
+
+    /// Put a trashed item back where it came from, returning the restored
+    /// path. Failures are typed ([`TrashRestoreError`]), not stringly.
+    async fn restore(&self, id: TrashId) -> Result<PathBuf, TrashRestoreError>;
 
     /// Read the entire contents of a file.
     async fn load(&self, path: &Path) -> Result<Vec<u8>>;
@@ -97,11 +217,71 @@ pub trait Vfs: Send + Sync {
 /// [`SpawnerExt::unblock`] — never on the caller's thread.
 pub struct RealVfs {
     spawner: Arc<dyn Spawner>,
+    /// Tokens already restored this session — the `AlreadyRestored`
+    /// double-undo guard (an in-memory set suffices: the race it guards is
+    /// two undos of the same entry within one run).
+    consumed_trash: Mutex<HashSet<TrashId>>,
 }
 
 impl RealVfs {
     pub fn new(spawner: Arc<dyn Spawner>) -> Self {
-        Self { spawner }
+        Self {
+            spawner,
+            consumed_trash: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+/// Chunk size for [`RealVfs`]'s copy loop — progress granularity and the
+/// between-chunks cancellation interval.
+const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Blocking single-file copy loop. Runs inside `unblock`. Once the
+/// destination has been created, any failure (cancel or I/O error) removes it
+/// — no partial file survives; failures *before* that point (missing source,
+/// directory source, pre-copy cancel) never touch the destination.
+fn copy_file_blocking(from: &Path, to: &Path, on_progress: &ProgressFn) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(from)?;
+    if metadata.is_dir() {
+        anyhow::bail!(
+            "copy: {} is a directory (directories are expanded by op planning)",
+            from.display()
+        );
+    }
+    let total = metadata.len();
+    if !on_progress(0, total) {
+        return Err(CopyCancelled.into());
+    }
+    let mut reader = std::fs::File::open(from)?;
+    let writer = std::fs::File::create(to)?;
+    let result = copy_chunks_blocking(&mut reader, writer, total, on_progress);
+    if result.is_err() {
+        // Cancelled or failed mid-write: never leave a partial file.
+        let _ = std::fs::remove_file(to);
+    }
+    result
+}
+
+fn copy_chunks_blocking(
+    reader: &mut std::fs::File,
+    mut writer: std::fs::File,
+    total: u64,
+    on_progress: &ProgressFn,
+) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    let mut done = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buf[..n])?;
+        done += n as u64;
+        if !on_progress(done, total) {
+            return Err(CopyCancelled.into());
+        }
     }
 }
 
@@ -187,6 +367,107 @@ impl Vfs for RealVfs {
                 Err(error) => Err(error.into()),
             })
             .await
+    }
+
+    async fn create_dir(&self, path: &Path) -> Result<()> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || Ok(std::fs::create_dir_all(&path)?))
+            .await
+    }
+
+    async fn create_file(&self, path: &Path, opts: CreateOptions) -> Result<()> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                let mut open = std::fs::OpenOptions::new();
+                open.write(true);
+                if opts.overwrite {
+                    open.create(true).truncate(true);
+                } else {
+                    open.create_new(true);
+                }
+                open.open(&path)
+                    .map(drop)
+                    .map_err(|error| anyhow::anyhow!("create {}: {error}", path.display()))
+            })
+            .await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path, on_progress: ProgressFn) -> Result<()> {
+        let from = from.to_path_buf();
+        let to = to.to_path_buf();
+        self.spawner
+            .unblock(move || copy_file_blocking(&from, &to, &on_progress))
+            .await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+        let from = from.to_path_buf();
+        let to = to.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                if let Ok(existing) = std::fs::symlink_metadata(&to) {
+                    if !opts.overwrite {
+                        anyhow::bail!("rename: destination exists: {}", to.display());
+                    }
+                    if existing.is_dir() {
+                        std::fs::remove_dir_all(&to)?;
+                    } else {
+                        std::fs::remove_file(&to)?;
+                    }
+                }
+                Ok(std::fs::rename(&from, &to)?)
+            })
+            .await
+    }
+
+    async fn remove(&self, path: &Path, opts: RemoveOptions) -> Result<()> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if metadata.is_dir() {
+                    if opts.recursive {
+                        std::fs::remove_dir_all(&path)?;
+                    } else {
+                        std::fs::remove_dir(&path)?;
+                    }
+                } else {
+                    std::fs::remove_file(&path)?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn trash(&self, path: &Path) -> Result<TrashId> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                #[cfg(target_os = "macos")]
+                {
+                    crate::platform::macos::trash_item_blocking(&path)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    trash_engine::fake_trash_blocking(&path)
+                }
+            })
+            .await
+    }
+
+    async fn restore(&self, id: TrashId) -> Result<PathBuf, TrashRestoreError> {
+        if self.consumed_trash.lock().unwrap().contains(&id) {
+            return Err(TrashRestoreError::AlreadyRestored);
+        }
+        let blocking_id = id.clone();
+        let restored = self
+            .spawner
+            .unblock(move || trash_engine::restore_blocking(&blocking_id))
+            .await?;
+        self.consumed_trash.lock().unwrap().insert(id);
+        Ok(restored)
     }
 
     async fn load(&self, path: &Path) -> Result<Vec<u8>> {
@@ -281,6 +562,8 @@ mod fake {
         watchers: Vec<FakeWatchSub>,
         next_watch_id: u64,
         next_mtime: u64,
+        next_trash_id: u64,
+        consumed_trash: std::collections::HashSet<TrashId>,
     }
 
     /// In-memory [`Vfs`] for tests: trees built from `serde_json::json!`
@@ -396,6 +679,88 @@ mod fake {
         pub fn watcher_count(&self) -> usize {
             self.state.lock().unwrap().watchers.len()
         }
+
+        /// Full tree snapshot for equality assertions (undo round-trip tests):
+        /// path → `None` for directories, `Some(contents)` for files.
+        pub fn snapshot(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            self.state
+                .lock()
+                .unwrap()
+                .tree
+                .iter()
+                .map(|(path, node)| {
+                    let contents = match node.kind {
+                        EntryKind::Dir => None,
+                        _ => Some(node.contents.clone()),
+                    };
+                    (path.clone(), contents)
+                })
+                .collect()
+        }
+    }
+
+    /// Rekey the subtree rooted at `from` to `to`, preserving node data
+    /// (rename semantics: mtimes survive). Returns the moved key count.
+    fn rekey_subtree_locked(state: &mut FakeState, from: &Path, to: &Path) -> usize {
+        let keys: Vec<PathBuf> = state
+            .tree
+            .keys()
+            .filter(|p| p.starts_with(from))
+            .cloned()
+            .collect();
+        let count = keys.len();
+        for key in keys {
+            let node = state.tree.remove(&key).expect("key just listed");
+            let suffix = key.strip_prefix(from).expect("key under from");
+            let new_key = if suffix.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(suffix)
+            };
+            state.tree.insert(new_key, node);
+        }
+        count
+    }
+
+    /// Insert missing ancestor directories of `path` (emitting `Created`),
+    /// failing if a file blocks the way — `create_dir_all` semantics.
+    fn ensure_parent_dirs_locked(state: &mut FakeState, path: &Path) -> Result<()> {
+        let mut missing: Vec<PathBuf> = Vec::new();
+        let mut cursor = path.parent();
+        while let Some(dir) = cursor {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            if let Some(node) = state.tree.get(dir) {
+                if !matches!(node.kind, EntryKind::Dir) {
+                    return Err(anyhow!("not a directory: {}", dir.display()));
+                }
+                break;
+            }
+            missing.push(dir.to_path_buf());
+            cursor = dir.parent();
+        }
+        for dir in missing.into_iter().rev() {
+            let modified = next_mtime(state);
+            state.tree.insert(
+                dir.clone(),
+                FakeNode {
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    modified,
+                    contents: Vec::new(),
+                },
+            );
+            emit_locked(state, path_event(&dir, PathEventKind::Created));
+        }
+        Ok(())
+    }
+
+    fn check_error_locked(state: &FakeState, path: &Path) -> Result<()> {
+        if let Some(message) = state.errors.get(path) {
+            return Err(anyhow!("{message}"));
+        }
+        Ok(())
     }
 
     fn path_event(path: &Path, kind: PathEventKind) -> PathEvent {
@@ -501,6 +866,236 @@ mod fake {
                 return Err(anyhow!("{message}"));
             }
             Ok(state.tree.get(path).map(|node| node_meta(path, node)))
+        }
+
+        async fn create_dir(&self, path: &Path) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            check_error_locked(&state, path)?;
+            if let Some(existing) = state.tree.get(path) {
+                return if matches!(existing.kind, EntryKind::Dir) {
+                    Ok(()) // create_dir_all semantics: existing dir succeeds
+                } else {
+                    Err(anyhow!("not a directory: {}", path.display()))
+                };
+            }
+            ensure_parent_dirs_locked(&mut state, path)?;
+            let modified = next_mtime(&mut state);
+            state.tree.insert(
+                path.to_path_buf(),
+                FakeNode {
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    modified,
+                    contents: Vec::new(),
+                },
+            );
+            emit_locked(&mut state, path_event(path, PathEventKind::Created));
+            Ok(())
+        }
+
+        async fn create_file(&self, path: &Path, opts: CreateOptions) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            check_error_locked(&state, path)?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or_else(|| anyhow!("create_file: {} has no parent", path.display()))?;
+            match state.tree.get(parent) {
+                Some(node) if matches!(node.kind, EntryKind::Dir) => {}
+                Some(_) => return Err(anyhow!("not a directory: {}", parent.display())),
+                None => return Err(anyhow!("no such directory: {}", parent.display())),
+            }
+            let existed = match state.tree.get(path) {
+                Some(node) if matches!(node.kind, EntryKind::Dir) => {
+                    return Err(anyhow!("is a directory: {}", path.display()));
+                }
+                Some(_) if !opts.overwrite => {
+                    return Err(anyhow!("already exists: {}", path.display()));
+                }
+                Some(_) => true,
+                None => false,
+            };
+            let modified = next_mtime(&mut state);
+            state.tree.insert(
+                path.to_path_buf(),
+                FakeNode {
+                    kind: EntryKind::File,
+                    size: 0,
+                    modified,
+                    contents: Vec::new(),
+                },
+            );
+            let kind = if existed {
+                PathEventKind::Changed
+            } else {
+                PathEventKind::Created
+            };
+            emit_locked(&mut state, path_event(path, kind));
+            Ok(())
+        }
+
+        async fn copy(&self, from: &Path, to: &Path, on_progress: ProgressFn) -> Result<()> {
+            // Read the source under the lock, then run the chunked progress
+            // loop outside it (mirroring RealVfs's chunked copy: a cancel can
+            // land between chunks).
+            let contents = {
+                let state = self.state.lock().unwrap();
+                check_error_locked(&state, from)?;
+                check_error_locked(&state, to)?;
+                let node = state
+                    .tree
+                    .get(from)
+                    .ok_or_else(|| anyhow!("no such file: {}", from.display()))?;
+                if matches!(node.kind, EntryKind::Dir) {
+                    return Err(anyhow!(
+                        "copy: {} is a directory (directories are expanded by op planning)",
+                        from.display()
+                    ));
+                }
+                node.contents.clone()
+            };
+            let total = contents.len() as u64;
+            if !on_progress(0, total) {
+                return Err(CopyCancelled.into());
+            }
+            const FAKE_CHUNK: u64 = 1024;
+            let mut done = 0u64;
+            while done < total {
+                done = (done + FAKE_CHUNK).min(total);
+                if !on_progress(done, total) {
+                    return Err(CopyCancelled.into());
+                }
+            }
+            let mut state = self.state.lock().unwrap();
+            ensure_parent_dirs_locked(&mut state, to)?;
+            let existed = state.tree.contains_key(to);
+            let modified = next_mtime(&mut state);
+            state.tree.insert(
+                to.to_path_buf(),
+                FakeNode {
+                    kind: EntryKind::File,
+                    size: total,
+                    modified,
+                    contents,
+                },
+            );
+            let kind = if existed {
+                PathEventKind::Changed
+            } else {
+                PathEventKind::Created
+            };
+            emit_locked(&mut state, path_event(to, kind));
+            Ok(())
+        }
+
+        async fn rename(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            check_error_locked(&state, from)?;
+            check_error_locked(&state, to)?;
+            if !state.tree.contains_key(from) {
+                return Err(anyhow!("no such path: {}", from.display()));
+            }
+            if to.starts_with(from) && to != from {
+                return Err(anyhow!("cannot move {} into itself", from.display()));
+            }
+            if state.tree.contains_key(to) {
+                if !opts.overwrite {
+                    return Err(anyhow!("rename: destination exists: {}", to.display()));
+                }
+                state.tree.retain(|p, _| !p.starts_with(to));
+            }
+            ensure_parent_dirs_locked(&mut state, to)?;
+            rekey_subtree_locked(&mut state, from, to);
+            emit_locked(&mut state, path_event(from, PathEventKind::Removed));
+            emit_locked(&mut state, path_event(to, PathEventKind::Created));
+            Ok(())
+        }
+
+        async fn remove(&self, path: &Path, opts: RemoveOptions) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            check_error_locked(&state, path)?;
+            let node = state
+                .tree
+                .get(path)
+                .ok_or_else(|| anyhow!("no such path: {}", path.display()))?;
+            if matches!(node.kind, EntryKind::Dir) && !opts.recursive {
+                let has_children = state.tree.keys().any(|p| p.parent() == Some(path));
+                if has_children {
+                    return Err(anyhow!("directory not empty: {}", path.display()));
+                }
+            }
+            state.tree.retain(|p, _| !p.starts_with(path));
+            emit_locked(&mut state, path_event(path, PathEventKind::Removed));
+            Ok(())
+        }
+
+        async fn trash(&self, path: &Path) -> Result<TrashId> {
+            let mut state = self.state.lock().unwrap();
+            check_error_locked(&state, path)?;
+            if !state.tree.contains_key(path) {
+                return Err(anyhow!("no such path: {}", path.display()));
+            }
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("cannot trash {}", path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or_else(|| anyhow!("cannot trash a root: {}", path.display()))?;
+            state.next_trash_id += 1;
+            let entry_dir = parent
+                .join(crate::platform::trash::FAKE_TRASH_DIR)
+                .join(format!("{}-{name}", state.next_trash_id));
+            // Materialize the trash entry dir (and `.fake-trash` root).
+            ensure_parent_dirs_locked(&mut state, &entry_dir.join("x"))?;
+            let trashed = entry_dir.join(&name);
+            rekey_subtree_locked(&mut state, path, &trashed);
+            emit_locked(&mut state, path_event(path, PathEventKind::Removed));
+            emit_locked(&mut state, path_event(&trashed, PathEventKind::Created));
+            Ok(TrashId {
+                original: path.to_path_buf(),
+                trashed,
+            })
+        }
+
+        async fn restore(&self, id: TrashId) -> Result<PathBuf, TrashRestoreError> {
+            let mut state = self.state.lock().unwrap();
+            if state.consumed_trash.contains(&id) {
+                return Err(TrashRestoreError::AlreadyRestored);
+            }
+            if !state.tree.contains_key(&id.trashed) {
+                return Err(TrashRestoreError::NotFound);
+            }
+            if state.tree.contains_key(&id.original) {
+                return Err(TrashRestoreError::Collision(id.original.clone()));
+            }
+            if ensure_parent_dirs_locked(&mut state, &id.original).is_err() {
+                return Err(TrashRestoreError::Collision(id.original.clone()));
+            }
+            rekey_subtree_locked(&mut state, &id.trashed, &id.original);
+            // Clean the now-empty trash entry dir (and the `.fake-trash` root
+            // if this was its last entry), emitting Removed for each — every
+            // tree mutation must be visible to watchers.
+            if let Some(entry_dir) = id.trashed.parent() {
+                let entry_dir = entry_dir.to_path_buf();
+                if state.tree.remove(&entry_dir).is_some() {
+                    emit_locked(&mut state, path_event(&entry_dir, PathEventKind::Removed));
+                }
+                if let Some(root) = entry_dir.parent() {
+                    let root = root.to_path_buf();
+                    let empty = !state.tree.keys().any(|p| p.parent() == Some(&root));
+                    if empty && state.tree.remove(&root).is_some() {
+                        emit_locked(&mut state, path_event(&root, PathEventKind::Removed));
+                    }
+                }
+            }
+            emit_locked(&mut state, path_event(&id.trashed, PathEventKind::Removed));
+            emit_locked(&mut state, path_event(&id.original, PathEventKind::Created));
+            let original = id.original.clone();
+            state.consumed_trash.insert(id);
+            Ok(original)
         }
 
         async fn load(&self, path: &Path) -> Result<Vec<u8>> {
@@ -620,6 +1215,7 @@ mod fake {
 mod tests {
     use super::*;
     use crate::exec::TestSpawner;
+    use crate::watcher::PathEventKind;
     use futures::executor::block_on;
     use serde_json::json;
 
@@ -821,6 +1417,461 @@ mod tests {
         assert!(
             missing_dir.is_err(),
             "missing directory is a read_dir error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M3 mutation surface
+    // -----------------------------------------------------------------------
+
+    fn noop_progress() -> ProgressFn {
+        Arc::new(|_, _| true)
+    }
+
+    fn real_test_vfs() -> RealVfs {
+        RealVfs::new(Arc::new(TestSpawner::new()))
+    }
+
+    #[test]
+    fn fake_vfs_create_dir_and_create_file() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree("/root", json!({ "a.txt": "abc" }));
+
+        // create_dir_all semantics: ancestors created, existing dir is fine.
+        block_on(vfs.create_dir(Path::new("/root/x/y"))).unwrap();
+        block_on(vfs.create_dir(Path::new("/root/x/y"))).unwrap();
+        assert_eq!(
+            block_on(vfs.metadata(Path::new("/root/x")))
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::Dir
+        );
+        // A file in the way fails.
+        assert!(block_on(vfs.create_dir(Path::new("/root/a.txt"))).is_err());
+        assert!(block_on(vfs.create_dir(Path::new("/root/a.txt/sub"))).is_err());
+
+        // create_file: parent must exist; no silent overwrite.
+        block_on(vfs.create_file(Path::new("/root/x/new.txt"), CreateOptions::default())).unwrap();
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/x/new.txt"))).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(
+            block_on(vfs.create_file(Path::new("/root/x/new.txt"), CreateOptions::default()))
+                .is_err(),
+            "existing file fails without overwrite"
+        );
+        block_on(vfs.create_file(
+            Path::new("/root/x/new.txt"),
+            CreateOptions { overwrite: true },
+        ))
+        .unwrap();
+        assert!(
+            block_on(vfs.create_file(Path::new("/root/missing/f.txt"), CreateOptions::default()))
+                .is_err(),
+            "missing parent fails"
+        );
+        assert!(
+            block_on(vfs.create_file(Path::new("/root/x"), CreateOptions { overwrite: true }))
+                .is_err(),
+            "cannot overwrite a directory with a file"
+        );
+    }
+
+    #[test]
+    fn fake_vfs_rename_moves_subtrees_and_preserves_mtimes() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree(
+            "/root",
+            json!({ "dir": { "a.txt": "a", "sub": { "b.txt": "b" } }, "other.txt": "o" }),
+        );
+        let before = block_on(vfs.metadata(Path::new("/root/dir/a.txt")))
+            .unwrap()
+            .unwrap();
+
+        block_on(vfs.rename(
+            Path::new("/root/dir"),
+            Path::new("/root/renamed"),
+            RenameOptions::default(),
+        ))
+        .unwrap();
+        assert!(
+            block_on(vfs.metadata(Path::new("/root/dir")))
+                .unwrap()
+                .is_none(),
+            "source subtree gone"
+        );
+        let after = block_on(vfs.metadata(Path::new("/root/renamed/a.txt")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.modified, before.modified, "rename preserves mtimes");
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/renamed/sub/b.txt"))).unwrap(),
+            b"b"
+        );
+
+        // Destination-exists rules.
+        assert!(
+            block_on(vfs.rename(
+                Path::new("/root/renamed"),
+                Path::new("/root/other.txt"),
+                RenameOptions::default(),
+            ))
+            .is_err(),
+            "existing destination fails without overwrite"
+        );
+        block_on(vfs.rename(
+            Path::new("/root/renamed/a.txt"),
+            Path::new("/root/other.txt"),
+            RenameOptions { overwrite: true },
+        ))
+        .unwrap();
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/other.txt"))).unwrap(),
+            b"a"
+        );
+
+        // Cannot move a directory into itself; missing source is an error.
+        assert!(
+            block_on(vfs.rename(
+                Path::new("/root/renamed"),
+                Path::new("/root/renamed/inside"),
+                RenameOptions::default(),
+            ))
+            .is_err()
+        );
+        assert!(
+            block_on(vfs.rename(
+                Path::new("/root/nope"),
+                Path::new("/root/anything"),
+                RenameOptions::default(),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fake_vfs_remove_semantics() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree(
+            "/root",
+            json!({ "dir": { "a.txt": "a" }, "empty": {}, "f.txt": "f" }),
+        );
+
+        assert!(
+            block_on(vfs.remove(Path::new("/root/dir"), RemoveOptions::default())).is_err(),
+            "non-empty dir needs recursive"
+        );
+        block_on(vfs.remove(Path::new("/root/dir"), RemoveOptions { recursive: true })).unwrap();
+        assert!(
+            block_on(vfs.metadata(Path::new("/root/dir/a.txt")))
+                .unwrap()
+                .is_none()
+        );
+
+        block_on(vfs.remove(Path::new("/root/empty"), RemoveOptions::default())).unwrap();
+        block_on(vfs.remove(Path::new("/root/f.txt"), RemoveOptions::default())).unwrap();
+        assert!(
+            block_on(vfs.remove(Path::new("/root/f.txt"), RemoveOptions::default())).is_err(),
+            "missing path is an error"
+        );
+    }
+
+    #[test]
+    fn fake_vfs_copy_reports_chunked_progress_and_cancels_without_partials() {
+        let (_spawner, vfs) = test_vfs();
+        let contents = "x".repeat(2500); // 3 chunks of 1024
+        vfs.insert_tree("/root", json!({ "src.bin": contents }));
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = calls.clone();
+        let progress: ProgressFn = Arc::new(move |done, total| {
+            recorder.lock().unwrap().push((done, total));
+            true
+        });
+        block_on(vfs.copy(
+            Path::new("/root/src.bin"),
+            Path::new("/root/dst.bin"),
+            progress,
+        ))
+        .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0, 2500), (1024, 2500), (2048, 2500), (2500, 2500)]
+        );
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/dst.bin")))
+                .unwrap()
+                .len(),
+            2500
+        );
+
+        // Abort after the first chunk: typed error, no destination node.
+        let aborting: ProgressFn = Arc::new(|done, _| done < 1024);
+        let error = block_on(vfs.copy(
+            Path::new("/root/src.bin"),
+            Path::new("/root/cancelled.bin"),
+            aborting,
+        ))
+        .unwrap_err();
+        assert!(error.is::<CopyCancelled>(), "typed cancel marker: {error}");
+        assert!(
+            block_on(vfs.metadata(Path::new("/root/cancelled.bin")))
+                .unwrap()
+                .is_none(),
+            "cancel mid-copy leaves no partial file"
+        );
+
+        // Copying a directory is a planning-layer mistake, not silent.
+        assert!(
+            block_on(vfs.copy(Path::new("/root"), Path::new("/elsewhere"), noop_progress()))
+                .is_err()
+        );
+        // Error injection covers copy destinations too.
+        vfs.set_error("/root/locked.bin", "disk full");
+        assert!(
+            block_on(vfs.copy(
+                Path::new("/root/src.bin"),
+                Path::new("/root/locked.bin"),
+                noop_progress(),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fake_vfs_trash_restore_round_trip_via_fake_trash_subtree() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree("/root", json!({ "dir": { "a.txt": "a" } }));
+        let before = vfs.snapshot();
+
+        let id = block_on(vfs.trash(Path::new("/root/dir"))).unwrap();
+        assert_eq!(id.original, PathBuf::from("/root/dir"));
+        assert!(id.trashed.starts_with("/root/.fake-trash"));
+        assert!(
+            block_on(vfs.metadata(Path::new("/root/dir")))
+                .unwrap()
+                .is_none(),
+            "trashed item left its original location"
+        );
+        assert_eq!(
+            block_on(vfs.load(&id.trashed.join("a.txt"))).unwrap(),
+            b"a",
+            ".fake-trash holds the restorable subtree"
+        );
+
+        let restored = block_on(vfs.restore(id)).unwrap();
+        assert_eq!(restored, PathBuf::from("/root/dir"));
+        assert_eq!(vfs.snapshot(), before, "restore is an exact round trip");
+    }
+
+    #[test]
+    fn fake_vfs_restore_error_variants() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree("/root", json!({ "a.txt": "a", "b.txt": "b" }));
+
+        // NotFound: trash emptied externally.
+        let gone = block_on(vfs.trash(Path::new("/root/a.txt"))).unwrap();
+        vfs.remove_path(&gone.trashed);
+        assert_eq!(
+            block_on(vfs.restore(gone)).unwrap_err(),
+            TrashRestoreError::NotFound
+        );
+
+        // Collision: original path re-occupied.
+        let occupied = block_on(vfs.trash(Path::new("/root/b.txt"))).unwrap();
+        vfs.insert_file("/root/b.txt", 9);
+        assert_eq!(
+            block_on(vfs.restore(occupied.clone())).unwrap_err(),
+            TrashRestoreError::Collision(PathBuf::from("/root/b.txt"))
+        );
+
+        // AlreadyRestored: token consumed (double-undo race).
+        vfs.remove_path("/root/b.txt");
+        block_on(vfs.restore(occupied.clone())).unwrap();
+        assert_eq!(
+            block_on(vfs.restore(occupied)).unwrap_err(),
+            TrashRestoreError::AlreadyRestored
+        );
+    }
+
+    #[test]
+    fn fake_vfs_mutations_emit_watcher_events() {
+        let test_spawner = Arc::new(TestSpawner::new());
+        let spawner: Arc<dyn Spawner> = test_spawner.clone();
+        let vfs = FakeVfs::new(spawner);
+        vfs.insert_tree("/dir", json!({ "a.txt": "a" }));
+        let (mut stream, _guard) = vfs.watch(Path::new("/dir"), Duration::from_millis(10));
+
+        block_on(vfs.rename(
+            Path::new("/dir/a.txt"),
+            Path::new("/dir/b.txt"),
+            RenameOptions::default(),
+        ))
+        .unwrap();
+        test_spawner.advance(Duration::from_millis(10));
+        let batch = block_on(stream.next()).expect("rename batch");
+        let kinds: Vec<_> = batch.iter().map(|e| (e.path.clone(), e.kind)).collect();
+        assert!(kinds.contains(&(Arc::from(Path::new("/dir/a.txt")), PathEventKind::Removed)));
+        assert!(kinds.contains(&(Arc::from(Path::new("/dir/b.txt")), PathEventKind::Created)));
+    }
+
+    #[test]
+    fn real_vfs_create_rename_remove_round_trip() {
+        let vfs = real_test_vfs();
+        let dir = tempfile::tempdir().unwrap();
+
+        block_on(vfs.create_dir(&dir.path().join("a/b"))).unwrap();
+        block_on(vfs.create_file(&dir.path().join("a/b/f.txt"), CreateOptions::default())).unwrap();
+        assert!(
+            block_on(vfs.create_file(&dir.path().join("a/b/f.txt"), CreateOptions::default()))
+                .is_err(),
+            "existing file fails without overwrite"
+        );
+
+        block_on(vfs.rename(
+            &dir.path().join("a/b/f.txt"),
+            &dir.path().join("a/g.txt"),
+            RenameOptions::default(),
+        ))
+        .unwrap();
+        assert!(dir.path().join("a/g.txt").exists());
+
+        std::fs::write(dir.path().join("occupied.txt"), b"keep").unwrap();
+        assert!(
+            block_on(vfs.rename(
+                &dir.path().join("a/g.txt"),
+                &dir.path().join("occupied.txt"),
+                RenameOptions::default(),
+            ))
+            .is_err(),
+            "existing destination fails without overwrite"
+        );
+        block_on(vfs.rename(
+            &dir.path().join("a/g.txt"),
+            &dir.path().join("occupied.txt"),
+            RenameOptions { overwrite: true },
+        ))
+        .unwrap();
+
+        assert!(
+            block_on(vfs.remove(&dir.path().join("a"), RemoveOptions::default())).is_err(),
+            "non-empty dir needs recursive"
+        );
+        block_on(vfs.remove(&dir.path().join("a"), RemoveOptions { recursive: true })).unwrap();
+        assert!(!dir.path().join("a").exists());
+        assert!(
+            block_on(vfs.remove(&dir.path().join("a"), RemoveOptions::default())).is_err(),
+            "missing path is an error"
+        );
+    }
+
+    #[test]
+    fn real_vfs_copy_progress_and_cancel_leaves_no_partial_file() {
+        let vfs = real_test_vfs();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.bin");
+        std::fs::write(&src, vec![7u8; 3 * 1024 * 1024]).unwrap(); // 3 chunks
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = calls.clone();
+        let progress: ProgressFn = Arc::new(move |done, total| {
+            recorder.lock().unwrap().push((done, total));
+            true
+        });
+        block_on(vfs.copy(&src, &dir.path().join("copy.bin"), progress)).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path().join("copy.bin"))
+                .unwrap()
+                .len(),
+            3 * 1024 * 1024
+        );
+        {
+            let calls = calls.lock().unwrap();
+            assert!(calls.len() >= 4, "chunked progress: {calls:?}");
+            assert_eq!(calls[0], (0, 3 * 1024 * 1024));
+            assert_eq!(calls.last().unwrap().0, 3 * 1024 * 1024);
+        }
+
+        // Abort after the first chunk: typed error and no partial file.
+        let aborting: ProgressFn = Arc::new(|done, _| done == 0);
+        let error =
+            block_on(vfs.copy(&src, &dir.path().join("partial.bin"), aborting)).unwrap_err();
+        assert!(error.is::<CopyCancelled>(), "typed cancel marker: {error}");
+        assert!(
+            !dir.path().join("partial.bin").exists(),
+            "cancel mid-copy leaves no partial file"
+        );
+    }
+
+    #[test]
+    fn real_vfs_copy_failure_before_writing_leaves_an_existing_destination_alone() {
+        let vfs = real_test_vfs();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&dest, b"precious").unwrap();
+
+        // Missing source: the copy fails before the destination is opened —
+        // the "remove the partial file" cleanup must not fire.
+        let error = block_on(vfs.copy(&dir.path().join("missing.txt"), &dest, noop_progress()))
+            .unwrap_err();
+        assert!(!error.is::<CopyCancelled>());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"precious",
+            "a failure before the first write never touches the destination"
+        );
+
+        // Cancelling before the first chunk leaves it alone too.
+        let cancel_immediately: ProgressFn = Arc::new(|_, _| false);
+        let error = block_on(vfs.copy(&dir.path().join("missing.txt"), &dest, cancel_immediately))
+            .unwrap_err();
+        assert!(!error.is::<CopyCancelled>(), "source check comes first");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"precious");
+    }
+
+    // The macOS build routes Vfs::trash through the real NSFileManager trash
+    // (exercised by the per-milestone Mac checklist, like the notify watcher);
+    // the portable `.fake-trash` scheme is what runs on Windows CI (§9).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn real_vfs_trash_restore_round_trip_and_error_variants() {
+        let vfs = real_test_vfs();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("project");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("a.txt"), b"a").unwrap();
+
+        let id = block_on(vfs.trash(&target)).unwrap();
+        assert!(!target.exists());
+        assert!(id.trashed.starts_with(dir.path().join(".fake-trash")));
+        assert_eq!(std::fs::read(id.trashed.join("a.txt")).unwrap(), b"a");
+
+        // Collision: original re-occupied.
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(
+            block_on(vfs.restore(id.clone())).unwrap_err(),
+            TrashRestoreError::Collision(target.clone())
+        );
+        std::fs::remove_dir(&target).unwrap();
+
+        // Round trip, then AlreadyRestored on the double undo.
+        assert_eq!(block_on(vfs.restore(id.clone())).unwrap(), target);
+        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
+        assert_eq!(
+            block_on(vfs.restore(id)).unwrap_err(),
+            TrashRestoreError::AlreadyRestored
+        );
+
+        // NotFound: trash emptied externally.
+        let file = dir.path().join("doomed.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let id = block_on(vfs.trash(&file)).unwrap();
+        std::fs::remove_file(&id.trashed).unwrap();
+        assert_eq!(
+            block_on(vfs.restore(id)).unwrap_err(),
+            TrashRestoreError::NotFound
         );
     }
 }

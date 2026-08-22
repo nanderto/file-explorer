@@ -1,14 +1,22 @@
 //! The directory view (ARCHITECTURE.md §2 `DirView`, §4a data flow).
 //!
-//! Owns the cursor/selection (single-select for M1, **path-keyed** per §2 so
-//! it survives re-sorts, watcher patches, and in-place expansion) and renders
-//! the owning pane's current [`ListingSnapshot`] as the details list
+//! Owns the full **path-keyed** [`SelectionModel`] (M3, §2): cursor +
+//! multi-select set + range anchor — click, `cmd`-click toggle,
+//! `shift`-click/`shift`-arrow ranges, select-all — surviving re-sorts,
+//! watcher patches, and in-place expansion re-projection. Renders the owning
+//! pane's current [`ListingSnapshot`] as the details list
 //! (`views/details_list.rs`). Handles `OpenSelected` (folder →
 //! `DirViewEvent::NavigateTo`, which the pane turns into navigation; file →
-//! the [`crate::app_state::Opener`] stub), cursor movement, and type-ahead
+//! the [`crate::app_state::Opener`] stub), cursor movement, type-ahead
 //! (§0: printable characters are *not* an action — they arrive via
 //! `on_key_down` fallthrough when no binding matched; the reset delay runs on
-//! [`fs_core::Spawner::timer`] so tests use fake time).
+//! [`fs_core::Spawner::timer`] so tests use fake time), and the M3
+//! clipboard/delete rows. `Cut`/`Copy` fill the [`fs_core::FileClipboard`] in
+//! [`FsContext`] (cut sources render dimmed), `Paste` turns it into a
+//! `FileOp` (move on cut, keep-both names planned by ops), and
+//! `DeleteToTrash` submits a `TrashOp` for the selection.
+//! `DeletePermanently` is bound in this view's context (so `!renaming`
+//! guards it) but handled by the workspace, which owns the confirm modal.
 //!
 //! **In-place folder expansion (M2, §2/§8):** the view holds
 //! `expanded: BTreeSet<Arc<Path>>`; the visible row list is a **flat
@@ -27,18 +35,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs_core::{EntryId, FileEntry, ListingSnapshot, SortSpec, list_dir};
+use fs_core::{ClipboardMode, EntryId, FileEntry, FileOp, ListingSnapshot, SortSpec, list_dir};
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
     ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, div, point, prelude::*, px,
 };
 
 use crate::actions::{
-    CollapseSelected, ExpandSelected, ExtendSelectionNext, ExtendSelectionPrev, OpenSelected,
-    PageDown, PageUp, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrev,
+    CollapseSelected, Copy, Cut, DeleteToTrash, ExpandSelected, ExtendSelectionNext,
+    ExtendSelectionPrev, OpenSelected, PageDown, PageUp, Paste, SelectAll, SelectFirst, SelectLast,
+    SelectNext, SelectPrev,
 };
 use crate::app_state::FsContext;
 use crate::pane::Pane;
+use crate::selection::SelectionModel;
 use crate::theme::Theme;
 use crate::views::details_list;
 
@@ -70,9 +80,10 @@ pub struct DirView {
     focus_handle: FocusHandle,
     theme: Theme,
     pane: WeakEntity<Pane>,
-    /// Path-keyed cursor = the single selection in M1. The full
-    /// `SelectionModel` (multi/range/marquee) lands at M3.
-    cursor: Option<EntryId>,
+    /// The full path-keyed selection (§2): cursor + multi-select set + range
+    /// anchor. Path keys are what make it survive re-sorts, watcher patches,
+    /// and in-place expansion re-projection.
+    selection: SelectionModel,
     /// Folders expanded in place, path-keyed so expansion survives
     /// re-projection. Collapsing keeps descendants' entries so re-expanding
     /// restores nested expansion (same policy as the sidebar tree).
@@ -98,7 +109,7 @@ impl DirView {
             focus_handle: cx.focus_handle(),
             theme,
             pane,
-            cursor: None,
+            selection: SelectionModel::default(),
             expanded: BTreeSet::new(),
             children: HashMap::new(),
             flat: Vec::new(),
@@ -110,16 +121,155 @@ impl DirView {
     }
 
     // ------------------------------------------------------------------
-    // Cursor (single-select M1)
+    // Selection (path-keyed SelectionModel, §2)
     // ------------------------------------------------------------------
 
     pub fn cursor(&self) -> Option<&EntryId> {
-        self.cursor.as_ref()
+        self.selection.cursor()
     }
 
+    /// M1-shaped cursor API, kept for the pane and tests: `Some` selects only
+    /// that entry; `None` clears the whole selection (navigation across
+    /// directories).
     pub fn set_cursor(&mut self, cursor: Option<EntryId>, cx: &mut Context<Self>) {
-        self.cursor = cursor;
+        match cursor {
+            Some(id) => self.selection.select_only(id),
+            None => self.selection.clear(),
+        }
         cx.notify();
+    }
+
+    pub fn selection(&self) -> &SelectionModel {
+        &self.selection
+    }
+
+    /// Multi-select driver for tests and visual scenarios: the selection
+    /// becomes exactly `paths` (cursor on the last).
+    pub fn select_paths(&mut self, paths: &[&Path], cx: &mut Context<Self>) {
+        self.selection.clear();
+        for path in paths {
+            self.selection.toggle(EntryId(Arc::from(*path)));
+        }
+        cx.notify();
+    }
+
+    /// `cmd`-click on a row: toggle its membership.
+    pub(crate) fn toggle_entry_selection(&mut self, entry: &FileEntry, cx: &mut Context<Self>) {
+        self.selection.toggle(entry.id());
+        cx.notify();
+    }
+
+    /// `shift`-click on a row: range from the anchor over the projection.
+    pub(crate) fn range_select_to(&mut self, entry: &FileEntry, cx: &mut Context<Self>) {
+        let order: Vec<EntryId> = self
+            .projected_rows(cx)
+            .iter()
+            .map(|row| row.entry.id())
+            .collect();
+        self.selection.select_range_to(entry.id(), &order);
+        cx.notify();
+    }
+
+    /// `cmd-a`: select every visible (projected) row.
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let order: Vec<EntryId> = self
+            .projected_rows(cx)
+            .iter()
+            .map(|row| row.entry.id())
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        self.selection.select_all(&order);
+        cx.notify();
+    }
+
+    /// Survival on fresh loads/watcher patches (called by the pane after a
+    /// snapshot swap): drop selected paths that are neither in the snapshot
+    /// nor injected by in-place expansion.
+    pub(crate) fn retain_selection_in_listing(
+        &mut self,
+        snapshot: Option<&ListingSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut keep: BTreeSet<EntryId> = snapshot
+            .map(|snap| snap.entries.iter().map(FileEntry::id).collect())
+            .unwrap_or_default();
+        for dir in &self.expanded {
+            if let Some(kids) = self.children.get(dir) {
+                keep.extend(kids.iter().map(FileEntry::id));
+            }
+        }
+        self.selection.retain(|id| keep.contains(id));
+        cx.notify();
+    }
+
+    /// NavEntry restore (pane back/forward/refresh): re-place the cursor
+    /// without collapsing a wider selection — refresh and re-sort restore
+    /// through this, and a multi-selection must survive them.
+    pub(crate) fn restore_cursor(&mut self, cursor: Option<EntryId>, cx: &mut Context<Self>) {
+        self.selection.restore_cursor(cursor);
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // Clipboard + delete (§0 M3 rows; §4b flow)
+    // ------------------------------------------------------------------
+
+    /// `cmd-x`: fill the clipboard in cut mode — sources render dimmed until
+    /// pasted (the paste then *moves* them).
+    pub fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.fill_clipboard(ClipboardMode::Cut, cx);
+    }
+
+    /// `cmd-c`: fill the clipboard in copy mode.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        self.fill_clipboard(ClipboardMode::Copy, cx);
+    }
+
+    fn fill_clipboard(&mut self, mode: ClipboardMode, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        // Root-most paths only: cutting a folder already carries everything
+        // inside it; a selected descendant would double-move.
+        let entries: Vec<EntryId> = self
+            .selection
+            .selected_paths_rootmost()
+            .iter()
+            .map(|path| EntryId(Arc::from(path.as_path())))
+            .collect();
+        FsContext::global_mut(cx).clipboard.set(entries, mode);
+        cx.notify();
+    }
+
+    /// `cmd-v`: turn the clipboard into a job (§4b) — `Copy` for copy-mode,
+    /// `Move` for cut-mode (consuming the clipboard, so the dimming clears).
+    /// Keep-both names (incl. paste-into-same-folder) are planned by ops.
+    pub fn paste_into_current(&mut self, cx: &mut Context<Self>) {
+        let Some(dest) = self
+            .pane
+            .upgrade()
+            .and_then(|pane| pane.read(cx).path().map(Path::to_path_buf))
+        else {
+            return;
+        };
+        let Some(op) = FsContext::global_mut(cx).clipboard.paste_op(&dest) else {
+            return;
+        };
+        FsContext::global(cx).queue.submit(op);
+        cx.notify();
+    }
+
+    /// `delete`: move the selection to the trash (undoable via restore).
+    pub fn delete_selection_to_trash(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selection.selected_paths_rootmost();
+        if paths.is_empty() {
+            return;
+        }
+        FsContext::global(cx)
+            .queue
+            .submit(FileOp::TrashOp { paths });
     }
 
     /// The pane's current snapshot — the DirView renders the pane's listing
@@ -247,15 +397,21 @@ impl DirView {
 
     /// Remove a folder from the expansion set (its subtree leaves the
     /// projection; descendants keep their own expansion entries so
-    /// re-expanding restores them). A cursor inside the removed subtree is
+    /// re-expanding restores them). Selected rows inside the removed subtree
+    /// are dropped from the selection — a path-keyed selection must not keep
+    /// acting on rows that left the projection — and a cursor inside it is
     /// pulled up to the collapsed folder rather than silently vanishing.
     fn collapse(&mut self, path: &Arc<Path>, cx: &mut Context<Self>) {
         self.expanded.remove(path);
-        if let Some(cursor) = &self.cursor
-            && cursor.0.starts_with(path)
-            && *cursor.0 != **path
-        {
-            self.cursor = Some(EntryId(path.clone()));
+        let cursor_was_inside = self
+            .selection
+            .cursor()
+            .is_some_and(|cursor| cursor.0.starts_with(path) && *cursor.0 != **path);
+        let key = path.clone();
+        self.selection
+            .retain(|id| !(id.0.starts_with(&key) && *id.0 != *key));
+        if cursor_was_inside {
+            self.selection.select_only(EntryId(path.clone()));
         }
         cx.notify();
     }
@@ -299,17 +455,37 @@ impl DirView {
     // ------------------------------------------------------------------
 
     fn cursor_ix(&self, rows: &[ProjectedRow]) -> Option<usize> {
-        let cursor = self.cursor.as_ref()?;
+        let cursor = self.selection.cursor()?;
         rows.iter().position(|row| row.entry.id() == *cursor)
     }
 
-    /// Move the cursor to `ix` and keep it visible (§8: `scroll_to_item` on
-    /// every cursor move).
+    /// Move the cursor to `ix` (plain movement: selection collapses to the
+    /// row) and keep it visible (§8: `scroll_to_item` on every cursor move).
     fn move_cursor_to(&mut self, ix: usize, rows: &[ProjectedRow], cx: &mut Context<Self>) {
         let Some(row) = rows.get(ix) else {
             return;
         };
-        self.cursor = Some(row.entry.id());
+        self.selection.select_only(row.entry.id());
+        self.scroll_handle
+            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// `shift-down`/`shift-up`: move the cursor and re-range the selection
+    /// from the anchor (§0 "Cursor movement (+shift- extends)").
+    fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let rows = self.projected_rows(cx);
+        let len = rows.len();
+        if len == 0 {
+            return;
+        }
+        let ix = match self.cursor_ix(&rows) {
+            Some(ix) => (ix as isize + delta).clamp(0, len as isize - 1) as usize,
+            None if delta >= 0 => 0,
+            None => len - 1,
+        };
+        let order: Vec<EntryId> = rows.iter().map(|row| row.entry.id()).collect();
+        self.selection.select_range_to(order[ix].clone(), &order);
         self.scroll_handle
             .scroll_to_item(ix, ScrollStrategy::Nearest);
         cx.notify();
@@ -528,10 +704,13 @@ impl Render for DirView {
             .on_action(
                 cx.listener(|this, _: &SelectLast, _, cx| this.move_cursor_to_end(false, cx)),
             )
-            // M1 is single-select: extending just moves the cursor until the
-            // full SelectionModel lands at M3.
-            .on_action(cx.listener(|this, _: &ExtendSelectionNext, _, cx| this.step_cursor(1, cx)))
-            .on_action(cx.listener(|this, _: &ExtendSelectionPrev, _, cx| this.step_cursor(-1, cx)))
+            // §0 shift-arrows: extend the range from the anchor (M3).
+            .on_action(
+                cx.listener(|this, _: &ExtendSelectionNext, _, cx| this.extend_selection(1, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ExtendSelectionPrev, _, cx| this.extend_selection(-1, cx)),
+            )
             .on_action(cx.listener(|this, _: &PageDown, _, cx| {
                 this.step_cursor(this.rows_per_page() as isize, cx)
             }))
@@ -541,9 +720,18 @@ impl Render for DirView {
             // §0 Views (M2): in-place expansion.
             .on_action(cx.listener(|this, _: &ExpandSelected, _, cx| this.expand_selected(cx)))
             .on_action(cx.listener(|this, _: &CollapseSelected, _, cx| this.collapse_selected(cx)))
-            // Single-select M1: select-all is a no-op until the M3
-            // SelectionModel; bound here so the keystroke is owned.
-            .on_action(cx.listener(|_, _: &SelectAll, _, _| {}))
+            // §0 select-all over the visible projection (M3).
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
+            // §0 clipboard rows (M3): cut dims sources, paste moves on cut.
+            .on_action(cx.listener(|this, _: &Cut, _, cx| this.cut_selection(cx)))
+            .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy_selection(cx)))
+            .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste_into_current(cx)))
+            // §0 delete-to-trash (M3). DeletePermanently deliberately has no
+            // handler here: it bubbles to the workspace, which owns the
+            // ConfirmDialog guard.
+            .on_action(
+                cx.listener(|this, _: &DeleteToTrash, _, cx| this.delete_selection_to_trash(cx)),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .flex()
             .flex_col()
@@ -561,7 +749,7 @@ mod tests {
     //! `right`/`left` bindings dispatch on the real focused entity.
 
     use super::*;
-    use crate::app_state::{FsContext, GpuiSpawner, LoggingOpener};
+    use crate::app_state::{GpuiSpawner, LoggingOpener};
     use crate::pane::Pane;
     use fs_core::{FakeVfs, Spawner};
     use gpui::{Entity, TestAppContext, VisualTestContext};
@@ -585,12 +773,13 @@ mod tests {
                 }),
             );
             crate::keymap::init(cx);
-            cx.set_global(FsContext {
-                vfs: vfs.clone(),
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
                 spawner,
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(fs_core::StubPlatform::new()),
-            });
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
             vfs
         })
     }
@@ -841,6 +1030,169 @@ mod tests {
                 ("/root/a.txt", 0),
             ]),
             "hidden children appear without reloading (name-sorted, folders first)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M3: clipboard behaviors (plan §3 "Cut/paste files" row) end-to-end
+    // through the real handlers, clipboard, JobQueue and FakeVfs.
+    // ------------------------------------------------------------------
+
+    /// Open `/root`, select one entry, and return the pane plus the vfs so the
+    /// tree can be asserted after an operation settles.
+    fn open_root_with_vfs(
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeVfs>, Entity<Pane>, &mut VisualTestContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        (vfs, pane, cx)
+    }
+
+    fn select(pane: &Entity<Pane>, cx: &mut VisualTestContext, path: &str) {
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        let path = PathBuf::from(path);
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.select_paths(&[path.as_path()], cx)));
+    }
+
+    fn dir_view_of(pane: &Entity<Pane>, cx: &mut VisualTestContext) -> Entity<DirView> {
+        pane.read_with(cx, |pane, _| pane.dir_view().clone())
+    }
+
+    fn tree_has(vfs: &Arc<FakeVfs>, path: &str) -> bool {
+        vfs.snapshot().keys().any(|p| p == Path::new(path))
+    }
+
+    #[gpui::test]
+    fn cut_marks_sources_dimmed_then_paste_moves_them(cx: &mut TestAppContext) {
+        let (vfs, pane, cx) = open_root_with_vfs(cx);
+        select(&pane, cx, "/root/a.txt");
+
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.cut_selection(cx)));
+
+        // Plan §3: cut sources render dimmed — the render path asks the
+        // clipboard, so assert exactly what it asks.
+        cx.update(|_, cx| {
+            let clipboard = &FsContext::global(cx).clipboard;
+            assert!(
+                clipboard.is_cut(Path::new("/root/a.txt")),
+                "cut source must report as cut-pending (drives dimming)"
+            );
+            assert!(
+                !clipboard.is_cut(Path::new("/root/zeta")),
+                "unrelated entries are not cut-pending"
+            );
+        });
+
+        // Paste into a different directory: cut pastes as a MOVE.
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root/zeta"), cx));
+        cx.run_until_parked();
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.paste_into_current(cx)));
+        cx.run_until_parked();
+
+        assert!(
+            tree_has(&vfs, "/root/zeta/a.txt"),
+            "paste-after-cut moves the entry into the destination"
+        );
+        assert!(
+            !tree_has(&vfs, "/root/a.txt"),
+            "paste-after-cut removes the source (move, not copy)"
+        );
+        cx.update(|_, cx| {
+            assert!(
+                !FsContext::global(cx)
+                    .clipboard
+                    .is_cut(Path::new("/root/a.txt")),
+                "the cut is consumed by the paste — dimming must clear"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn copy_then_paste_duplicates_and_keeps_the_source(cx: &mut TestAppContext) {
+        let (vfs, pane, cx) = open_root_with_vfs(cx);
+        select(&pane, cx, "/root/a.txt");
+
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.copy_selection(cx)));
+        cx.update(|_, cx| {
+            assert!(
+                !FsContext::global(cx)
+                    .clipboard
+                    .is_cut(Path::new("/root/a.txt")),
+                "copy mode never dims the source"
+            );
+        });
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root/zeta"), cx));
+        cx.run_until_parked();
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.paste_into_current(cx)));
+        cx.run_until_parked();
+
+        assert!(
+            tree_has(&vfs, "/root/zeta/a.txt"),
+            "copy lands at the destination"
+        );
+        assert!(tree_has(&vfs, "/root/a.txt"), "copy keeps the source");
+    }
+
+    #[gpui::test]
+    fn paste_into_the_same_folder_keeps_both(cx: &mut TestAppContext) {
+        // The plan §7 M3 acceptance row, exercised through the UI path:
+        // copy + paste in place must produce a keep-both name, never clobber.
+        let (vfs, pane, cx) = open_root_with_vfs(cx);
+        select(&pane, cx, "/root/a.txt");
+
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                view.copy_selection(cx);
+                view.paste_into_current(cx);
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(tree_has(&vfs, "/root/a.txt"), "the original survives");
+        let copies: Vec<_> = vfs
+            .snapshot()
+            .into_keys()
+            .filter(|p| {
+                p.parent() == Some(Path::new("/root"))
+                    && p.file_name().is_some_and(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("a") && n != "a.txt"
+                    })
+            })
+            .collect();
+        assert_eq!(
+            copies.len(),
+            1,
+            "same-folder paste yields exactly one keep-both sibling, got {copies:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn delete_moves_the_selection_to_the_trash(cx: &mut TestAppContext) {
+        let (vfs, pane, cx) = open_root_with_vfs(cx);
+        select(&pane, cx, "/root/a.txt");
+
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.delete_selection_to_trash(cx)));
+        cx.run_until_parked();
+
+        assert!(
+            !tree_has(&vfs, "/root/a.txt"),
+            "delete removes the entry from its directory"
+        );
+        assert!(
+            vfs.snapshot()
+                .keys()
+                .any(|p| p.components().any(|c| c.as_os_str() == ".fake-trash")),
+            "the entry is recoverable from the trash, not destroyed"
         );
     }
 }

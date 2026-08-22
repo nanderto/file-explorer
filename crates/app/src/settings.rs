@@ -206,12 +206,13 @@ mod tests {
         let vfs = FakeVfs::new(spawner.clone());
         let path = PathBuf::from("/config/file-explorer/settings.json");
         cx.update(|cx| {
-            cx.set_global(FsContext {
-                vfs: vfs.clone(),
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
                 spawner,
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(StubPlatform::new()),
-            });
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
         });
 
         // save() runs on the background executor, off the UI thread.

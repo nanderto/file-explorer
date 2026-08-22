@@ -21,8 +21,9 @@ use crate::exec::Spawner;
 use crate::watcher::WatchGuard;
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 mod stub;
+pub(crate) mod trash;
 
 #[cfg(target_os = "macos")]
 pub use macos::MacPlatform;

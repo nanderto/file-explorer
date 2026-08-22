@@ -12,9 +12,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fs_core::exec::UnblockClosure;
-use fs_core::{Platform, RealVfs, Spawner, Vfs};
+use fs_core::{FileClipboard, JobQueue, Platform, RealVfs, Spawner, UndoStack, Vfs};
 use futures::future::BoxFuture;
-use gpui::{App, BackgroundExecutor, Global};
+use gpui::{App, AppContext as _, BackgroundExecutor, Entity, Global};
+
+use crate::jobs_model::JobsModel;
+
+/// The undo/redo stack, shared between the [`JobsModel`] pump (which pushes
+/// completed-op inverses) and the workspace's `Undo`/`Redo` handlers. An
+/// async mutex: `UndoStack::undo/redo` await Vfs metadata while validating
+/// fingerprints, and a blocking lock held across that await would deadlock
+/// the single-threaded foreground executor.
+pub type SharedUndoStack = Arc<futures::lock::Mutex<UndoStack>>;
 
 /// Opens a file in its default application. Routed through [`FsContext`] like
 /// the Vfs so views never call the OS directly and tests can record requests.
@@ -33,13 +42,21 @@ impl Opener for LoggingOpener {
 }
 
 /// Global filesystem context. M1 carries the Vfs, Spawner, and the opener
-/// stub; M2 adds the [`Platform`] handle (volumes + eject); the job queue,
-/// undo stack, clipboard, and `JobsModel` handle join at M3 (additive).
+/// stub; M2 adds the [`Platform`] handle (volumes + eject); M3 adds the
+/// [`JobQueue`], the shared [`UndoStack`], and the [`JobsModel`] handle
+/// (ARCHITECTURE.md §2 — views observe the model; nothing else touches the
+/// queue's event channel).
 pub struct FsContext {
     pub vfs: Arc<dyn Vfs>,
     pub spawner: Arc<dyn Spawner>,
     pub opener: Arc<dyn Opener>,
     pub platform: Arc<dyn Platform>,
+    pub queue: Arc<JobQueue>,
+    pub undo: SharedUndoStack,
+    pub jobs: Entity<JobsModel>,
+    /// The cut/copy file clipboard (ARCHITECTURE.md §2/§6): a plain struct —
+    /// cut membership drives render dimming; paste turns it into a `FileOp`.
+    pub clipboard: FileClipboard,
 }
 
 impl Global for FsContext {}
@@ -48,10 +65,50 @@ impl FsContext {
     pub fn global(cx: &App) -> &FsContext {
         cx.global::<FsContext>()
     }
+
+    /// Mutable access for clipboard writes (Cut/Copy/Paste). Views that
+    /// mutate it `cx.notify()` themselves — the global carries no observers.
+    pub fn global_mut(cx: &mut App) -> &mut FsContext {
+        cx.global_mut::<FsContext>()
+    }
+}
+
+/// Build the M3 job spine (queue → JobsModel → undo stack) around the given
+/// seams and set the [`FsContext`] global. The single place the spine is
+/// wired, shared by boot ([`init`]), the visual test runner, and tests.
+pub fn install(
+    cx: &mut App,
+    vfs: Arc<dyn Vfs>,
+    spawner: Arc<dyn Spawner>,
+    opener: Arc<dyn Opener>,
+    platform: Arc<dyn Platform>,
+) -> Entity<JobsModel> {
+    let queue = JobQueue::new(vfs.clone(), spawner.clone());
+    let undo: SharedUndoStack = Arc::new(futures::lock::Mutex::new(UndoStack::new()));
+    let jobs = cx.new(|cx| {
+        JobsModel::new(
+            queue.clone(),
+            vfs.clone(),
+            undo.clone(),
+            spawner.clone(),
+            cx,
+        )
+    });
+    cx.set_global(FsContext {
+        vfs,
+        spawner,
+        opener,
+        platform,
+        queue,
+        undo,
+        jobs: jobs.clone(),
+        clipboard: FileClipboard::default(),
+    });
+    jobs
 }
 
 /// Install the real [`FsContext`] (RealVfs over the app's background
-/// executor). Called once at boot by `main` and the visual test runner.
+/// executor). Called once at boot by `main`.
 pub fn init(cx: &mut App) {
     let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
     let vfs: Arc<dyn Vfs> = Arc::new(RealVfs::new(spawner.clone()));
@@ -59,12 +116,7 @@ pub fn init(cx: &mut App) {
     let platform: Arc<dyn Platform> = Arc::new(fs_core::MacPlatform::new(spawner.clone()));
     #[cfg(not(target_os = "macos"))]
     let platform: Arc<dyn Platform> = Arc::new(fs_core::StubPlatform::new());
-    cx.set_global(FsContext {
-        vfs,
-        spawner,
-        opener: Arc::new(LoggingOpener),
-        platform,
-    });
+    install(cx, vfs, spawner, Arc::new(LoggingOpener), platform);
 }
 
 /// fs-core [`Spawner`] implemented on `gpui::BackgroundExecutor`

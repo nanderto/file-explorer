@@ -33,7 +33,7 @@ mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
     use file_explorer_app::app_state::{FsContext, GpuiSpawner, LoggingOpener};
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
-    use fs_core::{FakeVfs, SortKey, Spawner, Vfs};
+    use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Vfs};
     use gpui::{AnyWindowHandle, AppContext as _, Entity, VisualTestAppContext, px, size};
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -73,6 +73,9 @@ mod macos {
         SidebarTreeExpanded(&'static str, &'static [&'static str]),
         /// Navigate, then expand folders in place in the details view (M2).
         DetailsFolderExpanded(&'static str, &'static [&'static str]),
+        /// Navigate, then submit a copy that parks on a conflict so the
+        /// workspace opens the conflict modal (M3).
+        ConflictDialogOpen(&'static str),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -103,6 +106,11 @@ mod macos {
                 Theme::dark(),
                 Setup::DetailsFolderExpanded("/home", &["/home/Documents"]),
             ),
+            (
+                "conflict_dialog",
+                Theme::dark(),
+                Setup::ConflictDialogOpen("/home"),
+            ),
         ]
     }
 
@@ -121,7 +129,11 @@ mod macos {
                             "notes.txt": "0123456789",
                             "report.pdf": "This is a much longer fixture file body.",
                         },
-                        "Downloads": {},
+                        "Downloads": {
+                            // Collides with Documents/notes.txt: the
+                            // conflict_dialog scenario copies it there.
+                            "notes.txt": "a different set of notes",
+                        },
                         "Desktop": {},
                         "Pictures": {},
                         "archive.zip": "zip",
@@ -136,12 +148,13 @@ mod macos {
                 }),
             );
             let vfs: Arc<dyn Vfs> = vfs;
-            cx.set_global(FsContext {
+            file_explorer_app::app_state::install(
+                cx,
                 vfs,
                 spawner,
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(fs_core::StubPlatform::new()),
-            });
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
             file_explorer_app::settings::init_with_path(
                 cx,
                 PathBuf::from("/config/settings.json"),
@@ -263,6 +276,18 @@ mod macos {
                     // Each expansion's children load before the next level.
                     cx.run_until_parked();
                 }
+            }
+            Setup::ConflictDialogOpen(path) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                // Copy Downloads/notes.txt onto Documents/notes.txt: the job
+                // parks on the conflict and the workspace opens the modal.
+                cx.update(|cx| {
+                    FsContext::global(cx).queue.submit(FileOp::Copy {
+                        sources: vec![PathBuf::from("/home/Downloads/notes.txt")],
+                        dest_dir: PathBuf::from("/home/Documents"),
+                    });
+                });
             }
         }
         Ok(())

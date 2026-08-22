@@ -37,3 +37,6 @@ objc2-foundation = { version = "0.3", features = [
 
 [dev-dependencies]
 serde_json = "1"
+# Integration tests (tests/torture.rs) see the crate as a dependency, not
+# under cfg(test) — the self-dependency turns test-support on for them.
+fs-core = { path = ".", features = ["test-support"] }
