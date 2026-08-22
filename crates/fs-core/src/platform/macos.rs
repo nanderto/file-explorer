@@ -91,7 +91,7 @@ fn volumes_blocking() -> Result<Vec<VolumeInfo>> {
     let urls = unsafe {
         manager.mountedVolumeURLsIncludingResourceValuesForKeys_options(
             Some(&keys),
-            NSVolumeEnumerationOptions::NSVolumeEnumerationSkipHiddenVolumes,
+            NSVolumeEnumerationOptions::SkipHiddenVolumes,
         )
     }
     .ok_or_else(|| anyhow!("NSFileManager returned no mounted volume list"))?;
