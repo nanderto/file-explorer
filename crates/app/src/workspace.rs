@@ -194,7 +194,10 @@ impl Workspace {
                     self.close_modal(window, cx);
                 }
             }
-            JobsEvent::RowsChanged | JobsEvent::Completed { .. } => {}
+            // `Failed` is consumed by whichever view submitted the job (e.g.
+            // the rename editor); the workspace has nothing job-id-specific
+            // to do beyond the toast `JobsModel` already pushed.
+            JobsEvent::RowsChanged | JobsEvent::Completed { .. } | JobsEvent::Failed { .. } => {}
         }
     }
 

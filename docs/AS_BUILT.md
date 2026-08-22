@@ -11,10 +11,11 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
 ## Status
 
 **M3 in progress** — the fs-core ops engine, the app job/event spine
-(JobsModel, dialogs, progress/toasts, undo), and the keyboard file operations
-(cut/copy/paste with dimming, delete-to-trash, new folder/file) all work
-end-to-end; rename UI, context menu, drag & drop, marquee and the M3 visual
-scenarios remain. 171 tests green (88 fs-core unit + 3 integration + 80 app).
+(JobsModel, dialogs, progress/toasts, undo), the keyboard file operations
+(cut/copy/paste with dimming, delete-to-trash, new folder/file) and now the
+inline rename overlay (`f2` + slow-second-click) with `Duplicate` all work
+end-to-end; context menu, drag & drop, marquee and the remaining M3 visual
+scenarios remain. 182 tests green (88 fs-core unit + 3 integration + 91 app).
 
 | Milestone | State |
 |---|---|
@@ -22,7 +23,7 @@ scenarios remain. 171 tests green (88 fs-core unit + 3 integration + 80 app).
 | Phase A architecture | ✅ merged (#3) |
 | M1 read-only browsing | ✅ merged (#4) |
 | M2 sidebar + in-place expansion | ✅ merged (#5) |
-| M3 file operations | 🔄 engine + job spine + keyboard ops done; rename/menu/drag/marquee next |
+| M3 file operations | 🔄 engine + job spine + keyboard ops + inline rename/duplicate done; context menu/drag/marquee next |
 | M4 icon view + dual pane → M8 ship | not started |
 
 ## Components
@@ -106,7 +107,37 @@ scenarios remain. 171 tests green (88 fs-core unit + 3 integration + 80 app).
   sortable header share fixed column-width constants (Size 90px, Date 150px,
   disclosure slot 16px) with `w_full` rows and `flex_none` cells, so body
   cells align under the Name / Size / Date Modified headers (closes the known
-  M1 alignment gap).
+  M1 alignment gap). **M3:** one dispatcher (`handle_row_click`) owns every
+  row click — double-click opens, `cmd`-click toggles, `shift`-click ranges,
+  a plain click selects *and arms the row*, and a later plain click on an
+  armed row is the §0 **slow second click** that opens the inline editor
+  (arming runs on `Spawner::timer`, `RENAME_CLICK_ARM_DELAY` = 500ms, so a
+  double-click lands as `click_count >= 2` and disarms instead). The root key
+  context becomes `DirView renaming` while the editor is up, which is what
+  every `DirView && !renaming` binding is guarded by. `Duplicate` (`cmd-d`)
+  submits `FileOp::Duplicate` for the root-most selection (keep-both names
+  planned by ops).
+- `rename.rs` + the rename row in `views/details_list.rs` (M3): the §4c
+  inline-rename state machine as a **field** of `DirView`
+  (`rename: Option<RenameState>`), not an entity. `begin_rename` (from `f2`
+  or the slow second click) creates one vendored `InputState`, sets the name
+  and preselects the **stem** via `fs_core::split_name` (now `pub`, so the
+  split is shared rather than re-implemented), focuses it and subscribes to
+  its focus loss. `views/details_list.rs` swaps that row's name cell for the
+  editor, wiring `Confirm`/`Cancel` plus the vendored input's editing actions
+  in a row-level `TextInput` key context (same pattern as `address_bar.rs`);
+  the row `track_focus`es the editor's handle so those actions actually
+  resolve. `Confirm` validates locally (nonempty, no path separator, trimmed;
+  an unchanged name just closes), then submits `FileOp::Rename` and shows the
+  pending name until the job's terminal event — success moves the selection
+  onto the new path and tears the editor down, while a failure (a collision is
+  a plain `rename` error, `overwrite: false`) lands back in the still-open
+  editor as a `deferred` error popup under the row. That failure path is why
+  `JobsEvent` gained `Failed { id, error }`: the submitter reacts per job id
+  instead of parsing toast text. `Escape`, focus loss, and *leaving* the
+  directory all tear the editor down (an in-place reload — refresh, sort flip,
+  hidden toggle — deliberately does not; `Pane::load` only cancels when the
+  path actually changes).
 - `jobs_model.rs` (M3): `JobsModel` non-render entity — the **sole** consumer
   of the fs-core `JobEvent` channel (one `_pump: Task` held in a field, §2).
   Folds events into `Vec<JobRow>` (progress popover data; terminal rows are
@@ -222,9 +253,12 @@ scenarios remain. 171 tests green (88 fs-core unit + 3 integration + 80 app).
   `conflict_dialog` (submits a copy that parks on a fixture conflict —
   `Downloads/notes.txt` onto `Documents/notes.txt` — so the workspace's
   modal + scrim render; FakeVfs counter mtimes keep the size/date panel
-  deterministic). The runner installs the FakeVfs fixture **and** a fixture
-  settings file (two favorites) via `settings::init_with_path`, so all
-  content is deterministic. The `conflict_dialog` baseline must be generated
+  deterministic) and `details_rename_editing` (navigates to
+  `/home/Documents`, then `begin_rename`s `report.pdf` so the row editor
+  renders with the stem selected). The runner installs the FakeVfs fixture
+  **and** a fixture settings file (two favorites) via
+  `settings::init_with_path`, so all content is deterministic. The
+  `conflict_dialog` and `details_rename_editing` baselines must be generated
   via the update-visual-baselines workflow on the PR branch; existing
   baselines are unchanged (the jobs indicator renders nothing while idle).
 - CI: `Visual regression tests (macOS)` job runs the comparison per PR;
@@ -459,12 +493,21 @@ scenarios remain. 171 tests green (88 fs-core unit + 3 integration + 80 app).
 Each entry names the milestone expected to resolve it. Mechanics live in the
 component sections; this list is the scannable index.
 
-- **M3 remaining UI surfaces**: inline rename (F2 + slow-second-click),
-  `Duplicate` (`cmd-d`), context menus, drag & drop, rubber-band marquee, and
-  the `rename_editing` / `context_menu_open` / `cut_dimmed` / `marquee_active`
-  visual scenarios. A §0-vs-`keymap.rs` audit confirms the other 12 M3 rows
-  are bound; only `RenameSelected` and `Duplicate` are unimplemented.
-  *Next work item on the M3 branch.*
+- **M3 remaining UI surfaces**: context menus, drag & drop, rubber-band
+  marquee, and the `context_menu_open` / `cut_dimmed` / `marquee_active`
+  visual scenarios. Every §0 M3 row now has an implemented handler (the
+  §0-vs-`keymap.rs` audit's two gaps, `RenameSelected` and `Duplicate`, are
+  closed). *Next work item on the M3 branch.*
+- **New Folder / New File auto-name instead of opening the editor** —
+  ARCHITECTURE §4c specifies the same state machine with `is_new_entry: true`
+  (phantom row + editor, commit runs `CreateDir`/`CreateFile`); `Pane` instead
+  creates `"New Folder"` / `"New Folder 2"` via `next_available_name` and
+  leaves it named. Now that the rename editor exists, wiring the create path
+  to open it on the new row is a small follow-up. *M3 remainder.*
+- **`details_rename_editing` baseline not yet generated** — the scenario is
+  declared in `visual_test_runner.rs`, but its PNG must come from the macOS
+  runner (`gh workflow run update-visual-baselines.yml`), so the visual job
+  fails until that runs. *Immediately, on this branch.*
 
 - **Symlink copy policy** — copy dereferences file links; symlink-to-dir inside
   a copied tree fails the job (details under fs-core). *Revisit when a
@@ -516,3 +559,4 @@ component sections; this list is the scannable index.
 | 2026-08-22 | — | M3 part 1 review: into-itself data-loss guard; copy-cleanup scoping; macOS dead_code fix; FakeVfs restore events. 141 tests. |
 | 2026-08-22 | — | M3 job spine: JobsModel bridge, conflict/confirm dialogs, progress popover, toasts, undo/redo wiring, conflict_dialog scenario. 157 tests. |
 | 2026-08-22 | — | M3 keyboard ops: SelectionModel, cut/copy/paste (+dimming), delete-to-trash, new folder/file; 4 end-to-end behavior tests. 171 tests. |
+| 2026-08-23 | — | M3 inline rename (`rename.rs`: `f2` + slow-second-click, stem preselect, inline errors, `JobsEvent::Failed`) + `Duplicate`; `details_rename_editing` scenario. 182 tests. |

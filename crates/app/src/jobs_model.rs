@@ -39,6 +39,11 @@ pub enum JobsEvent {
     /// A job finished successfully (its undo entry, if any, is already
     /// pushed).
     Completed { id: JobId, receipt: OpReceipt },
+    /// A job ended in an error (a toast is already pushed for it). Per-`id`
+    /// so a subscriber tracking one submitted job — e.g. the rename editor
+    /// waiting to show a collision reported by the op — can react without
+    /// re-deriving it from the toast text.
+    Failed { id: JobId, error: String },
 }
 
 /// Whether a live job is running or parked on a conflict. Terminal jobs are
@@ -299,6 +304,7 @@ impl JobsModel {
                     format!("{} failed: {error}", kind_label(kind)),
                     cx,
                 );
+                cx.emit(JobsEvent::Failed { id, error });
             }
             JobEvent::Cancelled { id } => {
                 self.remove_row(id);

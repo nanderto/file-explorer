@@ -58,6 +58,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-x", Cut, Some("DirView && !renaming")),
         KeyBinding::new("cmd-c", Copy, Some("DirView && !renaming")),
         KeyBinding::new("cmd-v", Paste, Some("DirView && !renaming")),
+        // §0 Rename (M3): f2, or a slow second click handled entirely by
+        // DirView's own click-arming state (never a keymap row).
+        KeyBinding::new("f2", RenameSelected, Some("DirView && !renaming")),
+        // toolbar "Duplicate selection" (M3)
+        KeyBinding::new("cmd-d", Duplicate, Some("DirView && !renaming")),
         // §0 Delete (M3): plain delete → trash; shift-delete bypasses the
         // trash behind the ConfirmDialog guard
         KeyBinding::new("delete", DeleteToTrash, Some("DirView && !renaming")),
@@ -172,6 +177,8 @@ mod tests {
                 .on_action(record!(DeleteToTrash, "DeleteToTrash"))
                 .on_action(record!(DeletePermanently, "DeletePermanently"))
                 .on_action(record!(NewFolder, "NewFolder"))
+                .on_action(record!(RenameSelected, "RenameSelected"))
+                .on_action(record!(Duplicate, "Duplicate"))
                 .on_action(record!(AcceptSuggestion, "AcceptSuggestion"))
                 .on_action(record!(Confirm, "Confirm"))
                 .on_action(record!(Cancel, "Cancel"))
@@ -210,6 +217,7 @@ mod tests {
         cx.simulate_keystrokes("enter backspace alt-up cmd-a down up home end pageup pagedown");
         cx.simulate_keystrokes("shift-down shift-up right left");
         cx.simulate_keystrokes("cmd-x cmd-c cmd-v delete shift-delete");
+        cx.simulate_keystrokes("f2 cmd-d");
         assert_eq!(
             *fired.borrow(),
             vec![
@@ -232,6 +240,8 @@ mod tests {
                 "Paste",
                 "DeleteToTrash",
                 "DeletePermanently",
+                "RenameSelected",
+                "Duplicate",
             ]
         );
     }
@@ -248,10 +258,12 @@ mod tests {
     #[gpui::test]
     fn renaming_token_suppresses_dir_view_bindings(cx: &mut TestAppContext) {
         let (fired, cx) = probe(cx, "DirView renaming");
-        // §0 guard: every DirView row — including delete and the clipboard
-        // keys — must stay dead while the rename editor is up.
+        // §0 guard: every DirView row — including delete, the clipboard
+        // keys, rename, and duplicate — must stay dead while the rename
+        // editor is up.
         cx.simulate_keystrokes("enter backspace cmd-a");
         cx.simulate_keystrokes("cmd-x cmd-c cmd-v delete shift-delete");
+        cx.simulate_keystrokes("f2 cmd-d");
         assert!(
             fired.borrow().is_empty(),
             "`!renaming` guard must block DirView bindings while renaming, got {:?}",

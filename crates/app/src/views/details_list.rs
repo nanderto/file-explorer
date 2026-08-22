@@ -13,13 +13,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs_core::{SortDirection, SortKey, SortSpec};
 use gpui::{
-    ClickEvent, Context, Hsla, IntoElement, SharedString, Stateful, UniformList, div, prelude::*,
-    px, uniform_list,
+    ClickEvent, Context, Hsla, IntoElement, SharedString, Stateful, UniformList, anchored,
+    deferred, div, prelude::*, px, uniform_list,
 };
 
-use crate::actions::SortBy;
+use crate::actions::{Cancel, Confirm, SortBy};
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
+use crate::input::text_input as ti;
 use crate::pane::format_bytes;
 use crate::theme::Theme;
 
@@ -133,6 +134,17 @@ fn render_row(
     ix: usize,
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
+    // ARCHITECTURE.md §4c/§8 "Inline rename overlay": the row of the entry
+    // being renamed swaps its name cell for the editor (or, once `Confirm`
+    // has submitted the op, the pending name) instead of the normal label.
+    if this
+        .rename
+        .as_ref()
+        .is_some_and(|rename| *rename.target() == row.entry.id())
+    {
+        return render_rename_row(this, row, ix, cx);
+    }
+
     let entry = &row.entry;
     let theme = this.theme().clone();
     let selected = this.selection().is_selected(&entry.id());
@@ -192,18 +204,17 @@ fn render_row(
         .cursor_pointer()
         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             window.focus(this.focus_handle_ref(), cx);
-            let modifiers = event.modifiers();
-            if event.click_count() >= 2 {
-                this.open_entry(&click_entry, cx);
-            } else if modifiers.platform {
-                // §0 selection row: cmd-click toggles membership.
-                this.toggle_entry_selection(&click_entry, cx);
-            } else if modifiers.shift {
-                // §0 selection row: shift-click ranges from the anchor.
-                this.range_select_to(&click_entry, cx);
-            } else {
-                this.select_entry(&click_entry, cx);
-            }
+            // §0 selection row (fast double-click / cmd-click / shift-click)
+            // and the §0/§8 rename trigger (a slow second click on an
+            // already-armed row) share one dispatcher — see `DirView`'s doc
+            // comment on `handle_row_click`.
+            this.handle_row_click(
+                &click_entry,
+                event.modifiers(),
+                event.click_count(),
+                window,
+                cx,
+            );
         }))
         .child(div().w(px(row.depth as f32 * DISCLOSURE_WIDTH)).flex_none())
         .child(disclosure)
@@ -232,6 +243,137 @@ fn render_row(
     if cut_pending {
         styled_row = styled_row.opacity(CUT_DIM_OPACITY);
     }
+    styled_row
+}
+
+/// The row of the entry being renamed (ARCHITECTURE.md §4c/§8): the name
+/// cell is the vendored [`ti`] editor (or, once `Confirm` has submitted the
+/// op, the plain pending name — not editable); `Confirm`/`Cancel` and the
+/// editor's own editing keys are wired here, same pattern as
+/// `address_bar.rs`'s `TextInput` context. An inline validation error (local
+/// or reported by the op) renders as a `deferred` popup under the row.
+fn render_rename_row(
+    this: &mut DirView,
+    row: &crate::dir_view::ProjectedRow,
+    ix: usize,
+    cx: &mut Context<DirView>,
+) -> Stateful<gpui::Div> {
+    let theme = this.theme().clone();
+    let rename = this
+        .rename
+        .as_ref()
+        .expect("render_rename_row requires an active rename");
+    let input = rename.input().clone();
+    let processing = rename.processing().cloned();
+    let error = rename.error().cloned();
+    let depth = row.depth;
+
+    let name_area: gpui::AnyElement = if let Some(pending) = processing {
+        div()
+            .flex_1()
+            .truncate()
+            .text_color(theme.muted)
+            .child(pending)
+            .into_any_element()
+    } else {
+        input.clone().into_any_element()
+    };
+
+    // `track_focus` so the row's `TextInput` key context is actually part of
+    // the dispatch chain while the embedded editor holds focus (a plain
+    // `.child(input)` without it leaves `Confirm`/`Cancel` unreachable).
+    let input_focus = input.read(cx).focus_handle(cx);
+    let mut styled_row = div()
+        .id(("dir-row-rename", ix))
+        .debug_selector(|| format!("dir-row-{ix}"))
+        .track_focus(&input_focus)
+        .key_context("TextInput")
+        .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm_rename(window, cx)))
+        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel_rename(window, cx)))
+        // Forward the vendored input's editing actions (bound in
+        // keymap.rs, `TextInput` context) into the row's editor, same
+        // pattern as `address_bar.rs`.
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Left, w, cx| input.update(cx, |i, cx| i.left(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Right, w, cx| input.update(cx, |i, cx| i.right(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::SelectLeft, w, cx| input.update(cx, |i, cx| i.select_left(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::SelectRight, w, cx| input.update(cx, |i, cx| i.select_right(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::SelectAll, w, cx| input.update(cx, |i, cx| i.select_all(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Home, w, cx| input.update(cx, |i, cx| i.home(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::End, w, cx| input.update(cx, |i, cx| i.end(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Backspace, w, cx| input.update(cx, |i, cx| i.backspace(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Delete, w, cx| input.update(cx, |i, cx| i.delete(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Copy, w, cx| input.update(cx, |i, cx| i.copy(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Cut, w, cx| input.update(cx, |i, cx| i.cut(a, w, cx))
+        }))
+        .on_action(cx.listener({
+            let input = input.clone();
+            move |_, a: &ti::Paste, w, cx| input.update(cx, |i, cx| i.paste(a, w, cx))
+        }))
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .px(px(8.0))
+        .text_size(px(13.0))
+        .text_color(theme.text)
+        .child(div().w(px(depth as f32 * DISCLOSURE_WIDTH)).flex_none())
+        .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
+        .child(name_area)
+        .child(div().w(px(SIZE_COL_WIDTH)).flex_none())
+        .child(div().w(px(DATE_COL_WIDTH)).flex_none());
+
+    if let Some(message) = error {
+        styled_row = styled_row.child(deferred(
+            anchored().child(
+                div()
+                    .absolute()
+                    .top(px(ROW_HEIGHT))
+                    .left(px(depth as f32 * DISCLOSURE_WIDTH + DISCLOSURE_WIDTH))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(theme.error)
+                    .bg(theme.panel)
+                    .text_size(px(11.0))
+                    .text_color(theme.error)
+                    .child(message),
+            ),
+        ));
+    }
+
     styled_row
 }
 

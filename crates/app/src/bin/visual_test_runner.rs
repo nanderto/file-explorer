@@ -76,6 +76,9 @@ mod macos {
         /// Navigate, then submit a copy that parks on a conflict so the
         /// workspace opens the conflict modal (M3).
         ConflictDialogOpen(&'static str),
+        /// Navigate, then open the inline rename editor on one entry with its
+        /// stem preselected (M3, §4c).
+        RenameEditing(&'static str, &'static str),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -110,6 +113,11 @@ mod macos {
                 "conflict_dialog",
                 Theme::dark(),
                 Setup::ConflictDialogOpen("/home"),
+            ),
+            (
+                "details_rename_editing",
+                Theme::dark(),
+                Setup::RenameEditing("/home/Documents", "/home/Documents/report.pdf"),
             ),
         ]
     }
@@ -288,6 +296,26 @@ mod macos {
                         dest_dir: PathBuf::from("/home/Documents"),
                     });
                 });
+            }
+            Setup::RenameEditing(path, target) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                let dir_view = cx.read(|cx| pane.read(cx).dir_view().clone());
+                cx.update_window(handle, |_, window, cx| {
+                    dir_view.update(cx, |dir_view, cx| {
+                        let target = Path::new(target);
+                        let entry = dir_view
+                            .projected_rows(cx)
+                            .into_iter()
+                            .find(|row| row.entry.path.as_ref() == target)
+                            .map(|row| row.entry)
+                            .expect("rename target is listed in the fixture");
+                        dir_view.set_cursor(Some(entry.id()), cx);
+                        dir_view.begin_rename(&entry, window, cx);
+                    });
+                })
+                .map_err(|e| anyhow!("rename setup failed: {e:?}"))?;
             }
         }
         Ok(())

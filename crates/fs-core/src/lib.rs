@@ -34,7 +34,7 @@ pub use exec::{Spawner, SpawnerExt};
 pub use listing::{ListingCache, ListingPatch, ListingSnapshot, list_dir, patch_listing};
 pub use ops::{
     Conflict, ConflictChoice, FileOp, JobEvent, JobId, JobInfo, JobKind, JobQueue, OpReceipt,
-    Resolution, keep_both_candidates, plan_keep_both_names,
+    Resolution, keep_both_candidates, plan_keep_both_names, split_name,
 };
 #[cfg(target_os = "macos")]
 pub use platform::MacPlatform;

@@ -331,6 +331,13 @@ impl InputState {
         cx.notify();
     }
 
+    /// Local modification: read access to the current selection, for
+    /// callers that need to assert on it (e.g. the rename editor's stem
+    /// preselect).
+    pub fn selected_range(&self) -> Range<usize> {
+        self.selected_range.clone()
+    }
+
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -722,6 +729,22 @@ impl InputState {
     pub fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
+    }
+
+    /// Local modification: programmatic selection of an arbitrary range.
+    /// Upstream only exposes whole-content selection via `select_all`; the
+    /// app's inline rename editor needs to preselect just the file-name stem
+    /// (extension excluded).
+    pub fn select_range(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.content.len();
+        self.selected_range = range.start.min(len)..range.end.min(len);
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     pub fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
