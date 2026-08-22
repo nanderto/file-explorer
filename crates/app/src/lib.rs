@@ -6,10 +6,14 @@
 pub mod actions;
 pub mod address_bar;
 pub mod app_state;
+pub mod dialogs;
 pub mod dir_view;
 pub mod input;
+pub mod jobs_model;
+pub mod jobs_ui;
 pub mod keymap;
 pub mod pane;
+pub mod selection;
 pub mod settings;
 pub mod sidebar;
 pub mod theme;

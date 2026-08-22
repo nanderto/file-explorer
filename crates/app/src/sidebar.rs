@@ -567,7 +567,7 @@ impl Render for Sidebar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::{FsContext, GpuiSpawner, LoggingOpener};
+    use crate::app_state::{GpuiSpawner, LoggingOpener};
     use crate::settings::SettingsContent;
     use fs_core::{FakeVfs, Spawner, Vfs as _};
     use gpui::{Entity, TestAppContext, VisualTestContext};
@@ -593,12 +593,13 @@ mod tests {
                 }),
             );
             crate::keymap::init(cx);
-            cx.set_global(FsContext {
-                vfs: vfs.clone(),
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
                 spawner,
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(fs_core::StubPlatform::new()),
-            });
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
             crate::settings::init_with_path(cx, PathBuf::from(SETTINGS_PATH));
             vfs
         })

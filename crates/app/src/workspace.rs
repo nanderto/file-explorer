@@ -7,13 +7,17 @@
 //! Panes live in a `Vec` from day one (len 1 for M1) so the M4 split-pane
 //! toggle grows the vector instead of reshaping the tree.
 
+use fs_core::{Conflict, FileOp, JobId, UndoOutcome};
 use gpui::{
-    App, Context, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, Render, Subscription,
-    Window, div, prelude::*, px,
+    AnyElement, App, Context, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, Render,
+    SharedString, Subscription, Window, deferred, div, prelude::*, px,
 };
 
-use crate::actions::{FocusAddressBar, ToggleHiddenFiles};
+use crate::actions::{FocusAddressBar, Redo, ToggleHiddenFiles, Undo};
 use crate::app_state::FsContext;
+use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
+use crate::jobs_model::{JobsEvent, JobsModel};
+use crate::jobs_ui::{JobsIndicator, ToastLayer};
 use crate::pane::Pane;
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::Theme;
@@ -55,6 +59,35 @@ impl Render for SplitterGhost {
     }
 }
 
+/// A pending confirmation (currently: the §0 `DeletePermanently` guard).
+/// The op is held by the workspace and submitted only on `Confirmed`.
+pub struct ConfirmRequest {
+    pub title: SharedString,
+    pub message: SharedString,
+    pub confirm_label: SharedString,
+    pub op: FileOp,
+}
+
+/// Which dialog `Workspace.modal` currently shows (§8 "Dialogs").
+pub enum Modal {
+    Confirm {
+        view: Entity<ConfirmDialog>,
+        op: FileOp,
+    },
+    Conflict {
+        view: Entity<ConflictDialog>,
+        job: JobId,
+    },
+}
+
+/// The active modal plus what it needs to tear down cleanly: the focus to
+/// restore and the dialog-event subscription (dies with the modal).
+struct ModalState {
+    modal: Modal,
+    prev_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     theme: Theme,
@@ -64,6 +97,10 @@ pub struct Workspace {
     show_hidden: bool,
     sidebar_width: f32,
     info_panel_width: f32,
+    jobs: Entity<JobsModel>,
+    jobs_indicator: Entity<JobsIndicator>,
+    toast_layer: Entity<ToastLayer>,
+    modal: Option<ModalState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -75,6 +112,12 @@ impl Workspace {
         // Events up, method calls down (§2): the sidebar reports navigation
         // and eject requests; the workspace acts on them.
         let sidebar_subscription = cx.subscribe(&sidebar, Self::handle_sidebar_event);
+        // §2: the workspace observes the JobsModel for parked conflicts
+        // (NeedsDecision → modal); jobs_ui observes it for progress/toasts.
+        let jobs = FsContext::global(cx).jobs.clone();
+        let jobs_subscription = cx.subscribe_in(&jobs, window, Self::handle_jobs_event);
+        let jobs_indicator = cx.new(|cx| JobsIndicator::new(theme.clone(), jobs.clone(), cx));
+        let toast_layer = cx.new(|cx| ToastLayer::new(theme.clone(), jobs.clone(), cx));
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         Self {
@@ -86,7 +129,11 @@ impl Workspace {
             show_hidden: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             info_panel_width: INFO_PANEL_DEFAULT_WIDTH,
-            _subscriptions: vec![sidebar_subscription],
+            jobs,
+            jobs_indicator,
+            toast_layer,
+            modal: None,
+            _subscriptions: vec![sidebar_subscription, jobs_subscription],
         }
     }
 
@@ -116,6 +163,240 @@ impl Workspace {
                 }));
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Job spine: conflicts → modal, undo/redo, dialogs (§2, §4b, §8)
+    // ------------------------------------------------------------------
+
+    fn handle_jobs_event(
+        &mut self,
+        _jobs: &Entity<JobsModel>,
+        event: &JobsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            JobsEvent::NeedsDecision { id, conflict } => {
+                // A busy modal keeps priority; the pending conflict is
+                // re-checked when it closes (close_modal).
+                if self.modal.is_none() {
+                    self.open_conflict_modal(*id, conflict.clone(), window, cx);
+                }
+            }
+            JobsEvent::DecisionObsolete { id } => {
+                // The parked job ended (cancelled from the popover, failed):
+                // a modal still showing it is stale.
+                if matches!(
+                    &self.modal,
+                    Some(ModalState { modal: Modal::Conflict { job, .. }, .. }) if job == id
+                ) {
+                    self.close_modal(window, cx);
+                }
+            }
+            JobsEvent::RowsChanged | JobsEvent::Completed { .. } => {}
+        }
+    }
+
+    fn open_conflict_modal(
+        &mut self,
+        job: JobId,
+        conflict: Conflict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| ConflictDialog::new(self.theme.clone(), conflict, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            move |this, _, event: &ConflictDialogEvent, window, cx| {
+                this.handle_conflict_event(job, *event, window, cx);
+            },
+        );
+        self.open_modal(Modal::Conflict { view, job }, subscription, window, cx);
+    }
+
+    /// Show the destructive-action confirmation (§0 `DeletePermanently`:
+    /// "confirm dialog first"). The op is submitted only on `Confirmed`.
+    pub fn show_confirm(
+        &mut self,
+        request: ConfirmRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ConfirmRequest {
+            title,
+            message,
+            confirm_label,
+            op,
+        } = request;
+        let view =
+            cx.new(|cx| ConfirmDialog::new(self.theme.clone(), title, message, confirm_label, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &ConfirmDialogEvent, window, cx| {
+                this.handle_confirm_event(*event, window, cx);
+            },
+        );
+        self.open_modal(Modal::Confirm { view, op }, subscription, window, cx);
+    }
+
+    fn open_modal(
+        &mut self,
+        modal: Modal,
+        subscription: Subscription,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prev_focus = window.focused(cx);
+        let dialog_focus = match &modal {
+            Modal::Confirm { view, .. } => view.focus_handle(cx),
+            Modal::Conflict { view, .. } => view.focus_handle(cx),
+        };
+        self.modal = Some(ModalState {
+            modal,
+            prev_focus,
+            _subscription: subscription,
+        });
+        window.focus(&dialog_focus, cx);
+        cx.notify();
+    }
+
+    /// Tear the modal down: restore the pre-modal focus, then surface the
+    /// next parked conflict, if any (a conflict that arrived while another
+    /// modal was up).
+    fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.modal.take() {
+            if let Some(prev) = state.prev_focus {
+                window.focus(&prev, cx);
+            } else {
+                window.focus(&self.focus_handle, cx);
+            }
+            cx.notify();
+        }
+        if let Some((id, conflict)) = self
+            .jobs
+            .read(cx)
+            .pending_decision()
+            .cloned()
+            .filter(|_| self.modal.is_none())
+        {
+            self.open_conflict_modal(id, conflict, window, cx);
+        }
+    }
+
+    fn handle_conflict_event(
+        &mut self,
+        job: JobId,
+        event: ConflictDialogEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let queue = FsContext::global(cx).queue.clone();
+        match event {
+            // §4b: the resolution un-parks the waiting lane.
+            ConflictDialogEvent::Resolved(resolution) => queue.resolve(job, resolution),
+            // §0: escape dismisses the dialog and cancels the job.
+            ConflictDialogEvent::Cancelled => queue.cancel(job),
+        }
+        // Pop the handled decision first so close_modal's pending re-check
+        // cannot re-open the same conflict.
+        self.jobs
+            .update(cx, |jobs, cx| jobs.decision_handled(job, cx));
+        self.close_modal(window, cx);
+    }
+
+    fn handle_confirm_event(
+        &mut self,
+        event: ConfirmDialogEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event == ConfirmDialogEvent::Confirmed
+            && let Some(ModalState {
+                modal: Modal::Confirm { op, .. },
+                ..
+            }) = &self.modal
+        {
+            let op = op.clone();
+            FsContext::global(cx).queue.submit(op);
+        }
+        self.close_modal(window, cx);
+    }
+
+    /// The active modal, for tests and (later) chrome state.
+    pub fn active_modal(&self) -> Option<&Modal> {
+        self.modal.as_ref().map(|state| &state.modal)
+    }
+
+    fn handle_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        Self::apply_undo_redo(false, cx);
+    }
+
+    fn handle_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        Self::apply_undo_redo(true, cx);
+    }
+
+    /// §0 Undo/Redo (Workspace → UndoStack): validate + submit through the
+    /// queue on the foreground executor. Inverse jobs are registered with the
+    /// JobsModel **synchronously after submission** (no intervening await),
+    /// so their completions never push fresh undo entries; an invalidated
+    /// entry surfaces as a toast instead of applying against stale state.
+    fn apply_undo_redo(redo: bool, cx: &mut Context<Self>) {
+        let fs = FsContext::global(cx);
+        let vfs = fs.vfs.clone();
+        let queue = fs.queue.clone();
+        let undo = fs.undo.clone();
+        let jobs = fs.jobs.clone();
+        // One-shot task (not a held pump): detached so a dropped workspace
+        // can't cancel an undo between popping the entry and submitting it.
+        cx.spawn(async move |_, cx| {
+            let outcome = if redo {
+                undo.lock().await.redo(&vfs, &queue).await
+            } else {
+                undo.lock().await.undo(&vfs, &queue).await
+            };
+            match outcome {
+                UndoOutcome::Applied { jobs: ids } => {
+                    jobs.update(cx, |jobs, _| jobs.suppress_undo_for(&ids));
+                }
+                UndoOutcome::Invalidated { reason, .. } => {
+                    let verb = if redo { "redo" } else { "undo" };
+                    jobs.update(cx, |jobs, cx| {
+                        jobs.push_undo_invalidated(format!("Can't {verb} — {reason}"), cx);
+                    });
+                }
+                UndoOutcome::Nothing => {}
+            }
+        })
+        .detach();
+    }
+
+    /// The scrim + centered dialog, painted over everything (§8 "Dialogs":
+    /// `deferred` overlay + scrim).
+    fn render_modal_overlay(&self) -> Option<impl IntoElement> {
+        let state = self.modal.as_ref()?;
+        let dialog: AnyElement = match &state.modal {
+            Modal::Confirm { view, .. } => view.clone().into_any_element(),
+            Modal::Conflict { view, .. } => view.clone().into_any_element(),
+        };
+        let theme = &self.theme;
+        Some(
+            deferred(
+                div()
+                    .id("modal-scrim")
+                    .absolute()
+                    .size_full()
+                    .occlude()
+                    .bg(theme.border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(dialog),
+            )
+            .with_priority(100),
+        )
     }
 
     pub fn active_pane(&self) -> &gpui::Entity<Pane> {
@@ -249,24 +530,28 @@ impl Render for Workspace {
             .key_context("Workspace")
             .on_action(cx.listener(Self::handle_focus_address_bar))
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
+            .on_action(cx.listener(Self::handle_undo))
+            .on_action(cx.listener(Self::handle_redo))
             .flex()
             .flex_col()
             .size_full()
             .font_family(UI_FONT)
             .bg(theme.surface)
             .text_color(theme.text)
-            // Titlebar
+            // Titlebar (with the jobs indicator, visible only while jobs run)
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .h(px(40.0))
                     .px(px(80.0))
                     .bg(theme.titlebar)
                     .border_b_1()
                     .border_color(theme.border)
                     .text_size(px(13.0))
-                    .child("file-explorer"),
+                    .child("file-explorer")
+                    .child(self.jobs_indicator.clone()),
             )
             // Body: sidebar | pane(s) | info panel, separated by splitters
             .child(
@@ -310,6 +595,10 @@ impl Render for Workspace {
                             .child(self.splitter_handle(SplitterSide::InfoPanel)),
                     ),
             )
+            // Toast overlay (renders nothing while empty)
+            .child(self.toast_layer.clone())
+            // Modal overlay + scrim (§8 "Dialogs")
+            .children(self.render_modal_overlay())
     }
 }
 
@@ -318,7 +607,7 @@ mod tests {
     use super::*;
     use crate::app_state::{FsContext, GpuiSpawner, LoggingOpener};
     use crate::pane::AddressBarMode;
-    use fs_core::{FakeVfs, Spawner};
+    use fs_core::{FakeVfs, Spawner, Vfs as _};
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use serde_json::json;
     use std::path::Path;
@@ -337,12 +626,13 @@ mod tests {
                 }),
             );
             crate::keymap::init(cx);
-            cx.set_global(FsContext {
-                vfs: vfs.clone(),
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
                 spawner,
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(fs_core::StubPlatform::new()),
-            });
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
             crate::settings::init_with_path(
                 cx,
                 std::path::PathBuf::from("/config/file-explorer/settings.json"),
@@ -429,6 +719,291 @@ mod tests {
             assert_eq!(
                 workspace.active_pane().read(cx).address_bar_mode(),
                 AddressBarMode::Editing
+            );
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // M3 job spine (§9 "jobs_model.rs / dialogs" rows)
+    // ------------------------------------------------------------------
+
+    fn contents(vfs: &Arc<FakeVfs>, path: &str) -> Vec<u8> {
+        futures::executor::block_on(vfs.load(Path::new(path))).unwrap()
+    }
+
+    fn exists(vfs: &Arc<FakeVfs>, path: &str) -> bool {
+        futures::executor::block_on(vfs.metadata(Path::new(path)))
+            .unwrap()
+            .is_some()
+    }
+
+    fn queue_of(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> std::sync::Arc<fs_core::JobQueue> {
+        workspace.read_with(cx, |_, cx| FsContext::global(cx).queue.clone())
+    }
+
+    fn jobs_of(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<crate::jobs_model::JobsModel> {
+        workspace.read_with(cx, |_, cx| FsContext::global(cx).jobs.clone())
+    }
+
+    // §4b + §9: a parked NeedsDecision opens the workspace's conflict modal,
+    // and the dialog's `k` binding reaches `queue.resolve` (keep both).
+    #[gpui::test]
+    fn needs_decision_opens_modal_and_keep_both_key_resolves(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/src", json!({ "a.txt": "new" }));
+        vfs.insert_tree("/dest", json!({ "a.txt": "old" }));
+        let (workspace, cx) = build_workspace(cx);
+        let queue = queue_of(&workspace, cx);
+
+        queue.submit(fs_core::FileOp::Copy {
+            sources: vec![std::path::PathBuf::from("/src/a.txt")],
+            dest_dir: std::path::PathBuf::from("/dest"),
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                matches!(workspace.active_modal(), Some(Modal::Conflict { .. })),
+                "NeedsDecision must open the conflict modal"
+            );
+        });
+
+        // The modal focused its dialog on open; `k` resolves as Keep both.
+        cx.simulate_keystrokes("k");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none(), "modal closed");
+        });
+        assert_eq!(contents(&vfs, "/dest/a.txt"), b"old");
+        assert_eq!(contents(&vfs, "/dest/a copy.txt"), b"new");
+    }
+
+    // §0: `a` toggles Apply-to-all, `r` replaces — one prompt for two
+    // conflicts, and no second modal appears.
+    #[gpui::test]
+    fn apply_to_all_replace_resolves_every_conflict_with_one_prompt(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/src", json!({ "a.txt": "new a", "b.txt": "new b" }));
+        vfs.insert_tree("/dest", json!({ "a.txt": "old a", "b.txt": "old b" }));
+        let (workspace, cx) = build_workspace(cx);
+        let queue = queue_of(&workspace, cx);
+
+        queue.submit(fs_core::FileOp::Copy {
+            sources: vec![
+                std::path::PathBuf::from("/src/a.txt"),
+                std::path::PathBuf::from("/src/b.txt"),
+            ],
+            dest_dir: std::path::PathBuf::from("/dest"),
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a r");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal().is_none(), "no second prompt");
+            assert!(
+                FsContext::global(cx)
+                    .jobs
+                    .read(cx)
+                    .pending_decision()
+                    .is_none()
+            );
+        });
+        assert_eq!(contents(&vfs, "/dest/a.txt"), b"new a");
+        assert_eq!(contents(&vfs, "/dest/b.txt"), b"new b");
+    }
+
+    // §0: escape dismisses the dialog AND cancels the job.
+    #[gpui::test]
+    fn escape_dismisses_the_conflict_dialog_and_cancels_the_job(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/src", json!({ "a.txt": "new" }));
+        vfs.insert_tree("/dest", json!({ "a.txt": "old" }));
+        let (workspace, cx) = build_workspace(cx);
+        let queue = queue_of(&workspace, cx);
+
+        queue.submit(fs_core::FileOp::Copy {
+            sources: vec![std::path::PathBuf::from("/src/a.txt")],
+            dest_dir: std::path::PathBuf::from("/dest"),
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.active_modal().is_none());
+            let jobs = FsContext::global(cx).jobs.read(cx);
+            assert!(jobs.rows().is_empty(), "cancelled job removed");
+            assert!(jobs.pending_decision().is_none());
+        });
+        assert_eq!(contents(&vfs, "/dest/a.txt"), b"old", "nothing written");
+    }
+
+    // A job cancelled from the popover while its conflict modal is up makes
+    // the decision obsolete: the stale modal closes by itself.
+    #[gpui::test]
+    fn cancelling_a_parked_job_closes_its_stale_modal(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/src", json!({ "a.txt": "new" }));
+        vfs.insert_tree("/dest", json!({ "a.txt": "old" }));
+        let (workspace, cx) = build_workspace(cx);
+        let queue = queue_of(&workspace, cx);
+        let jobs = jobs_of(&workspace, cx);
+
+        queue.submit(fs_core::FileOp::Copy {
+            sources: vec![std::path::PathBuf::from("/src/a.txt")],
+            dest_dir: std::path::PathBuf::from("/dest"),
+        });
+        cx.run_until_parked();
+        let id = jobs.read_with(cx, |jobs, _| jobs.pending_decision().expect("parked").0);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(matches!(
+                workspace.active_modal(),
+                Some(Modal::Conflict { .. })
+            ));
+        });
+
+        jobs.read_with(cx, |jobs, _| jobs.cancel_job(id));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.active_modal().is_none(),
+                "stale conflict modal closed on DecisionObsolete"
+            );
+        });
+    }
+
+    // §8 ConfirmDialog: enter submits the held op (delete permanently),
+    // escape leaves the world untouched. Dispatch guard for the
+    // `ConfirmDialog` key context on the real entity.
+    #[gpui::test]
+    fn confirm_dialog_enter_submits_and_escape_aborts(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+
+        let request = || ConfirmRequest {
+            title: "Delete Permanently".into(),
+            message: "\u{201c}a.txt\u{201d} will be deleted immediately.".into(),
+            confirm_label: "Delete".into(),
+            op: fs_core::FileOp::Delete {
+                paths: vec![std::path::PathBuf::from("/root/a.txt")],
+            },
+        };
+
+        // Escape first: nothing happens.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_confirm(request(), window, cx)
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(matches!(
+                workspace.active_modal(),
+                Some(Modal::Confirm { .. })
+            ));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none());
+        });
+        assert!(exists(&vfs, "/root/a.txt"), "escape never submits");
+
+        // Enter: the held op is submitted.
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_confirm(request(), window, cx)
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none());
+        });
+        assert!(!exists(&vfs, "/root/a.txt"), "enter submitted the delete");
+    }
+
+    // §0 Undo/Redo through the Workspace context: cmd-z rolls a completed
+    // rename back, cmd-shift-z re-applies it — and the inverse jobs push no
+    // fresh undo entries (the stacks never feed themselves).
+    #[gpui::test]
+    fn cmd_z_undoes_and_cmd_shift_z_redoes_a_rename(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let queue = queue_of(&workspace, cx);
+
+        queue.submit(fs_core::FileOp::Rename {
+            from: std::path::PathBuf::from("/root/a.txt"),
+            to: std::path::PathBuf::from("/root/b.txt"),
+        });
+        cx.run_until_parked();
+        assert!(exists(&vfs, "/root/b.txt"));
+
+        cx.update(|window, cx| {
+            let handle = workspace.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert!(exists(&vfs, "/root/a.txt"), "undo renamed back");
+        assert!(!exists(&vfs, "/root/b.txt"));
+
+        cx.simulate_keystrokes("cmd-shift-z");
+        cx.run_until_parked();
+        assert!(exists(&vfs, "/root/b.txt"), "redo re-applied the rename");
+        assert!(!exists(&vfs, "/root/a.txt"));
+
+        // One more undo works (the redo re-armed it); then the stack is
+        // empty — the inverse jobs themselves pushed nothing.
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert!(exists(&vfs, "/root/a.txt"));
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert!(
+            exists(&vfs, "/root/a.txt"),
+            "empty stack: second undo is a no-op"
+        );
+    }
+
+    // §6 undo invalidation: a fingerprint mismatch surfaces as a toast and
+    // never applies against stale state.
+    #[gpui::test]
+    fn invalidated_undo_surfaces_a_toast_instead_of_applying(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let queue = queue_of(&workspace, cx);
+        let jobs = jobs_of(&workspace, cx);
+
+        queue.submit(fs_core::FileOp::Rename {
+            from: std::path::PathBuf::from("/root/a.txt"),
+            to: std::path::PathBuf::from("/root/b.txt"),
+        });
+        cx.run_until_parked();
+
+        // The world changes underneath the entry.
+        vfs.insert_file("/root/b.txt", 99);
+
+        cx.update(|window, cx| {
+            let handle = workspace.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+
+        assert!(exists(&vfs, "/root/b.txt"), "stale undo never applied");
+        jobs.read_with(cx, |jobs, _| {
+            assert!(
+                jobs.toasts()
+                    .iter()
+                    .any(|t| t.message.contains("Can't undo")),
+                "invalidation toast shown: {:?}",
+                jobs.toasts()
             );
         });
     }

@@ -39,6 +39,7 @@ This table is the **literal source of truth for `crates/app/src/keymap.rs`** and
 | §3 Conflict dialog | Replace / Skip / Keep both | `r` / `s` / `k` | `ConflictReplace` / `ConflictSkip` / `ConflictKeepBoth` | `ConflictDialog` | ConflictDialog → JobQueue | M3 |
 | §3 Conflict dialog | Toggle "Apply to all" | `a` | `ToggleApplyToAll` | `ConflictDialog` | ConflictDialog | M3 |
 | §3 Conflict dialog | Activate focused button / dismiss & cancel job | `enter` / `escape` | `Confirm` / `Cancel` | `ConflictDialog` | ConflictDialog | M3 |
+| §3 Delete | Confirm / abort the delete-permanently dialog | `enter` / `escape` | `Confirm` / `Cancel` | `ConfirmDialog` | ConfirmDialog → Workspace → JobQueue | M3 |
 | §3 Free space | Free space in status line | — | *not an action* (rendered state) | — | Pane status line | M1 |
 | §3 Hidden files | Toggle hidden files | `cmd-shift-.`, toolbar | `ToggleHiddenFiles` | `Workspace` | Workspace | M1 |
 | §3 Undo | Undo / Redo (rename, move, copy, new folder, trash-restore) | `cmd-z` / `cmd-shift-z` | `Undo` / `Redo` | `Workspace` | Workspace → UndoStack | M3 |
@@ -232,6 +233,7 @@ pub struct SortBy { pub key: fs_core::sort::SortKey }
 - `AddressBar` — the pane's TextInput in edit mode (adds `AcceptSuggestion` on `tab` over plain `TextInput`).
 - `TextInput` — generic editing bindings (left/right/word-jump/select-all/copy/paste-text, `Confirm`/`Cancel`).
 - `ConflictDialog` — active while `Workspace.modal` holds the conflict modal; `track_focus` on the dialog's focus handle.
+- `ConfirmDialog` — active while `Workspace.modal` holds the confirm modal (delete-permanently guard); `track_focus` on the dialog's focus handle.
 
 `keymap.rs` is written by transcribing §0 row-for-row into `cx.bind_keys(...)`; JSON user overrides are deferred to M7. Handlers live on the entity that owns the state: `DirView` handles selection/open/rename/ops/expansion; `Pane` handles history/address-bar/refresh; `Workspace` handles undo/split/hidden-toggle/global focus; the conflict dialog handles its own resolution actions and forwards to `JobQueue::resolve`.
 

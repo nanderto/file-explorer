@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use crate::actions::SortBy;
+use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 use crate::pane::format_bytes;
 use crate::theme::Theme;
@@ -34,6 +35,8 @@ const DISCLOSURE_WIDTH: f32 = 16.0;
 /// Selection tint: the theme accent at partial alpha, so selected-row text
 /// keeps its normal contrast in both appearances.
 const SELECTION_ALPHA: f32 = 0.35;
+/// Row opacity for cut-pending entries (plan §3: "cut items render dimmed").
+const CUT_DIM_OPACITY: f32 = 0.5;
 
 /// The sortable column header row. Cells dispatch `SortBy { key }` through
 /// the action system so header clicks, and nothing else, own the sort logic
@@ -132,7 +135,10 @@ fn render_row(
 ) -> Stateful<gpui::Div> {
     let entry = &row.entry;
     let theme = this.theme().clone();
-    let selected = this.cursor() == Some(&entry.id());
+    let selected = this.selection().is_selected(&entry.id());
+    // Cut-pending entries render dimmed (§4b: the DirView checks membership
+    // in the FsContext clipboard at render).
+    let cut_pending = FsContext::global(cx).clipboard.is_cut(&entry.path);
     let name: SharedString = SharedString::new(entry.name.clone());
     let size: SharedString = if entry.is_dir_like() {
         SharedString::new_static("—")
@@ -186,8 +192,15 @@ fn render_row(
         .cursor_pointer()
         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             window.focus(this.focus_handle_ref(), cx);
+            let modifiers = event.modifiers();
             if event.click_count() >= 2 {
                 this.open_entry(&click_entry, cx);
+            } else if modifiers.platform {
+                // §0 selection row: cmd-click toggles membership.
+                this.toggle_entry_selection(&click_entry, cx);
+            } else if modifiers.shift {
+                // §0 selection row: shift-click ranges from the anchor.
+                this.range_select_to(&click_entry, cx);
             } else {
                 this.select_entry(&click_entry, cx);
             }
@@ -215,6 +228,9 @@ fn render_row(
         );
     if selected {
         styled_row = styled_row.bg(selection_color(&theme));
+    }
+    if cut_pending {
+        styled_row = styled_row.opacity(CUT_DIM_OPACITY);
     }
     styled_row
 }

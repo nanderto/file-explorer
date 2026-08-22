@@ -15,14 +15,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_core::{
-    EntryId, ListingCache, ListingSnapshot, SortDirection, SortKey, SortSpec, Vfs, list_dir,
+    EntryId, FileOp, ListingCache, ListingSnapshot, SortDirection, SortKey, SortSpec, Vfs, list_dir,
 };
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, NavigationDirection,
     Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
-use crate::actions::{GoBack, GoForward, GoUp, Refresh, SortBy};
+use crate::actions::{GoBack, GoForward, GoUp, NewFile, NewFolder, Refresh, SortBy};
 use crate::address_bar::{AddressBar, AddressBarEvent};
 use crate::app_state::FsContext;
 use crate::dir_view::{DirView, DirViewEvent};
@@ -274,6 +274,41 @@ impl Pane {
         cx.notify();
     }
 
+    /// §0 "New folder" (`cmd-shift-n`, context menu): create a fresh,
+    /// non-conflicting folder in the current directory through the job queue
+    /// (undoable; completion toasts via the JobsModel).
+    pub fn new_folder(&mut self, cx: &mut Context<Self>) {
+        self.create_new_entry(true, cx);
+    }
+
+    /// §0 "New text file" (context menu **New ▸ Text file…** — no key row).
+    pub fn new_file(&mut self, cx: &mut Context<Self>) {
+        self.create_new_entry(false, cx);
+    }
+
+    fn create_new_entry(&mut self, folder: bool, cx: &mut Context<Self>) {
+        let Some(dir) = self.path.as_deref() else {
+            return;
+        };
+        let existing: std::collections::BTreeSet<String> = self
+            .snapshot
+            .as_ref()
+            .map(|snap| snap.entries.iter().map(|e| e.name.to_string()).collect())
+            .unwrap_or_default();
+        let name = if folder {
+            next_available_name("New Folder", "", &existing)
+        } else {
+            next_available_name("New Text File", ".txt", &existing)
+        };
+        let path = dir.join(name);
+        let op = if folder {
+            FileOp::CreateDir { path }
+        } else {
+            FileOp::CreateFile { path }
+        };
+        FsContext::global(cx).queue.submit(op);
+    }
+
     fn reload_in_place(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else {
             cx.notify();
@@ -304,14 +339,19 @@ impl Pane {
             let restore = self.pending_restore.take();
             self.apply_restore(restore, cx);
         } else {
-            // Old rows stay visible while loading (§4a); the cursor does not
-            // carry across directories.
             self.snapshot_is_stale = self.snapshot.is_some();
-            self.scroll_top = 0.0;
-            self.dir_view.update(cx, |dir_view, cx| {
-                dir_view.set_cursor(None, cx);
-                dir_view.apply_scroll_top(0.0);
-            });
+            // Plain navigation (no restore pending): the selection does not
+            // carry across directories. In-place reloads (refresh, sort flip,
+            // hidden toggle, cache-miss back/forward) keep the current
+            // selection visible on the old rows until the fresh load lands —
+            // apply_restore then prunes and re-places the cursor.
+            if self.pending_restore.is_none() {
+                self.scroll_top = 0.0;
+                self.dir_view.update(cx, |dir_view, cx| {
+                    dir_view.set_cursor(None, cx);
+                    dir_view.apply_scroll_top(0.0);
+                });
+            }
         }
         cx.notify();
 
@@ -363,26 +403,27 @@ impl Pane {
     }
 
     /// Apply a [`NavEntry`]'s cursor + scroll against the current snapshot
-    /// (restore semantics), or — with no restore — drop a cursor whose path
-    /// vanished from the fresh listing. The cursor lives in the [`DirView`].
+    /// (restore semantics). Either way, selected paths that vanished from the
+    /// listing are pruned (path-keyed survival, §2); a restore re-places the
+    /// cursor **without** collapsing a wider selection, so multi-selections
+    /// survive refresh/re-sort. The selection lives in the [`DirView`].
     fn apply_restore(&mut self, restore: Option<NavEntry>, cx: &mut Context<Self>) {
+        let snapshot = self.snapshot.clone();
         match restore {
             Some(entry) => {
                 let cursor = entry.cursor.filter(|id| self.listing_contains(id, cx));
                 self.scroll_top = entry.scroll_top;
                 let scroll_top = entry.scroll_top;
                 self.dir_view.update(cx, |dir_view, cx| {
-                    dir_view.set_cursor(cursor, cx);
+                    dir_view.retain_selection_in_listing(snapshot.as_deref(), cx);
+                    dir_view.restore_cursor(cursor, cx);
                     dir_view.apply_scroll_top(scroll_top);
                 });
             }
             None => {
-                if let Some(cursor) = self.cursor(cx)
-                    && !self.listing_contains(&cursor, cx)
-                {
-                    self.dir_view
-                        .update(cx, |dir_view, cx| dir_view.set_cursor(None, cx));
-                }
+                self.dir_view.update(cx, |dir_view, cx| {
+                    dir_view.retain_selection_in_listing(snapshot.as_deref(), cx);
+                });
             }
         }
     }
@@ -489,6 +530,24 @@ impl Pane {
             _ => items,
         }
     }
+}
+
+/// First free `"base<ext>"`, `"base 2<ext>"`, `"base 3<ext>"`, … name among
+/// `existing` (Explorer-style New Folder naming; distinct from ops'
+/// keep-both `"name copy"` sequence, which is for collision copies).
+fn next_available_name(
+    base: &str,
+    ext: &str,
+    existing: &std::collections::BTreeSet<String>,
+) -> String {
+    let first = format!("{base}{ext}");
+    if !existing.contains(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|i| format!("{base} {i}{ext}"))
+        .find(|name| !existing.contains(name))
+        .expect("candidate sequence is unbounded")
 }
 
 /// Humanize a byte count for the status line ("13.7 GB free").
@@ -608,6 +667,10 @@ impl Render for Pane {
             .on_action(cx.listener(|this, _: &GoUp, _, cx| this.go_up(cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, action: &SortBy, _, cx| this.sort_by(action.key, cx)))
+            // §0 New folder/file (M3): the pane owns the destination
+            // directory; the ops queue does the creation.
+            .on_action(cx.listener(|this, _: &NewFolder, _, cx| this.new_folder(cx)))
+            .on_action(cx.listener(|this, _: &NewFile, _, cx| this.new_file(cx)))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| this.go_back(cx)),
@@ -640,7 +703,7 @@ impl Render for Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::{FsContext, GpuiSpawner, LoggingOpener};
+    use crate::app_state::{GpuiSpawner, LoggingOpener};
     use fs_core::{FakeVfs, Spawner};
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -723,12 +786,13 @@ mod tests {
             vfs.insert_tree("/other", json!({ "b.txt": "b" }));
             vfs.set_free_space(2048);
             crate::keymap::init(cx);
-            cx.set_global(FsContext {
-                vfs: vfs.clone(),
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
                 spawner,
-                opener: Arc::new(LoggingOpener),
-                platform: Arc::new(fs_core::StubPlatform::new()),
-            });
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
             vfs
         })
     }

@@ -10,9 +10,11 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
 
 ## Status
 
-**M3 in progress** — part 1 (the fs-core file-operations engine) is done; part 2
-(the app UI surfaces) is the next workflow on this branch. 141 tests green
-(88 fs-core unit + 3 integration + 50 app).
+**M3 in progress** — the fs-core ops engine, the app job/event spine
+(JobsModel, dialogs, progress/toasts, undo), and the keyboard file operations
+(cut/copy/paste with dimming, delete-to-trash, new folder/file) all work
+end-to-end; rename UI, context menu, drag & drop, marquee and the M3 visual
+scenarios remain. 171 tests green (88 fs-core unit + 3 integration + 80 app).
 
 | Milestone | State |
 |---|---|
@@ -20,7 +22,7 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
 | Phase A architecture | ✅ merged (#3) |
 | M1 read-only browsing | ✅ merged (#4) |
 | M2 sidebar + in-place expansion | ✅ merged (#5) |
-| M3 file operations | 🔄 part 1 (fs-core engine) built; part 2 (UI) next |
+| M3 file operations | 🔄 engine + job spine + keyboard ops done; rename/menu/drag/marquee next |
 | M4 icon view + dual pane → M8 ship | not started |
 
 ## Components
@@ -105,6 +107,56 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
   disclosure slot 16px) with `w_full` rows and `flex_none` cells, so body
   cells align under the Name / Size / Date Modified headers (closes the known
   M1 alignment gap).
+- `jobs_model.rs` (M3): `JobsModel` non-render entity — the **sole** consumer
+  of the fs-core `JobEvent` channel (one `_pump: Task` held in a field, §2).
+  Folds events into `Vec<JobRow>` (progress popover data; terminal rows are
+  replaced by toasts), queues parked conflicts (`pending: VecDeque`, emitting
+  `NeedsDecision` for the front and `DecisionObsolete` when a parked job dies),
+  and pushes each completed op's `UndoEntry` onto the shared undo stack
+  **exactly once** — inverse jobs submitted by undo/redo are registered in a
+  suppression set (synchronously after submit, no intervening await, so the
+  pump can't observe their completion first) and never push, keeping the
+  stacks from feeding themselves. Toasts (`Success`/`Error`/`Info`) auto-
+  dismiss via a `Spawner::timer` task per toast (fake time in tests; expiry
+  detaches its own task rather than self-cancelling). Emits
+  `JobsEvent::{RowsChanged, NeedsDecision, DecisionObsolete, Completed}`.
+- `dialogs/` (M3, §8 "Dialogs"): minimal in-house modal —
+  `Workspace.modal: Option<ModalState>` rendered as a `deferred` overlay +
+  scrim (theme-derived, `occlude`d; no click-away dismissal). `ConfirmDialog`
+  (title/message/destructive label; own `ConfirmDialog` key context with
+  `track_focus`, enter/escape) guards `DeletePermanently`: the workspace
+  holds the pending `FileOp` (`Workspace::show_confirm(ConfirmRequest)`) and
+  submits it only on `Confirmed`. `ConflictDialog` (own `ConflictDialog` key
+  context per §0: `r`/`s`/`k` resolve, `a` toggles apply-to-all, `enter` =
+  Replace default, `escape` dismisses **and cancels the job**) shows the §3
+  size+date comparison of both sides. Both dialogs are dumb emitters; the
+  workspace mediates: `NeedsDecision` → modal (focused on open; a busy modal
+  keeps priority and the pending conflict re-checks on close), resolution →
+  `queue.resolve`/`cancel` → `JobsModel::decision_handled` (announces the
+  next parked conflict); prior focus is restored on close. Deviation
+  recorded in ARCHITECTURE §0/§3 (same PR): a `ConfirmDialog` key context
+  row was added — the table previously bound enter/escape only for the
+  conflict dialog.
+- `jobs_ui.rs` (M3, §8 "Progress popover + toasts"): pure observers of
+  `JobsModel`. `JobsIndicator` — titlebar button (rendered only while jobs
+  run, so idle chrome and existing baselines are untouched) toggling an
+  `anchored`+`deferred` popover listing job rows with verb + current file,
+  an accent progress bar, and a per-job cancel ✕ (`JobQueue::cancel`).
+  `ToastLayer` — bottom-right overlay rows (completion/error/undo-
+  invalidation), click to dismiss early.
+- `workspace.rs` (M3 additions): owns the modal state + jobs subscription
+  (`subscribe_in`, so handlers can focus/restore), embeds the indicator and
+  toast layer, and handles `Undo`/`Redo` (§0 `cmd-z`/`cmd-shift-z`): a
+  detached one-shot task locks the shared async-mutex `UndoStack`
+  (`app_state::SharedUndoStack` — a blocking lock would deadlock the
+  foreground executor across the validate await), applies, then registers
+  the inverse job ids with `JobsModel`; `UndoOutcome::Invalidated` surfaces
+  as a "Can't undo — …" toast, never applied against stale state.
+- `app_state.rs` (M3): `FsContext` grew `queue: Arc<JobQueue>`,
+  `undo: SharedUndoStack`, and `jobs: Entity<JobsModel>`;
+  `app_state::install(cx, vfs, spawner, opener, platform)` is the single
+  wiring point for the spine, shared by boot, the visual runner, and every
+  test (`init` delegates to it).
 - `actions.rs`: the §0 table's M1 action set (`actions!` namespace
   `file_explorer`) + parameterized `SortBy { key: SortKey }`. Deviation from
   the ARCHITECTURE.md §3 sketch: `SortBy` derives `Action` with `no_json`
@@ -113,7 +165,10 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
   `SortBy` is mouse-dispatched so nothing is lost in M1.
 - `keymap.rs`: the §0 M1 rows transcribed 1:1 into `cx.bind_keys` with the
   declared contexts (`Workspace`, `Pane`, `DirView && !renaming`,
-  `AddressBar`, `TextInput`).
+  `AddressBar`, `TextInput`), plus the M3 job-spine rows: `cmd-z`/`cmd-shift-z`
+  (`Workspace`), `r`/`s`/`k`/`a`/`enter`/`escape` (`ConflictDialog`), and
+  `enter`/`escape` (`ConfirmDialog`) — each new context has a probe dispatch
+  guard plus real-entity coverage in `workspace.rs` tests.
 - `app_state.rs`: `FsContext` global (`Arc<dyn Vfs>` + `Arc<dyn Spawner>` +
   `Arc<dyn Platform>` since M2 — `MacPlatform` on macOS, `StubPlatform`
   elsewhere and in tests/visual scenarios; job queue/undo/clipboard join at
@@ -160,16 +215,18 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
   channel tolerance 3, union-canvas so size changes always fail). Pixel-diff
   logic in `visual_diff` module is platform-independent and unit-tested.
   Scenarios: `workspace_dark`, `workspace_light`, `listing_populated`,
-  `listing_sorted_by_size`, `address_bar_editing`, and (M2)
+  `listing_sorted_by_size`, `address_bar_editing`, (M2)
   `sidebar_tree_expanded` (navigates, then expands `/` and `/home` in the
   sidebar tree) and `details_folder_expanded` (navigates to `/home`, then
-  expands `/home/Documents` in place in the details view). The runner
-  installs the FakeVfs fixture **and** a fixture settings file (two
-  favorites) via `settings::init_with_path`, so all content is deterministic.
-  The M2 sidebar changes every scenario's sidebar region, and the M2 column
-  alignment/disclosure-slot fix changes every listing scenario's rows — all
-  baselines (plus the two new scenarios') must be regenerated via the
-  update-visual-baselines workflow on the PR branch.
+  expands `/home/Documents` in place in the details view), and (M3)
+  `conflict_dialog` (submits a copy that parks on a fixture conflict —
+  `Downloads/notes.txt` onto `Documents/notes.txt` — so the workspace's
+  modal + scrim render; FakeVfs counter mtimes keep the size/date panel
+  deterministic). The runner installs the FakeVfs fixture **and** a fixture
+  settings file (two favorites) via `settings::init_with_path`, so all
+  content is deterministic. The `conflict_dialog` baseline must be generated
+  via the update-visual-baselines workflow on the PR branch; existing
+  baselines are unchanged (the jobs indicator renders nothing while idle).
 - CI: `Visual regression tests (macOS)` job runs the comparison per PR;
   `update-visual-baselines.yml` (manual dispatch, non-main branches) regenerates
   baselines on the same runner image and commits them to the branch.
@@ -402,6 +459,11 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
 Each entry names the milestone expected to resolve it. Mechanics live in the
 component sections; this list is the scannable index.
 
+- **M3 remaining UI surfaces**: inline rename (F2 + slow-second-click),
+  context menus, drag & drop, rubber-band marquee, and the
+  `rename_editing` / `context_menu_open` / `cut_dimmed` / `marquee_active`
+  visual scenarios. *Next work item on the M3 branch.*
+
 - **Symlink copy policy** — copy dereferences file links; symlink-to-dir inside
   a copied tree fails the job (details under fs-core). *Revisit when a
   milestone needs link-preserving copy.*
@@ -409,14 +471,16 @@ component sections; this list is the scannable index.
   deep-in-tree edits escape invalidation (accepted per ARCHITECTURE §6). *M7+
   if ever.*
 - **`JobEvent::Failed` carries no receipt** — the completed part of a midway-
-  failed multi-source op is not undoable. *M3 part 2 (JobsModel contract).*
+  failed multi-source op is not undoable; the JobsModel contract is an error
+  toast + no undo entry. *Accepted; revisit if partial-undo is ever required.*
 - **Undo/redo stacks are optimistic** — they flip before the inverse jobs
-  complete. *M3 part 2 (JobsModel integration).*
-- **Favorites reordering** deferred. *M3 part 2 (drag infrastructure).*
+  complete (self-feeding is prevented via JobsModel suppression, but a failed
+  inverse job leaves the stacks flipped). *Accepted; revisit with M8 polish.*
+- **Favorites reordering** deferred. *M3 remainder (drag infrastructure).*
 - **Settings boot-race merge semantics** (early mutation can suppress the disk
   load for a session). *M7 settings store.*
 - **Sidebar/dir-view child caches never invalidate** (stale after ejects /
-  external changes). *M3 part 2 watcher re-projection.*
+  external changes). *M3 remainder (watcher re-projection).*
 - **Eject errors only logged**, no UI surfacing. *M5-ish polish / Mac checklist.*
 - **Process**: baseline commits are pushed with `GITHUB_TOKEN`, which never
   triggers CI — after baselines land, push a normal commit so the required `CI`
@@ -448,3 +512,5 @@ component sections; this list is the scannable index.
 | 2026-08-22 | #5 | M2 review fix (sidebar observes `AppSettings`); objc2 constant-name CI fix; baselines regenerated. |
 | 2026-08-22 | — | M3 part 1: Vfs mutation surface, ops/JobQueue (keep-both, conflict lanes, cancel), undo, clipboard, trash, torture test. 138 tests. |
 | 2026-08-22 | — | M3 part 1 review: into-itself data-loss guard; copy-cleanup scoping; macOS dead_code fix; FakeVfs restore events. 141 tests. |
+| 2026-08-22 | — | M3 job spine: JobsModel bridge, conflict/confirm dialogs, progress popover, toasts, undo/redo wiring, conflict_dialog scenario. 157 tests. |
+| 2026-08-22 | — | M3 keyboard ops: SelectionModel, cut/copy/paste (+dimming), delete-to-trash, new folder/file; 4 end-to-end behavior tests. 171 tests. |
