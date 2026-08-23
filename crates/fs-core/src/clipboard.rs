@@ -65,12 +65,33 @@ impl FileClipboard {
         Some((paths, mode))
     }
 
+    /// Whether `dest_dir` is inside — or *is* — one of the clipboard's
+    /// entries. Pasting there would be a self-move or a self-copy: the same
+    /// rule drag & drop applies before arming a drop target, kept here so
+    /// every paste path (`cmd-v`, the row menu's `Paste { dest }` on a folder,
+    /// the background menu) obeys it identically.
+    pub fn contains_destination(&self, dest_dir: &Path) -> bool {
+        self.entries.iter().any(|id| dest_dir.starts_with(&*id.0))
+    }
+
     /// Turn a paste into the [`FileOp`] the job queue runs (§4b): copy-mode
     /// pastes as `Copy`, cut-mode as `Move` (consuming the clipboard via
     /// [`FileClipboard::take_for_paste`]). Planning proper happens in ops —
     /// submitting the returned op resolves paste-into-same-folder keep-both
     /// names at planning time. `None` when the clipboard is empty.
+    ///
+    /// Also `None` — **without consuming the clipboard** — when the
+    /// destination is inside or equal to a source
+    /// ([`FileClipboard::contains_destination`]). Consuming it would be the
+    /// worst outcome available: a `Move` of a folder into itself fails at
+    /// execution (`rename(2)` gives `EINVAL`), so the user got a failure toast
+    /// *and* silently lost the cut they now have to redo, while the `Copy`
+    /// variant instead succeeded into a nested self-copy that Explorer refuses
+    /// outright.
     pub fn paste_op(&mut self, dest_dir: &Path) -> Option<FileOp> {
+        if self.contains_destination(dest_dir) {
+            return None;
+        }
         let (sources, mode) = self.take_for_paste()?;
         let dest_dir = dest_dir.to_path_buf();
         Some(match mode {
@@ -87,6 +108,41 @@ mod tests {
 
     fn id(path: &str) -> EntryId {
         EntryId(Arc::from(Path::new(path)))
+    }
+
+    #[test]
+    fn pasting_into_a_source_is_refused_without_consuming_the_clipboard() {
+        // Cut a folder, right-click that same folder, Paste. The op would be
+        // `Move { sources: [/root/target], dest_dir: /root/target }`, which
+        // `rename(2)` rejects — so the user would have got a failure toast and
+        // silently lost the cut. The clipboard must survive intact.
+        let mut clipboard = FileClipboard::default();
+        clipboard.set(vec![id("/root/target")], ClipboardMode::Cut);
+        assert!(clipboard.contains_destination(Path::new("/root/target")));
+        assert_eq!(clipboard.paste_op(Path::new("/root/target")), None);
+        assert!(
+            !clipboard.is_empty(),
+            "a refused paste must not consume the cut"
+        );
+        assert!(clipboard.is_cut(Path::new("/root/target")));
+
+        // ...and *into* a source is refused too, at any depth.
+        assert!(clipboard.contains_destination(Path::new("/root/target/deep/er")));
+        assert_eq!(clipboard.paste_op(Path::new("/root/target/deep/er")), None);
+        assert!(!clipboard.is_empty());
+
+        // A copy clipboard would otherwise have succeeded into a nested
+        // self-copy at /root/target/target, which Explorer refuses outright.
+        let mut clipboard = FileClipboard::default();
+        clipboard.set(vec![id("/root/target")], ClipboardMode::Copy);
+        assert_eq!(clipboard.paste_op(Path::new("/root/target")), None);
+        assert!(!clipboard.is_empty(), "a copy clipboard is never consumed");
+
+        // A sibling destination is still perfectly legal.
+        assert!(!clipboard.contains_destination(Path::new("/root/elsewhere")));
+        assert!(clipboard.paste_op(Path::new("/root/elsewhere")).is_some());
+        // ...and so is a path that merely shares a name prefix.
+        assert!(!clipboard.contains_destination(Path::new("/root/target2")));
     }
 
     #[test]

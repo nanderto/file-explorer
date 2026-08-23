@@ -232,6 +232,14 @@ impl JobsModel {
     /// Surface an undo/redo invalidation notice
     /// ("Can't undo — 'report.pdf' was modified since").
     pub fn push_undo_invalidated(&mut self, message: String, cx: &mut Context<Self>) {
+        self.push_notice(message, cx);
+    }
+
+    /// Surface a plain informational notice as a timed toast — the one
+    /// user-visible channel for "this command exists but cannot act", used by
+    /// the pane's `SetViewColumns` handler (§8 stretch item) so an
+    /// unimplemented view mode is announced rather than silently ignored.
+    pub fn push_notice(&mut self, message: String, cx: &mut Context<Self>) {
         self.push_toast(ToastKind::Info, message, cx);
         cx.emit(JobsEvent::RowsChanged);
         cx.notify();

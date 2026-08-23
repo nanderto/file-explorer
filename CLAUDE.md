@@ -18,13 +18,34 @@ A native macOS file manager in Rust on GPUI, with Windows File Explorer behavior
 - All tests: `cargo test --workspace`
 - One crate: `cargo test -p fs-core`
 - Full local gate (exactly what hooks/CI run): `bash scripts/gate.sh push`
-- Visual regression tests (macOS only): `cargo run -p file-explorer-app --bin visual_test_runner --features visual-tests`
+- Visual regression tests (only runs on macOS): `cargo run -p file-explorer-app --bin visual_test_runner --features visual-tests`
+
+## Development machines
+
+Development happens on **either macOS or Windows** — both are first-class, and no
+change may assume one of them. The product targets macOS, so the two differ in
+what they can *verify*, not in what they may *contain*:
+
+- **Everything portable** — all of `fs-core` (it is GPUI-free and headless), the
+  `Platform` stub impl, and every unit/integration/`#[gpui::test]` test — must
+  build and pass on both. `cargo test --workspace` green is the bar on either
+  machine, and CI enforces it on macOS.
+- **`cfg(target_os = "macos")` code** (objc2 volumes, tags, QuickLook
+  thumbnails, trash) only compiles on a Mac. On a Mac, compile-check and
+  exercise it locally — that is the whole point of being on one. On Windows it
+  is invisible to the local build, so rely on the CI macOS jobs and fix forward
+  quickly; never let it rot behind a stub that happens to satisfy the tests.
+- **Visual regression tests** only run on macOS, and their *baselines* come from
+  the CI runner image regardless of which machine you are on — see below.
+- Never gate behavior on the developer's OS. If a task genuinely cannot be
+  verified on the machine at hand, say so in the PR rather than leaving the gap
+  silent.
 
 ## Visual regression tests
 
 - Baselines live in `crates/app/test_fixtures/visual_tests/*.png`; the CI job `Visual regression tests (macOS)` renders off-screen windows with `gpui::VisualTestAppContext` and compares against them (≥99% pixel match, per-channel tolerance 3).
 - Scenarios are declared in `crates/app/src/bin/visual_test_runner.rs` (`scenarios()`); add one for every new UI state worth pinning.
-- When the UI **intentionally** changes, regenerate baselines from the PR branch — never hand-edit or locally regenerate them (this machine is Windows; baselines must come from the same macOS runner image CI compares on):
+- When the UI **intentionally** changes, regenerate baselines from the PR branch — never hand-edit or locally regenerate them, **even on a Mac**: baselines must come from the same macOS runner image CI compares on, and a local Mac differs from it (OS version, font rendering, GPU) enough to produce baselines that then fail in CI.
   `gh workflow run update-visual-baselines.yml --ref <branch>` — it commits updated PNGs back to the branch.
 - A visual-test failure uploads the captured screenshots and red/dimmed diff images as the `visual-test-output` CI artifact — inspect those before touching baselines.
 - Keep renders deterministic: fixed window size (1200×760), fixed font (`Helvetica`), no wall-clock-dependent UI in captured states.
@@ -54,5 +75,5 @@ A change is not done until ALL of these hold. Do them as part of the work, not a
 - Keep `fs-core` free of GPUI imports — it must build and test headless on any platform.
 - The UI thread never touches the disk; all I/O goes through the background executor.
 - No hard-coded colors in `crates/app` — every color comes from the active theme.
-- macOS-specific code lives behind the `Platform` trait (`fs-core/src/platform.rs`) with a stub impl so the workspace builds on Windows/Linux.
+- macOS-specific code lives behind the `Platform` trait (`fs-core/src/platform/`) with a portable, deterministic stub impl, so the whole workspace builds and tests on macOS, Windows and Linux alike.
 - gpui / gpui-component versions are pinned; upgrade only at milestone boundaries, in a dedicated PR.

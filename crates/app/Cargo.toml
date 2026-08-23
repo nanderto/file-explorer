@@ -45,6 +45,9 @@ serde_json = "1"
 unicode-segmentation.workspace = true
 
 [dev-dependencies]
+# A test `Platform` that records thumbnail requests implements the same
+# `#[async_trait]` trait fs-core declares.
+async-trait = "0.1"
 fs-core = { path = "../fs-core", features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 serde_json = "1"

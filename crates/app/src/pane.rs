@@ -34,7 +34,10 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::actions::{GoBack, GoForward, GoUp, NewFile, NewFolder, Refresh, SortBy};
+use crate::actions::{
+    GoBack, GoForward, GoUp, NewFile, NewFolder, Refresh, SetViewColumns, SetViewIcons,
+    SetViewList, SortBy,
+};
 use crate::address_bar::{AddressBar, AddressBarEvent};
 use crate::app_state::FsContext;
 use crate::dir_view::{DirView, DirViewEvent};
@@ -53,6 +56,13 @@ pub enum PaneEvent {
     /// details view's expansion children; the workspace forwards this to the
     /// sidebar, whose tree caches child listings of its own.
     DirsChanged(Vec<Arc<Path>>),
+    /// Focus entered this pane — its own node or any descendant (the details
+    /// view or icon grid, the address-bar editor, the rename editor). The
+    /// workspace makes the emitting pane the **active** one, so every
+    /// workspace-level command (undo/redo, hidden-files toggle, `cmd-l`,
+    /// delete-permanently, sidebar navigation) targets the pane the user is
+    /// actually working in rather than pane 0 (M4 dual pane).
+    FocusIn,
 }
 
 /// One history slot: where we were **and** what it looked like — back/forward
@@ -151,6 +161,10 @@ impl Drop for BackgroundWatchGuard {
     }
 }
 
+/// What `SetViewColumns` tells the user while `views/columns.rs` is still a
+/// §8 stretch item. A constant so the toast text and its test cannot drift.
+pub const COLUMNS_UNAVAILABLE_NOTICE: &str = "Column view isn't available yet";
+
 /// Whether the address bar renders as breadcrumb segments or as the editable
 /// path input (ARCHITECTURE.md §2). The input itself is `address_bar.rs` (M1,
 /// separate build step); the mode lives here because the pane owns it.
@@ -158,6 +172,31 @@ impl Drop for BackgroundWatchGuard {
 pub enum AddressBarMode {
     Breadcrumb,
     Editing,
+}
+
+/// How the pane's [`DirView`] lays its entries out (ARCHITECTURE.md §2
+/// "Pane … view_mode", §8 "Icon grid"). Only the two shipped modes exist:
+/// Miller columns are a post-v1 stretch (§8), so there is no `Columns`
+/// variant to switch *into* — see [`Pane::set_view_columns`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The M1 details list: one fixed-height row per entry, sortable columns.
+    #[default]
+    List,
+    /// The M4 icon grid: fixed-size tiles, `cols` recomputed from pane width.
+    Icons,
+}
+
+impl ViewMode {
+    /// The *other* shipped mode. A fresh split pane opens in it (plan §2's
+    /// blueprint screenshot is a details list beside an icon grid), so the
+    /// split is immediately useful as two different views of the same tree.
+    pub fn complement(self) -> Self {
+        match self {
+            ViewMode::List => ViewMode::Icons,
+            ViewMode::Icons => ViewMode::List,
+        }
+    }
 }
 
 pub struct Pane {
@@ -180,6 +219,10 @@ pub struct Pane {
     /// Restore waiting for the fresh snapshot (cache misses).
     pending_restore: Option<NavEntry>,
     address_bar: AddressBarMode,
+    /// Details list or icon grid (§0 "View mode switcher"). Lives here, not
+    /// on the DirView, because the pane owns the toolbar control and the §0
+    /// handler — and because the DirView's selection must survive the switch.
+    view_mode: ViewMode,
     sort: SortSpec,
     show_hidden: bool,
     cache: ListingCache,
@@ -207,6 +250,14 @@ pub struct Pane {
 impl Pane {
     pub fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vfs = FsContext::global(cx).vfs.clone();
+        let focus_handle = cx.focus_handle();
+        // Events up (§2): the workspace tracks the active pane **by focus**,
+        // and gpui's focus-on-mouse-down means any click inside this pane
+        // (list row, breadcrumb, status line) lands on a descendant handle —
+        // hence `on_focus_in`, which fires for the subtree, not just this node.
+        let focus_subscription = cx.on_focus_in(&focus_handle, window, |_, _, cx| {
+            cx.emit(PaneEvent::FocusIn);
+        });
         let pane = cx.weak_entity();
         let dir_view = cx.new(|cx| DirView::new(theme.clone(), pane, cx));
         // Events up, method calls down (§2): the DirView reports opened
@@ -234,7 +285,7 @@ impl Pane {
         );
         Self {
             address_bar_view,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             theme,
             vfs,
             history: NavHistory::default(),
@@ -245,6 +296,7 @@ impl Pane {
             scroll_top: 0.0,
             pending_restore: None,
             address_bar: AddressBarMode::Breadcrumb,
+            view_mode: ViewMode::default(),
             sort: SortSpec::default(),
             show_hidden: false,
             cache: ListingCache::default(),
@@ -256,7 +308,7 @@ impl Pane {
             _watch_guard: None,
             _watch_pump: None,
             watch_generation: 0,
-            _subscriptions: vec![subscription, bar_subscription],
+            _subscriptions: vec![subscription, bar_subscription, focus_subscription],
         }
     }
 
@@ -336,6 +388,31 @@ impl Pane {
         }
         self.show_hidden = show_hidden;
         self.reload_in_place(cx);
+    }
+
+    /// Switch layout (§0 "View mode switcher": `cmd-1`/`cmd-2` and the
+    /// toolbar control, both dispatching the same boxed actions). Nothing
+    /// reloads — the listing, the sort and the path-keyed selection are the
+    /// same data drawn differently, which is exactly why the selection
+    /// survives the switch.
+    pub fn set_view_mode(&mut self, view_mode: ViewMode, cx: &mut Context<Self>) {
+        if self.view_mode == view_mode {
+            return;
+        }
+        self.view_mode = view_mode;
+        cx.notify();
+    }
+
+    /// `SetViewColumns` (§0 row, M4) with §8's answer: Miller columns are a
+    /// post-v1 stretch, so this says so in a toast instead of silently doing
+    /// nothing. Declaring the action keeps the §0 table complete (the native
+    /// menu bar at M8 dispatches the same one); the unimplemented *view* is
+    /// visible to the user, not swallowed.
+    pub fn set_view_columns(&mut self, cx: &mut Context<Self>) {
+        let jobs = FsContext::global(cx).jobs.clone();
+        jobs.update(cx, |jobs, cx| {
+            jobs.push_notice(COLUMNS_UNAVAILABLE_NOTICE.to_string(), cx);
+        });
     }
 
     /// Swap the breadcrumb for the editable path input (`cmd-l`, forwarded by
@@ -710,6 +787,10 @@ impl Pane {
         self.scroll_top = scroll_top;
     }
 
+    pub fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
     pub fn address_bar_mode(&self) -> AddressBarMode {
         self.address_bar
     }
@@ -814,7 +895,9 @@ impl Pane {
             .text_size(px(13.0));
 
         if self.address_bar == AddressBarMode::Editing {
-            return row.child(self.address_bar_view.clone());
+            return row
+                .child(div().flex_1().child(self.address_bar_view.clone()))
+                .child(self.render_view_switcher(cx));
         }
 
         // Breadcrumb: one clickable segment per path component; blank space
@@ -853,17 +936,77 @@ impl Pane {
                 );
             }
         }
-        row.child(segments).child(
-            // Blank filler: click to edit the path (cmd-l equivalent).
-            div()
-                .id("breadcrumb-blank")
-                .flex_1()
-                .h_full()
-                .min_h(px(20.0))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.focus_address_bar(window, cx);
-                })),
-        )
+        row.child(segments)
+            .child(
+                // Blank filler: click to edit the path (cmd-l equivalent).
+                div()
+                    .id("breadcrumb-blank")
+                    .flex_1()
+                    .h_full()
+                    .min_h(px(20.0))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus_address_bar(window, cx);
+                    })),
+            )
+            .child(self.render_view_switcher(cx))
+    }
+
+    /// The §0 "View mode switcher" toolbar control: two segmented buttons
+    /// that **dispatch the same boxed actions** the keymap binds, so the
+    /// switch logic exists exactly once (§0) — the buttons know nothing about
+    /// `view_mode` beyond which of them is currently lit.
+    ///
+    /// Each button focuses the pane before dispatching, like the details
+    /// list's sort headers: the action then travels the focus chain to this
+    /// pane's handler regardless of where focus was (a click on a control is
+    /// not a reason for the action to land in a *different* pane).
+    fn render_view_switcher(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let mut switcher = div()
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(2.0))
+            .ml(px(8.0));
+        for (id, label, mode, action) in [
+            (
+                "view-mode-list",
+                "☰",
+                ViewMode::List,
+                Box::new(SetViewList) as Box<dyn gpui::Action>,
+            ),
+            (
+                "view-mode-icons",
+                "▦",
+                ViewMode::Icons,
+                Box::new(SetViewIcons) as Box<dyn gpui::Action>,
+            ),
+        ] {
+            let active = self.view_mode == mode;
+            let boxed = action;
+            switcher = switcher.child(
+                div()
+                    .id(id)
+                    .debug_selector(|| id.to_string())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(22.0))
+                    .h(px(20.0))
+                    .rounded(px(3.0))
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(theme.accent.opacity(0.30)))
+                    .text_color(if active { theme.text } else { theme.muted })
+                    .hover(|s| s.bg(theme.accent.opacity(0.15)))
+                    .on_click(cx.listener(move |this, _, window: &mut Window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                        window.dispatch_action(boxed.boxed_clone(), cx);
+                    }))
+                    .child(SharedString::new_static(label)),
+            );
+        }
+        switcher
     }
 }
 
@@ -898,6 +1041,17 @@ impl Render for Pane {
             // editor names it and submits the op (§4c).
             .on_action(cx.listener(|this, _: &NewFolder, window, cx| this.new_folder(window, cx)))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| this.new_file(window, cx)))
+            // §0 View mode switcher (M4): the keymap rows and the toolbar
+            // control below dispatch these same boxed actions.
+            .on_action(
+                cx.listener(|this, _: &SetViewList, _, cx| this.set_view_mode(ViewMode::List, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SetViewIcons, _, cx| {
+                    this.set_view_mode(ViewMode::Icons, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SetViewColumns, _, cx| this.set_view_columns(cx)))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| this.go_back(cx)),
@@ -1599,6 +1753,111 @@ mod tests {
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.path(), Some(Path::new("/other")));
             assert_eq!(pane.item_count(), 2, "cmd-r reloaded the listing");
+        });
+    }
+
+    // A fresh split pane opens in the *other* mode (plan §2's list-beside-grid
+    // blueprint), so the complement must be an involution — flipping twice is
+    // where you started, and neither mode maps to itself.
+    #[test]
+    fn view_mode_complement_is_the_other_shipped_mode() {
+        assert_eq!(ViewMode::List.complement(), ViewMode::Icons);
+        assert_eq!(ViewMode::Icons.complement(), ViewMode::List);
+        for mode in [ViewMode::List, ViewMode::Icons] {
+            assert_ne!(mode.complement(), mode);
+            assert_eq!(mode.complement().complement(), mode);
+        }
+    }
+
+    // §0 "View mode switcher": the keystrokes and the toolbar buttons are two
+    // triggers for **one** handler, so this asserts both routes land on the
+    // same pane state — a button wired to a method instead of the boxed
+    // action would pass a state test and still break the menu bar at M8.
+    #[gpui::test]
+    fn view_mode_switches_from_both_the_keymap_and_the_toolbar(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.view_mode(), ViewMode::List, "list is the default");
+        });
+
+        cx.update(|window, cx| {
+            let handle = pane.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+
+        cx.simulate_keystrokes("cmd-2");
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.view_mode(), ViewMode::Icons, "cmd-2 = icon grid");
+        });
+
+        cx.simulate_keystrokes("cmd-1");
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.view_mode(), ViewMode::List, "cmd-1 = details list");
+        });
+
+        // The toolbar control, clicked at the pixels it actually painted.
+        let icons = cx
+            .debug_bounds("view-mode-icons")
+            .expect("the toolbar switcher paints an icon-grid button");
+        cx.simulate_click(icons.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.view_mode(), ViewMode::Icons, "toolbar button switched");
+        });
+
+        let list = cx
+            .debug_bounds("view-mode-list")
+            .expect("the toolbar switcher paints a details-list button");
+        cx.simulate_click(list.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.view_mode(), ViewMode::List, "and switched back");
+        });
+    }
+
+    // §8 keeps Miller columns a post-v1 stretch. The action exists (the §0
+    // table and, at M8, the menu bar need it) but must not pretend: it tells
+    // the user, and it leaves the current view alone.
+    #[gpui::test]
+    fn set_view_columns_announces_the_unimplemented_view(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| pane.set_view_mode(ViewMode::Icons, cx));
+
+        cx.update(|window, cx| {
+            let handle = pane.focus_handle(cx);
+            window.focus(&handle, cx);
+            window.dispatch_action(Box::new(SetViewColumns), cx);
+        });
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.view_mode(),
+                ViewMode::Icons,
+                "an unimplemented mode must not disturb the current one"
+            );
+        });
+        cx.update(|_, cx| {
+            let jobs = FsContext::global(cx).jobs.clone();
+            let messages: Vec<String> = jobs
+                .read(cx)
+                .toasts()
+                .iter()
+                .map(|toast| toast.message.to_string())
+                .collect();
+            assert_eq!(
+                messages,
+                vec![COLUMNS_UNAVAILABLE_NOTICE.to_string()],
+                "the user is told, rather than the command silently doing nothing"
+            );
         });
     }
 }

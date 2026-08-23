@@ -21,8 +21,29 @@ serde_json = { version = "1", optional = true }
 # atomic_write: temp-in-same-dir + persist (ARCHITECTURE.md §6).
 tempfile = "3"
 
-# macOS platform services (plan §4: NSFileManager mounted volumes via objc2).
+# macOS platform services (plan §4: NSFileManager mounted volumes via objc2,
+# QuickLookThumbnailing for real thumbnails with an `image`-crate fallback).
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGImage",
+] }
+objc2-quick-look-thumbnailing = { version = "0.3", features = [
+    "QLThumbnailGenerationRequest",
+    "QLThumbnailGenerator",
+    "QLThumbnailRepresentation",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+# Fallback decoder when QuickLook declines a file (plan §4 names exactly this
+# fallback). Extra decoders beyond the workspace default `png`.
+image = { workspace = true, features = ["bmp", "gif", "jpeg", "tiff", "webp"] }
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSDictionary",

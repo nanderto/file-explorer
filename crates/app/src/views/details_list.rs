@@ -17,11 +17,10 @@ use gpui::{
     deferred, div, prelude::*, px, uniform_list,
 };
 
-use crate::actions::{Cancel, Confirm, SortBy};
+use crate::actions::SortBy;
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 use crate::drag;
-use crate::input::text_input as ti;
 use crate::pane::format_bytes;
 use crate::theme::Theme;
 
@@ -39,6 +38,63 @@ const DISCLOSURE_WIDTH: f32 = 16.0;
 const SELECTION_ALPHA: f32 = 0.35;
 /// Row opacity for cut-pending entries (plan §3: "cut items render dimmed").
 const CUT_DIM_OPACITY: f32 = 0.5;
+/// The Name column never shrinks past this. `Size` and `Date Modified` are
+/// fixed-width `flex_none` cells while Name is `flex_1` with `flex-basis: 0`,
+/// so in a narrow pane the name is squeezed to nothing and every filename
+/// vanishes — which is exactly what the M4 split pane does (~270 px leaves
+/// ~14 px for the name). Explorer keeps the name readable and lets the
+/// metadata columns go, so past this floor the trailing columns drop out:
+/// Date first, then Size.
+pub(crate) const NAME_MIN_WIDTH: f32 = 120.0;
+/// Horizontal padding on the header and every body row, which the column-fit
+/// arithmetic has to subtract before deciding what fits.
+const ROW_PADDING_X: f32 = 8.0;
+
+/// Which metadata columns fit beside a readable Name column at `available`
+/// content width.
+///
+/// The header and body rows must be handed the **same** value within a frame,
+/// or values stop aligning under their headers (the M1 column-alignment bug
+/// class). [`DirView::render`] measures once and passes it to both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct VisibleColumns {
+    pub(crate) size: bool,
+    pub(crate) date: bool,
+}
+
+impl VisibleColumns {
+    /// Every column — the assumption before a real measurement exists.
+    pub(crate) const ALL: Self = Self {
+        size: true,
+        date: true,
+    };
+}
+
+/// Decide which metadata columns fit at `available` content width.
+pub(crate) fn visible_columns(available: f32) -> VisibleColumns {
+    // An unmeasured width (first frame, before the list has painted bounds)
+    // must assume the full set: dropping columns on a zero measurement would
+    // flash the narrow layout every time a pane opens.
+    if !available.is_finite() || available <= 0.0 {
+        return VisibleColumns::ALL;
+    }
+    // What Name is left with once padding, the disclosure slot and the fixed
+    // metadata cells are taken out.
+    let for_name = |fixed: f32| available - 2.0 * ROW_PADDING_X - DISCLOSURE_WIDTH - fixed;
+    if for_name(SIZE_COL_WIDTH + DATE_COL_WIDTH) >= NAME_MIN_WIDTH {
+        VisibleColumns::ALL
+    } else if for_name(SIZE_COL_WIDTH) >= NAME_MIN_WIDTH {
+        VisibleColumns {
+            size: true,
+            date: false,
+        }
+    } else {
+        VisibleColumns {
+            size: false,
+            date: false,
+        }
+    }
+}
 
 /// The sortable column header row. Cells dispatch `SortBy { key }` through
 /// the action system so header clicks, and nothing else, own the sort logic
@@ -46,6 +102,7 @@ const CUT_DIM_OPACITY: f32 = 0.5;
 pub(crate) fn render_header(
     theme: &Theme,
     sort: SortSpec,
+    columns: VisibleColumns,
     cx: &mut Context<DirView>,
 ) -> impl IntoElement + use<> {
     div()
@@ -61,16 +118,20 @@ pub(crate) fn render_header(
         // aligns with depth-0 names.
         .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
         .child(header_cell("Name", SortKey::Name, sort, true, cx))
-        .child(
-            header_cell("Size", SortKey::Size, sort, false, cx)
-                .w(px(SIZE_COL_WIDTH))
-                .flex_none(),
-        )
-        .child(
-            header_cell("Date Modified", SortKey::DateModified, sort, false, cx)
-                .w(px(DATE_COL_WIDTH))
-                .flex_none(),
-        )
+        .when(columns.size, |el| {
+            el.child(
+                header_cell("Size", SortKey::Size, sort, false, cx)
+                    .w(px(SIZE_COL_WIDTH))
+                    .flex_none(),
+            )
+        })
+        .when(columns.date, |el| {
+            el.child(
+                header_cell("Date Modified", SortKey::DateModified, sort, false, cx)
+                    .w(px(DATE_COL_WIDTH))
+                    .flex_none(),
+            )
+        })
 }
 
 fn header_cell(
@@ -111,7 +172,11 @@ fn header_cell(
 
 /// The virtualized row list over the DirView's flat projection (only the
 /// visible range renders; expansion just changes the projection length).
-pub(crate) fn render_rows(dir_view: &DirView, cx: &mut Context<DirView>) -> UniformList {
+pub(crate) fn render_rows(
+    dir_view: &DirView,
+    columns: VisibleColumns,
+    cx: &mut Context<DirView>,
+) -> UniformList {
     let item_count = dir_view.flat_rows().len();
     uniform_list(
         "details-rows",
@@ -120,7 +185,7 @@ pub(crate) fn render_rows(dir_view: &DirView, cx: &mut Context<DirView>) -> Unif
             range
                 .filter_map(|ix| {
                     let row = this.flat_rows().get(ix)?.clone();
-                    Some(render_row(this, &row, ix, cx))
+                    Some(render_row(this, &row, ix, columns, cx))
                 })
                 .collect::<Vec<_>>()
         }),
@@ -133,6 +198,7 @@ fn render_row(
     this: &mut DirView,
     row: &crate::dir_view::ProjectedRow,
     ix: usize,
+    columns: VisibleColumns,
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
     // ARCHITECTURE.md §4c/§8 "Inline rename overlay": the row of the entry
@@ -143,7 +209,7 @@ fn render_row(
         .as_ref()
         .is_some_and(|rename| *rename.target() == row.entry.id())
     {
-        return render_rename_row(this, row, ix, cx);
+        return render_rename_row(this, row, ix, columns, cx);
     }
 
     let entry = &row.entry;
@@ -233,24 +299,28 @@ fn render_row(
         .child(div().w(px(row.depth as f32 * DISCLOSURE_WIDTH)).flex_none())
         .child(disclosure)
         .child(div().flex_1().truncate().child(name))
-        .child(
-            div()
-                .w(px(SIZE_COL_WIDTH))
-                .flex_none()
-                .flex()
-                .justify_end()
-                .text_color(theme.muted)
-                .child(size),
-        )
-        .child(
-            div()
-                .w(px(DATE_COL_WIDTH))
-                .flex_none()
-                .flex()
-                .justify_end()
-                .text_color(theme.muted)
-                .child(modified),
-        );
+        .when(columns.size, |el| {
+            el.child(
+                div()
+                    .w(px(SIZE_COL_WIDTH))
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .text_color(theme.muted)
+                    .child(size),
+            )
+        })
+        .when(columns.date, |el| {
+            el.child(
+                div()
+                    .w(px(DATE_COL_WIDTH))
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .text_color(theme.muted)
+                    .child(modified),
+            )
+        });
     if selected {
         styled_row = styled_row.bg(selection_color(&theme));
     }
@@ -302,15 +372,16 @@ fn size_cell(entry: &fs_core::FileEntry) -> SharedString {
 }
 
 /// The row of the entry being renamed (ARCHITECTURE.md §4c/§8): the name
-/// cell is the vendored [`ti`] editor (or, once `Confirm` has submitted the
-/// op, the plain pending name — not editable); `Confirm`/`Cancel` and the
-/// editor's own editing keys are wired here, same pattern as
-/// `address_bar.rs`'s `TextInput` context. An inline validation error (local
-/// or reported by the op) renders as a `deferred` popup under the row.
+/// cell is the vendored text editor (or, once `Confirm` has submitted the op,
+/// the plain pending name — not editable). Its `Confirm`/`Cancel` and editing
+/// keys come from [`crate::rename::with_editor_actions`], the same wiring the
+/// grid tile uses. An inline validation error (local or reported by the op)
+/// renders as a `deferred` popup under the row.
 fn render_rename_row(
     this: &mut DirView,
     row: &crate::dir_view::ProjectedRow,
     ix: usize,
+    columns: VisibleColumns,
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
     let theme = this.theme().clone();
@@ -346,81 +417,31 @@ fn render_rename_row(
         input.clone().into_any_element()
     };
 
-    // `track_focus` so the row's `TextInput` key context is actually part of
-    // the dispatch chain while the embedded editor holds focus (a plain
-    // `.child(input)` without it leaves `Confirm`/`Cancel` unreachable).
-    let input_focus = input.read(cx).focus_handle(cx);
-    let mut styled_row = div()
-        // Path-keyed for the same reason as the normal row above; only one of
-        // the two ever paints for a given path in a frame.
-        .id(gpui::ElementId::Path(row.entry.path.clone()))
-        .debug_selector(|| format!("dir-row-{ix}"))
-        .track_focus(&input_focus)
-        .key_context("TextInput")
-        .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm_rename(window, cx)))
-        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel_rename(window, cx)))
-        // Forward the vendored input's editing actions (bound in
-        // keymap.rs, `TextInput` context) into the row's editor, same
-        // pattern as `address_bar.rs`.
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Left, w, cx| input.update(cx, |i, cx| i.left(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Right, w, cx| input.update(cx, |i, cx| i.right(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::SelectLeft, w, cx| input.update(cx, |i, cx| i.select_left(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::SelectRight, w, cx| input.update(cx, |i, cx| i.select_right(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::SelectAll, w, cx| input.update(cx, |i, cx| i.select_all(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Home, w, cx| input.update(cx, |i, cx| i.home(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::End, w, cx| input.update(cx, |i, cx| i.end(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Backspace, w, cx| input.update(cx, |i, cx| i.backspace(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Delete, w, cx| input.update(cx, |i, cx| i.delete(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Copy, w, cx| input.update(cx, |i, cx| i.copy(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Cut, w, cx| input.update(cx, |i, cx| i.cut(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Paste, w, cx| input.update(cx, |i, cx| i.paste(a, w, cx))
-        }))
-        .flex()
-        .items_center()
-        .w_full()
-        .h(px(ROW_HEIGHT))
-        .px(px(8.0))
-        .text_size(px(13.0))
-        .text_color(theme.text)
-        .child(div().w(px(depth as f32 * DISCLOSURE_WIDTH)).flex_none())
-        .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
-        .child(name_area)
-        .child(
+    // The editor's dispatch node — focus, `TextInput` key context,
+    // `Confirm`/`Cancel` and the vendored input's editing actions — is
+    // [`crate::rename::with_editor_actions`], shared with the grid tile so
+    // the wiring exists exactly once.
+    let mut styled_row = crate::rename::with_editor_actions(
+        div()
+            // Path-keyed for the same reason as the normal row above; only one
+            // of the two ever paints for a given path in a frame.
+            .id(gpui::ElementId::Path(row.entry.path.clone()))
+            .debug_selector(|| format!("dir-row-{ix}")),
+        &input,
+        cx,
+    )
+    .flex()
+    .items_center()
+    .w_full()
+    .h(px(ROW_HEIGHT))
+    .px(px(8.0))
+    .text_size(px(13.0))
+    .text_color(theme.text)
+    .child(div().w(px(depth as f32 * DISCLOSURE_WIDTH)).flex_none())
+    .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
+    .child(name_area)
+    .when(columns.size, |el| {
+        el.child(
             div()
                 .w(px(SIZE_COL_WIDTH))
                 .flex_none()
@@ -429,7 +450,9 @@ fn render_rename_row(
                 .text_color(theme.muted)
                 .child(size),
         )
-        .child(
+    })
+    .when(columns.date, |el| {
+        el.child(
             div()
                 .w(px(DATE_COL_WIDTH))
                 .flex_none()
@@ -437,7 +460,8 @@ fn render_rename_row(
                 .justify_end()
                 .text_color(theme.muted)
                 .child(modified),
-        );
+        )
+    });
 
     if let Some(message) = error {
         styled_row = styled_row.child(deferred(
@@ -553,5 +577,62 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+    }
+
+    /// The floor that keeps filenames on screen. A single full-width pane fits
+    /// everything; the M4 split pane does not, and the columns that go are the
+    /// trailing ones — never the Name.
+    #[test]
+    fn narrow_panes_drop_trailing_columns_instead_of_the_name() {
+        // Full-width single pane (the `listing_populated` scenario): all three.
+        assert_eq!(visible_columns(760.0), VisibleColumns::ALL);
+
+        // The exact width that stops fitting Name + Size + Date. Below it the
+        // Date column goes first.
+        let both = 2.0 * ROW_PADDING_X + DISCLOSURE_WIDTH + SIZE_COL_WIDTH + DATE_COL_WIDTH;
+        assert_eq!(visible_columns(both + NAME_MIN_WIDTH), VisibleColumns::ALL);
+        assert_eq!(
+            visible_columns(both + NAME_MIN_WIDTH - 1.0),
+            VisibleColumns {
+                size: true,
+                date: false
+            },
+            "one pixel under the fit, Date is the column that goes"
+        );
+
+        // The M4 split pane: ~270 px used to leave ~14 px for the name, which
+        // rendered every filename as nothing. Now Name is guaranteed its floor.
+        let split = visible_columns(271.0);
+        assert!(
+            !split.date,
+            "a 271 px pane cannot afford Date and a readable name"
+        );
+        let leftover = 271.0
+            - 2.0 * ROW_PADDING_X
+            - DISCLOSURE_WIDTH
+            - if split.size { SIZE_COL_WIDTH } else { 0.0 };
+        assert!(
+            leftover >= NAME_MIN_WIDTH,
+            "Name kept {leftover} px, below the {NAME_MIN_WIDTH} px floor"
+        );
+
+        // Pathological widths must not panic or silently drop everything on a
+        // first frame that has no painted bounds yet.
+        assert_eq!(visible_columns(0.0), VisibleColumns::ALL, "unmeasured");
+        assert_eq!(visible_columns(-50.0), VisibleColumns::ALL, "nonsense");
+        assert_eq!(visible_columns(f32::NAN), VisibleColumns::ALL, "NaN");
+        assert_eq!(
+            visible_columns(f32::INFINITY),
+            VisibleColumns::ALL,
+            "infinite"
+        );
+        // Truly tiny: nothing but the name survives, and it still gets a cell.
+        assert_eq!(
+            visible_columns(60.0),
+            VisibleColumns {
+                size: false,
+                date: false
+            }
+        );
     }
 }

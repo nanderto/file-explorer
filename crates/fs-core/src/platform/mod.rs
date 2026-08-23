@@ -18,6 +18,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 
 use crate::exec::Spawner;
+use crate::thumbnail::Thumbnail;
 use crate::watcher::WatchGuard;
 
 #[cfg(target_os = "macos")]
@@ -70,6 +71,27 @@ pub trait Platform: Send + Sync {
     /// Unmount and eject the volume. Fails if the volume is unknown, busy, or
     /// not ejectable.
     async fn eject(&self, volume_id: &VolumeId) -> Result<()>;
+
+    /// A thumbnail of `path` whose longest edge is at most `px` pixels
+    /// (aspect ratio preserved, so the result is usually smaller on one axis
+    /// and never upscaled past the source).
+    ///
+    /// Returns decoded RGBA rather than an encoded blob — see [`Thumbnail`] for
+    /// why. Errors are ordinary and expected: not every file *has* a
+    /// thumbnail, and the icon grid falls back to a type icon rather than
+    /// treating the failure as fatal. Callers should treat an `Err` as "no
+    /// preview available", and must not retry in a loop.
+    ///
+    /// Every implementation runs its blocking work (QuickLook, objc2, image
+    /// decode) through [`crate::SpawnerExt::unblock`]; the UI thread only ever
+    /// awaits this.
+    ///
+    /// **Cancellation is expected and must be safe.** The icon grid drops this
+    /// future whenever the tile it belongs to scrolls out of view, so an
+    /// implementation must leave nothing behind that a drop would corrupt: work
+    /// already handed to a background thread may run to completion and be
+    /// discarded, but no shared state may be left half-written.
+    async fn thumbnail(&self, path: &Path, px: u32) -> Result<Thumbnail>;
 }
 
 /// Watch the volume list for changes by polling [`Platform::volumes`] every
@@ -170,6 +192,77 @@ mod tests {
 
         let err = block_on(platform.eject(&ssd)).unwrap_err();
         assert!(err.to_string().contains("no such volume"), "{err}");
+    }
+
+    #[test]
+    fn stub_thumbnails_are_deterministic_and_path_dependent() {
+        let path = Path::new("/root/photo.png");
+        let first = block_on(StubPlatform::new().thumbnail(path, 64)).unwrap();
+        let second = block_on(StubPlatform::new().thumbnail(path, 64)).unwrap();
+        assert_eq!(first, second, "same path + size ⇒ byte-identical pixels");
+
+        let other =
+            block_on(StubPlatform::new().thumbnail(Path::new("/root/other.png"), 64)).unwrap();
+        assert_ne!(
+            first.rgba(),
+            other.rgba(),
+            "different paths get visibly different pixels"
+        );
+
+        // Not a flat swatch — the grid needs something that reads as an image.
+        assert!(
+            first.rgba().chunks_exact(4).map(|px| px[0]).max()
+                > first.rgba().chunks_exact(4).map(|px| px[0]).min(),
+            "the synthesized pattern varies across the tile"
+        );
+        assert!(
+            first.rgba().chunks_exact(4).all(|px| px[3] == 0xff),
+            "synthesized thumbnails are fully opaque"
+        );
+    }
+
+    #[test]
+    fn stub_thumbnails_fit_the_requested_box_and_preserve_a_ratio() {
+        let platform = StubPlatform::new();
+        // Three different paths, chosen to cover the stub's three aspect
+        // ratios: square, landscape, portrait.
+        let mut shapes = Vec::new();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let thumbnail =
+                block_on(platform.thumbnail(&PathBuf::from(format!("/{name}")), 40)).unwrap();
+            assert!(
+                thumbnail.width() <= 40 && thumbnail.height() <= 40,
+                "{name}: {}x{} exceeds the 40px box",
+                thumbnail.width(),
+                thumbnail.height()
+            );
+            assert_eq!(thumbnail.width().max(thumbnail.height()), 40, "{name}");
+            assert_eq!(
+                thumbnail.byte_len(),
+                (thumbnail.width() * thumbnail.height() * 4) as usize
+            );
+            shapes.push((thumbnail.width(), thumbnail.height()));
+        }
+        assert!(
+            shapes.iter().any(|(w, h)| w == h)
+                && shapes.iter().any(|(w, h)| w > h)
+                && shapes.iter().any(|(w, h)| w < h),
+            "the stub produces square, landscape and portrait tiles: {shapes:?}"
+        );
+    }
+
+    #[test]
+    fn stub_thumbnail_rejects_sizes_outside_the_contract() {
+        let platform = StubPlatform::new();
+        let path = Path::new("/root/photo.png");
+        for px in [0, crate::thumbnail::MAX_PX + 1] {
+            let err = block_on(platform.thumbnail(path, px)).unwrap_err();
+            assert!(err.to_string().contains("out of range"), "{err}");
+        }
+        // The smallest legal request still yields a valid 1px-edge thumbnail.
+        let tiny = block_on(platform.thumbnail(path, 1)).unwrap();
+        assert_eq!(tiny.width().max(tiny.height()), 1);
+        assert_eq!(tiny.byte_len(), 4);
     }
 
     #[test]

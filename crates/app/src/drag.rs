@@ -44,7 +44,6 @@ use crate::app_state::FsContext;
 use crate::dir_view::{DirView, DirViewEvent, ProjectedRow};
 use crate::marquee::{ContentPoint, scroll_y};
 use crate::theme::Theme;
-use crate::views::details_list::ROW_HEIGHT;
 
 /// §8: hovering a folder for this long during a drag navigates into it.
 /// Runs on [`fs_core::Spawner::timer`], so tests drive it with fake time.
@@ -435,17 +434,19 @@ impl DirView {
             self.clear_drop_target(cx);
             return;
         }
-        let row = row_at(
-            ContentPoint::from_window(pointer, viewport, scroll_y(self)).y,
-            ROW_HEIGHT,
-            self.flat_rows().len(),
-        )
-        .and_then(|ix| self.flat_rows().get(ix))
-        // A §4c new-entry phantom row is not a folder anyone can drop into —
-        // it does not exist yet. A drop aimed at it lands in the pane's own
-        // directory, which is where it would have gone a moment earlier.
-        .filter(|row| !self.is_new_entry_row(row))
-        .cloned();
+        // Mode-aware hit test (`DirView::index_at_content`): rows in the
+        // details list, tiles in the icon grid — the same function the
+        // marquee's empty-space rule uses, so the two gestures can never
+        // disagree about what the pointer is over.
+        let content = ContentPoint::from_window(pointer, viewport, scroll_y(self));
+        let row = self
+            .index_at_content(content, cx)
+            .and_then(|ix| self.flat_rows().get(ix))
+            // A §4c new-entry phantom row is not a folder anyone can drop into —
+            // it does not exist yet. A drop aimed at it lands in the pane's own
+            // directory, which is where it would have gone a moment earlier.
+            .filter(|row| !self.is_new_entry_row(row))
+            .cloned();
         let target = target_for_row(row.as_ref());
 
         let current = self.current_dir(cx);
@@ -722,6 +723,7 @@ mod tests {
     //! (the op really runs — the queue is wired end to end in these tests).
 
     use super::*;
+    use crate::views::details_list::ROW_HEIGHT;
 
     use std::sync::Arc;
 

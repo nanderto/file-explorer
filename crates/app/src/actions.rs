@@ -28,6 +28,12 @@ actions!(
         SelectLast,
         ExtendSelectionNext,
         ExtendSelectionPrev,
+        // The horizontal half of §0's "Cursor movement (+shift- extends)",
+        // which only the M4 icon grid has an axis for: in the details list
+        // there is nothing to the left or right of a full-width row, so these
+        // are deliberately inert there rather than aliases of up/down.
+        ExtendSelectionRight,
+        ExtendSelectionLeft,
         PageUp,
         PageDown,
         ExpandSelected,
@@ -35,7 +41,6 @@ actions!(
         // clipboard & file operations (M3)
         Cut,
         Copy,
-        Paste,
         DeleteToTrash,
         DeletePermanently,
         NewFolder,
@@ -44,6 +49,14 @@ actions!(
         Duplicate,
         // view
         ToggleHiddenFiles,
+        // view mode (M4, §0 "View mode switcher" — the pane owns the state)
+        SetViewList,
+        SetViewIcons,
+        SetViewColumns,
+        // dual pane (M4, §0 "Split-pane toggle" — the workspace owns the
+        // pane strip; declared here so the whole §0 M4 row set exists in one
+        // place)
+        ToggleSplitPane,
         // editing-mode (address bar / rename editor / dialogs)
         Confirm,
         Cancel,
@@ -57,6 +70,18 @@ actions!(
         ToggleApplyToAll,
     ]
 );
+
+/// Paste the clipboard (§0 "Paste" row). `dest` is the folder to paste
+/// **into**: `None` means the pane's open directory — what `cmd-v` and the
+/// background context menu mean — and `Some(dir)` is the *row* context menu
+/// pasting into the folder that was right-clicked, which is what Explorer
+/// does. Parameterized rather than duplicated so the single `DirView` handler
+/// still owns the whole operation (§3: one command, one implementation).
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = file_explorer, no_json)]
+pub struct Paste {
+    pub dest: Option<std::path::PathBuf>,
+}
 
 /// Sort the active listing by a column (§0 "Sorting" row). Dispatched by
 /// header clicks (mouse), never bound in the keymap.

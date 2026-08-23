@@ -35,6 +35,7 @@ This table is the **literal source of truth for `crates/app/src/keymap.rs`** and
 | §3 Selection | Select all | `cmd-a` | `SelectAll` | `DirView && !renaming` | DirView | M1 |
 | §3 Selection | Click / `cmd`-click toggle / `shift`-click range / rubber-band | mouse (not keymap) | — (SelectionModel mutations) | — | DirView / marquee | M1 (multi: M3) |
 | §3 Selection | Cursor movement (+`shift-` extends) | `up` `down` `home` `end` `pageup` `pagedown` | `SelectNext/Prev/First/Last`, `ExtendSelectionNext/Prev`, `PageUp/PageDown` | `DirView && !renaming` | DirView | M1 |
+| §3 Selection | Horizontal cursor movement (+`shift-` extends) — **icon grid only**: a details row is full width, so these are inert there | `left` `right` (as 2D motion in Icons; expand/collapse in List), `shift-left` `shift-right` | `ExpandSelected`/`CollapseSelected`, `ExtendSelectionLeft/Right` | `DirView && !renaming` | DirView | M4 |
 | §2 Views | Expand folder in place (disclosure triangle) | `right`, triangle click | `ExpandSelected` | `DirView && !renaming` | DirView | M2 |
 | §2 Views | Collapse in-place folder | `left`, triangle click | `CollapseSelected` | `DirView && !renaming` | DirView | M2 |
 | §3 Type-ahead | Jump to next name matching typed prefix | printable chars | *not an action* — `on_key_down` fallthrough when no binding matched | `DirView && !renaming` | DirView | M1 |
@@ -46,7 +47,8 @@ This table is the **literal source of truth for `crates/app/src/keymap.rs`** and
 | §3 Hidden files | Toggle hidden files | `cmd-shift-.`, toolbar | `ToggleHiddenFiles` | `Workspace` | Workspace | M1 |
 | §3 Undo | Undo / Redo (rename, move, copy, new folder, trash-restore) | `cmd-z` / `cmd-shift-z` | `Undo` / `Redo` | `Workspace` | Workspace → UndoStack | M3 |
 | §2 Toolbar | Refresh | `cmd-r`, toolbar | `Refresh` | `Pane` | Pane | M1 |
-| §2 Toolbar | View mode switcher | toolbar | `SetViewList` / `SetViewIcons` / `SetViewColumns` | — | Pane | M4 |
+| §2 Toolbar | View mode switcher (list / icons) | toolbar, `cmd-1` / `cmd-2` | `SetViewList` / `SetViewIcons` | `Pane` | Pane | M4 |
+| §2 Toolbar | View mode switcher (columns) | **none in v1** — the switcher ships two buttons and the binding is deliberately left off; the handler exists and announces unavailability (`COLUMNS_UNAVAILABLE_NOTICE`) rather than no-opping. Miller columns are post-v1. | `SetViewColumns` | `Pane` | Pane | post-v1 |
 | §2 Panes | Split-pane toggle | `cmd-shift-o`, toolbar | `ToggleSplitPane` | `Workspace` | Workspace | M4 |
 | §2 Info panel | Info panel toggle | `cmd-shift-i`, toolbar | `ToggleInfoPanel` | `Workspace` | Workspace | M5 |
 | §2 Toolbar | Search field focus | `cmd-f` | `FocusSearch` | `Workspace` | Workspace | M6 |
@@ -531,7 +533,7 @@ What we take instead:
 | | `dir_view.rs` | Enter=open vs Confirm-in-rename; F2 *and* slow-second-click enter rename; Escape/blur teardown; type-ahead (fake timer reset); Delete blocked while `renaming`; ExpandSelected/CollapseSelected re-projection |
 | | `address_bar.rs` | cmd-l focus, edit→confirm navigates, escape restores breadcrumb, autocomplete list, **tab AcceptSuggestion completes in place** |
 | | `jobs_model.rs` / dialogs | JobEvent stream → JobsModel rows; NeedsDecision → Workspace modal; ConflictDialog keys (`r`/`s`/`k`/`a`/enter/escape) reach `queue.resolve` (FakeVfs); Completed pushes undo entry exactly once |
-| **Visual scenarios** (`visual_test_runner`, macOS CI — infra exists per AS_BUILT) | per milestone | existing `workspace_dark/light`; add M1 `listing_populated`, `listing_sorted_by_size`, `address_bar_editing`; M2 `sidebar_tree_expanded`, `details_folder_expanded`; M3 `rename_editing`, `context_menu_open`, `conflict_dialog`, `cut_dimmed`, `marquee_active`; M4 `icon_grid`, `dual_pane`; M5 `info_panel_jpeg`; M7 `user_theme_applied`. All fed by FakeVfs fixture trees for determinism (fixed 1200×760, Helvetica, no wall-clock UI — per CLAUDE.md). |
+| **Visual scenarios** (`visual_test_runner`, macOS CI — infra exists per AS_BUILT) | per milestone | existing `workspace_dark/light`; add M1 `listing_populated`, `listing_sorted_by_size`, `address_bar_editing`; M2 `sidebar_tree_expanded`, `details_folder_expanded`; M3 `rename_editing`, `context_menu_open`, `conflict_dialog`, `cut_dimmed`, `marquee_active`; M4 `icon_grid`, `split_panes`; M5 `info_panel_jpeg`; M7 `user_theme_applied`. All fed by FakeVfs fixture trees for determinism (fixed 1200×760, Helvetica, no wall-clock UI — per CLAUDE.md). |
 | **Manual per-milestone on real Mac** | gate checklist | native watcher quirks, real trash/restore, Finder drag interop, appearance switching — the things FakeVfs can't prove |
 
 ---
