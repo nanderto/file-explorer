@@ -11,7 +11,12 @@ Build the file-explorer application described in `docs/file-explorer-plan.md`, u
 3. `docs/AS_BUILT.md` — what already exists (the index: status, known gaps, deviations, change log; per-crate detail in `docs/as-built/`). Do not redo it: the cargo workspace, M0 window skeleton (`WorkspaceView`, dark/light `Theme`), and the visual regression infrastructure (runner binary, baselines, CI jobs, `update-visual-baselines.yml`) are built and merged.
 4. `docs/requirements/Basic window.png` — the target layout.
 
-## Phase A — Architecture (one orchestrated workflow, then a PR)
+## Phase A — Architecture ✅ DONE (PR #3) — do not re-run
+
+`docs/ARCHITECTURE.md` exists and is the blueprint every milestone follows. The
+record below is kept for provenance only. Skip to Phase B.
+
+<details><summary>How it was produced</summary>
 
 Run a workflow that produces `docs/ARCHITECTURE.md` — the entity/module blueprint the feature milestones will follow. Structure it as parallel research, then a judged synthesis:
 
@@ -27,9 +32,15 @@ Run a workflow that produces `docs/ARCHITECTURE.md` — the entity/module bluepr
 
 Land Phase A as its own PR (it updates `docs/AS_BUILT.md` too).
 
+</details>
+
 ## Phase B — Features (one orchestrated workflow per milestone, one PR per milestone)
 
-Work through the plan's milestones in order: **M1 read-only browsing → M2 sidebar → M3 file operations → M4 icon view + dual pane → M5 info panel → M6 search/tags/permissions → M7 themes/settings → M8 ship prep.** For each milestone:
+Work through the plan's milestones in order: **M1 read-only browsing → M2 sidebar → M3 file operations → M4 icon view + dual pane → M5 info panel → M6 search/tags/permissions → M7 themes/settings → M8 ship prep.**
+
+**Which milestone is next is decided by `docs/AS_BUILT.md`'s Status table, not by this document** — it is the authority on what is already built, and this file is not updated per milestone. Before doing anything: read that table, confirm against `git log --oneline -15` and `gh pr list --state all`, and start at the first milestone not marked complete. Never re-run a finished milestone.
+
+For each milestone:
 
 1. **Scout inline** (cheap, no agents): confirm the milestone's acceptance criteria from the plan and the relevant ARCHITECTURE.md sections; list the files/modules to touch.
 2. **Run a build workflow**: decompose into parallel implementation lanes where independent (e.g. M1: listing engine in fs-core / details-view rendering / navigation+history / breadcrumb+address bar), pipeline each lane through implement → unit+integration+UI tests → adversarial review (reviewer agents try to break Explorer-spec conformance and the threading rule "UI thread never touches the disk"). Confirmed findings loop back before the PR.
@@ -45,4 +56,14 @@ Work through the plan's milestones in order: **M1 read-only browsing → M2 side
 - **Budget sanity**: one workflow per milestone, sized to the milestone; don't fan out for trivial glue work. Verify adversarially where correctness matters most (file operations in M3, permissions in M6).
 - If a milestone's acceptance criteria can't be met as planned, deliver what's solid, record the deviation in `docs/AS_BUILT.md`, and flag it in the PR — do not silently shrink scope.
 
-Start now with Phase A.
+## Starting a session
+
+1. Read `CLAUDE.md` (non-negotiable gates), then `docs/AS_BUILT.md`'s Status table.
+2. Check for work in flight before starting anything new: `gh pr list --state open`
+   (an open PR may be a finished milestone awaiting merge), and `git status` /
+   `git branch --show-current` (uncommitted work from an interrupted run — verify
+   the gate before assuming it is broken *or* good).
+3. Start the first milestone the Status table does not mark complete, at Phase B
+   step 1. Phase A is done; do not re-run it.
+
+Then proceed, milestone by milestone, until the plan's v1 scope is shipped.
