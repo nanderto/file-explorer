@@ -298,18 +298,23 @@ component sections; this list is the scannable index.
   screenshot's three titlebar glyphs above the panel (info / history /
   warnings) are also not built — the panel has one mode. *M6 (tags) / M7
   (chrome).*
-- **The panel is taller than the window, so its last row is off every
-  baseline.** Verified by opening the local renders (inspection only): at the
-  fixed 1200×760 capture size a fully expanded single-entry panel runs past the
-  bottom edge — `info_panel_jpeg` pins everything down to the owner/group
-  dropdowns, and the "Locked" row's label is at the very bottom edge with its
-  checkbox clipped away entirely. The column is
-  `overflow_y_scroll`, so it is reachable in the app — but no baseline proves
-  the bottom of it renders, and no baseline pins the panel with its sections
-  *collapsed*, hidden, or in the light theme (`workspace_light` has no folder
-  open, so it only shows the empty state). Cheap to add when one of those
-  states next changes; not worth three more full-window captures now.
-  *M7 (theme scenarios) or the next info-panel change.*
+- **The panel is taller than the window, so the bottom of the Permissions
+  section is off every baseline.** Verified by opening the regenerated runner
+  PNGs (the earlier wording here was written from local renders and understated
+  it): at the fixed 1200×760 capture size a fully expanded single-entry panel
+  runs past the bottom edge, and the last row that renders is **"Others"** —
+  `info_panel_jpeg` and `details_rename_editing` cut off the **octal field, the
+  owner and group dropdowns and the "Locked" row entirely**, and `split_panes`
+  cuts off one row earlier still (it ends at "Group", because its breadcrumb row
+  is taller). So four of the panel's Permissions fields — including the two the
+  M5 review reshaped into dropdowns — are pinned by **no** baseline at all, and
+  a regression in them would pass CI. The column is `overflow_y_scroll`, so all
+  of it is reachable in the app; this is a coverage hole, not a broken panel.
+  Nor does any baseline pin the panel with its sections *collapsed*, hidden, or
+  in the light theme (`workspace_light` has no folder open, so it only shows the
+  empty state). The cheap fix is a scenario that captures the panel scrolled to
+  its bottom, or one with `General` collapsed so `Permissions` fits.
+  *M6, which makes exactly those fields editable and must pin them.*
 - **The info panel has no preview cache: re-selecting a file re-runs
   QuickLook.** `spawn_load` asks `Platform::thumbnail` on every retarget and
   keeps the result only in the live `preview` slot, so clicking A, B, A, B costs
