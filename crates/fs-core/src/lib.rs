@@ -16,7 +16,12 @@
 //! whole flow tests on Windows), file operations with planning and the
 //! destination-volume job queue ([`ops`]), inverse-op undo with fingerprint
 //! invalidation ([`undo`]), and the cut/copy clipboard ([`clipboard`]).
+//!
+//! M5 backs the info panel with [`attrs`]: unix permissions, the
+//! multi-selection summary, the previewable-type gate, and
+//! [`platform::Platform::file_attrs`] for the attributes that need an OS call.
 
+pub mod attrs;
 pub mod clipboard;
 pub mod entry;
 pub mod exec;
@@ -29,6 +34,10 @@ pub mod undo;
 pub mod vfs;
 pub mod watcher;
 
+pub use attrs::{
+    FileAttrs, PREVIEW_SIZE_CEILING, PermBit, PermClass, SelectionSummary, UnixPerms,
+    is_previewable, is_previewable_entry, summarize,
+};
 pub use clipboard::{ClipboardMode, FileClipboard};
 pub use entry::{EntryId, EntryKind, EntryMeta, FileEntry, TargetKind};
 pub use exec::{Spawner, SpawnerExt};

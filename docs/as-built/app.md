@@ -9,7 +9,8 @@ change log row, and the relevant section here. -->
 Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
 
 - `workspace.rs`: `Workspace` entity (refactor of the M0 `WorkspaceView`,
-  which is deleted) — same chrome (titlebar, info-panel placeholder), root
+  which is deleted) — same chrome (titlebar; the info-panel column was a
+  placeholder until M5 replaced it with the real `Entity<InfoPanel>`), root
   `track_focus` + `Workspace` key context, owns `panes: Vec<Entity<Pane>>`
   (len 1 for M1) + `active_pane_ix` and (M2) `Entity<Sidebar>`; handles
   `FocusAddressBar` (forwards to the active pane), `ToggleHiddenFiles` (fans
@@ -297,6 +298,112 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     goes in `missing` (stamped, so an edited file is retried) and the tile
     keeps its glyph. Nothing is surfaced to the user and nothing retries in a
     loop, per the trait's contract.
+- `info_panel.rs` (M5, §1 `info_panel.rs`, §9's M5 line): the `InfoPanel`
+  entity that replaced the M0 placeholder — the right-hand column of
+  `docs/requirements/Basic window.png`.
+  - **One `Subject` at a time**, path-keyed (§2 invariant 2), never
+    entry-keyed: `Nothing` (no folder open), `One { path, kind }` where `kind`
+    distinguishes a selected entry from the open folder shown when the
+    selection is empty, or `Many(SelectionSummary)`. Everything displayed
+    about a `One` comes from the load, so the panel never has to be told which
+    `FileEntry` a path resolved to — and the multi-selection case needs no
+    load at all, because `fs_core::summarize` over the projection is pure.
+  - **One load task, four cancellations.** The `Spawner::timer` debounce
+    (130 ms), `Vfs::metadata`, `Platform::file_attrs` and — only when
+    `fs_core::is_previewable` says so — `Platform::thumbnail` all live in a
+    single `Task` slot, so a retarget drops the lot. Arrow-keying through a
+    thousand rows costs one stat, not a thousand (unit-tested by counting the
+    recording platform's calls). Same bounded-orphan caveat as
+    `Platform::thumbnail`: work already handed to the background executor runs
+    to completion and has its result discarded.
+  - **Nothing blocking on the UI thread.** Both lookups and the preview fetch
+    are awaited on `cx.background_executor().spawn`, so an `NSFileManager`
+    round-trip or a QuickLook wait cannot land on the render thread even if a
+    `Platform` impl forgets to `unblock`; `render` touches no disk API at all.
+    A test with a platform that answers only when the fake clock advances
+    proves the app still parks and stays interactive while a load is in
+    flight.
+  - **Whose selection: the active pane's.** `Workspace` holds one
+    `cx.observe` per pane's `DirView` (parallel to `pane_subscriptions`, so a
+    collapse drops the closed pane's with the pane) and pushes the *active*
+    view down through `InfoPanel::follow`. `DirView` has no
+    `SelectionChanged` event — a selection change is a `cx.notify()` — so this
+    is an observe rather than a subscribe, and the filter that keeps a scroll,
+    a hover or an arriving thumbnail from restarting the debounce is an O(1)
+    `Witness`: the open directory, the pane's `ListingSnapshot` **by held
+    `Arc` identity** (held, not reduced to a raw pointer — a dropped
+    snapshot's address is free for the allocator to hand to its replacement),
+    the expansion bookkeeping sizes, and the selection's size, cursor and
+    extremes. Only when the witness moves is `projected_rows` built — the
+    comparison happens **first**, before the subject is derived, which is the
+    whole point of having a witness and which a review fix restored (it was
+    deriving the subject eagerly, so every idle notify paid for a full
+    projection); `an_idle_follow_does_not_build_the_projection` pins it against
+    a thread-local `dir_view::projections_built()` probe. It is also why the
+    subject is derived from `projected_rows` and not from `flat_rows`: the
+    latter is the *last painted* projection, and an observer fires before the
+    frame that would refresh it.
+  - **A re-read keeps what is painted.** `retarget` clears `details` and the
+    preview only when the subject actually *changes*. Re-describing the same
+    path — which is what every watcher patch does, and patches arrive every
+    `pane::WATCH_LATENCY` (100 ms), shorter than the 130 ms debounce — leaves
+    the values on screen and swaps the new ones in when they land, so a
+    download or a copy job in the open folder no longer pins the panel at em
+    dashes (`repeated_relistings_keep_the_values_painted`). A preview is
+    dropped mid-flight only if the fresh stat says the subject is no longer
+    previewable. The cost is that a file being written *while selected* shows
+    values from the last quiet moment; recorded as a Known gap.
+  - **The values themselves are pure functions.** `header_text`,
+    `general_rows` and `perm_matrix` take `(path, kind, meta, attrs)` and
+    return text and a `[class][bit]` matrix, so the Path row's
+    parent-vs-own-path rule, the em dash for every value before the load lands,
+    a folder's absent Size (matching `details_list::size_cell`, which shows an
+    em dash for `is_dir_like` rows — a directory's inode size is not the
+    folder's size) and the R/W/X grid's orientation are all unit-tested rather
+    than left to a baseline nobody opens.
+  - `is_settled()` reports whether the stat, the attributes and (when the
+    subject has one) the preview have all arrived. It exists for the visual
+    runner, which asserts it before every capture.
+  - **Sections** match the blueprint: a fixed-height preview slot (decoded
+    preview or the type glyph — fixed so an arriving image reflows nothing),
+    the name, `"<type description> — <size>"`, a collapsible **General**
+    (containing folder for a selected item / its own path for the open folder,
+    `format_size` = human + comma-grouped exact bytes, modified, created,
+    added, extension, hide-extension, hidden) and a collapsible
+    **Permissions** (R/W/X grid for owner/group/others, symbolic + boxed
+    octal, owner and group as disabled dropdowns with the blueprint's `⌄`,
+    locked). The permission controls are **read-only**
+    for M5: drawn at 55% opacity with *no* click handlers, because a control
+    that looks live and silently does nothing is worse than one that looks
+    inert. `thumbnails::render_image` is shared rather than forked, and the
+    panel keeps a single-slot image (plus a `retired` list drained in `render`,
+    the only place a `Window` is available for `cx.drop_image`) instead of the
+    icon grid's viewport-shaped cache.
+  - `ToggleInfoPanel` (§0: `cmd-shift-i` + titlebar `ⓘ` dispatching the same
+    boxed action, handled on `Workspace`). Hiding it removes the column and
+    its splitter and leaves the pane strip's own state untouched (the strip is
+    `flex_1`, the panel `flex_none`), and the panel is told to `clear()`, so a
+    hidden panel stats nothing; showing it re-describes the current selection.
+  - **Visual scenarios** (three, all `Theme::dark()`): `info_panel_jpeg` —
+    §8's named M5 row and the milestone's acceptance criterion, a selected
+    `/home/Pictures/photo.jpg` so the preview, "JPEG image — 24.0 KB", the
+    `jpg` extension row and the `rw-rw-r-- 664` grid are pinned on an image;
+    `info_panel_selection` — the same shape over `report.pdf` in a populated
+    folder; `info_panel_multi_selection` — four selected entries, one of them
+    a folder, so the summary's Items/Folders/Files/Total size are all
+    non-trivial and the absence of General/Permissions is pinned too. Each
+    advances the deterministic clock past `LOAD_DEBOUNCE` before capturing
+    (`settle_info_panel` in the runner, called after every navigation **and**
+    after every scenario's own gesture except `MarqueeActive`'s held drag,
+    whose 30 ms autoscroll tick would walk the list). Settling after the
+    navigation alone is not enough — a gesture that moves the cursor arms a
+    fresh debounce, which is how `details_rename_editing` and `split_panes`
+    came to capture a panel of em dashes — so `run_scenario` also asserts
+    `InfoPanel::is_settled()` before capturing, and any future scenario that
+    forgets is a hard failure rather than a plausible-looking baseline. The JPEG subject
+    is inserted with `FakeVfs::insert_file` after `insert_tree`, not as a
+    fixture key, because `FakeVfs` mtimes come from an insertion-order counter
+    and a new key inside the tree would shift every node declared after it.
 - `scrollbar.rs` (M4, §8 widget list "Auto-hide scrollbar"): a thin overlay,
   not a layout node — an absolutely-positioned child of the marquee's list
   surface (the same positioning context as the rubber band), so it reserves no

@@ -10,6 +10,7 @@ pub mod context_menu;
 pub mod dialogs;
 pub mod dir_view;
 pub mod drag;
+pub mod info_panel;
 pub mod input;
 pub mod jobs_model;
 pub mod jobs_ui;

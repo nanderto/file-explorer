@@ -114,6 +114,10 @@ pub fn init(cx: &mut App) {
         // workspace owns `panes` and decides which pane survives a collapse,
         // and the binding must work with focus anywhere in the window.
         KeyBinding::new("cmd-shift-o", ToggleSplitPane, Some("Workspace")),
+        // §0 Info panel toggle (M5). Workspace context for the same reasons as
+        // the split: the workspace owns the right-hand column, and the
+        // titlebar button dispatches this action with focus on the root.
+        KeyBinding::new("cmd-shift-i", ToggleInfoPanel, Some("Workspace")),
         // §0 Undo / Redo (M3)
         KeyBinding::new("cmd-z", Undo, Some("Workspace")),
         KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),
@@ -232,6 +236,7 @@ mod tests {
                 .on_action(record!(ToggleApplyToAll, "ToggleApplyToAll"))
                 .on_action(record!(ToggleHiddenFiles, "ToggleHiddenFiles"))
                 .on_action(record!(ToggleSplitPane, "ToggleSplitPane"))
+                .on_action(record!(ToggleInfoPanel, "ToggleInfoPanel"))
                 .size_full()
         }
     }
@@ -319,10 +324,10 @@ mod tests {
     #[gpui::test]
     fn workspace_context_dispatches_the_split_pane_row(cx: &mut TestAppContext) {
         let (fired, cx) = probe(cx, "Workspace");
-        cx.simulate_keystrokes("cmd-shift-o cmd-shift-.");
+        cx.simulate_keystrokes("cmd-shift-o cmd-shift-. cmd-shift-i");
         assert_eq!(
             *fired.borrow(),
-            vec!["ToggleSplitPane", "ToggleHiddenFiles"]
+            vec!["ToggleSplitPane", "ToggleHiddenFiles", "ToggleInfoPanel"]
         );
     }
 

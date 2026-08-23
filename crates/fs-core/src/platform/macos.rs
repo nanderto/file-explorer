@@ -23,12 +23,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 
 use super::{Platform, VolumeId, VolumeInfo};
+use crate::attrs::{FileAttrs, UnixPerms};
 use crate::exec::{Spawner, SpawnerExt as _};
 use crate::thumbnail::{Thumbnail, validate_px};
 
@@ -70,6 +71,15 @@ impl Platform for MacPlatform {
                     )
                 }),
             })
+            .await
+    }
+
+    /// Three lookups, each degrading on its own (see [`file_attrs_blocking`]),
+    /// all inside one [`SpawnerExt::unblock`].
+    async fn file_attrs(&self, path: &Path) -> Result<FileAttrs> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || file_attrs_blocking(&path))
             .await
     }
 
@@ -191,6 +201,175 @@ fn volumes_blocking() -> Result<Vec<VolumeInfo>> {
         });
     }
     Ok(volumes)
+}
+
+/// `UF_IMMUTABLE` from `<sys/stat.h>`: the user-immutable flag, which is what
+/// Finder's "Locked" checkbox sets. Spelled out here rather than pulled in from
+/// `libc` — a whole new dependency (and the full rebuild that a `Cargo.toml`
+/// change costs) for one constant that has been stable since 4.4BSD.
+const UF_IMMUTABLE: u32 = 0x0000_0002;
+
+/// Extended attributes for the info panel (M5). Blocking — always called
+/// through `unblock`.
+///
+/// Only the `lstat` can fail the call: if the item is not there, there are no
+/// attributes to show. The three richer lookups are independent and each
+/// degrades to `None`/`false` on failure, so a file on a filesystem that has no
+/// Date Added still reports its mode and owner.
+///
+/// `lstat` (not `stat`) on purpose: the panel describes the item the user
+/// selected, and for a symlink that is the link's own mode and owner, not its
+/// target's.
+///
+/// Uses `std::os::macos::fs::MetadataExt` for mode/uid/gid/flags instead of
+/// calling `libc::lstat` directly — same `struct stat`, no new dependency —
+/// and `NSFileManager`/`NSURL` (already in use above) for the names and the
+/// Foundation-only values, so no `getpwuid_r`/`getgrgid_r` either.
+///
+/// Deliberately **unbounded**, unlike [`quicklook_blocking`]: there is no
+/// completion handler to abandon, so bounding a `stat` would mean leaking a
+/// thread per stalled call rather than parking one. A selection on a hung
+/// network mount therefore parks its pool thread until the mount answers —
+/// recorded as a Known gap.
+fn file_attrs_blocking(path: &Path) -> Result<FileAttrs> {
+    use std::os::macos::fs::MetadataExt as _;
+
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {} for its attributes", path.display()))?;
+    // The Foundation lookups below go through `NSString`, which can only carry
+    // a UTF-8 path: for anything else (raw bytes on an SMB or exFAT volume) a
+    // lossy conversion would query a *different* path, and could attribute
+    // another file's owner and type description to this one. Honestly absent
+    // beats plausibly wrong.
+    if path.to_str().is_none() {
+        return Ok(FileAttrs {
+            perms: Some(UnixPerms::from_mode(meta.st_mode())),
+            owner: Some(meta.st_uid().to_string()),
+            group: Some(meta.st_gid().to_string()),
+            locked: meta.st_flags() & UF_IMMUTABLE != 0,
+            ..FileAttrs::default()
+        });
+    }
+    let (owner, group) = account_names(path)
+        .unwrap_or_default()
+        // No account names? Fall back to the numeric ids, which we always have.
+        .into_pair_or(meta.st_uid(), meta.st_gid());
+    let resources = url_resource_values(path).unwrap_or_default();
+
+    Ok(FileAttrs {
+        perms: Some(UnixPerms::from_mode(meta.st_mode())),
+        owner: Some(owner),
+        group: Some(group),
+        locked: meta.st_flags() & UF_IMMUTABLE != 0,
+        added: resources.added,
+        extension_hidden: resources.extension_hidden,
+        type_description: resources.type_description,
+    })
+}
+
+/// Owner and group *names*, either of which the directory service may decline
+/// to resolve (a uid with no account, a network directory that is down).
+#[derive(Default)]
+struct AccountNames {
+    owner: Option<String>,
+    group: Option<String>,
+}
+
+impl AccountNames {
+    /// Each missing name becomes its numeric id rendered as a string, which is
+    /// what `ls -l` does and what [`FileAttrs::owner`] documents.
+    fn into_pair_or(self, uid: u32, gid: u32) -> (String, String) {
+        (
+            self.owner.unwrap_or_else(|| uid.to_string()),
+            self.group.unwrap_or_else(|| gid.to_string()),
+        )
+    }
+}
+
+/// `NSFileManager attributesOfItemAtPath:error:` for the owner and group names.
+#[allow(unused_unsafe)] // see volumes_blocking
+fn account_names(path: &Path) -> Option<AccountNames> {
+    use objc2_foundation::{
+        NSFileAttributeKey, NSFileGroupOwnerAccountName, NSFileManager, NSFileOwnerAccountName,
+        NSString,
+    };
+
+    let manager = unsafe { NSFileManager::defaultManager() };
+    let attributes = unsafe {
+        manager.attributesOfItemAtPath_error(&NSString::from_str(&path.to_string_lossy()))
+    }
+    .ok()?;
+    let string_for = |key: &NSFileAttributeKey| -> Option<String> {
+        attributes
+            .objectForKey(key)
+            .and_then(|value| value.downcast_ref::<NSString>().map(|s| s.to_string()))
+    };
+    Some(AccountNames {
+        owner: unsafe { string_for(NSFileOwnerAccountName) },
+        group: unsafe { string_for(NSFileGroupOwnerAccountName) },
+    })
+}
+
+/// The `FileAttrs` fields that only Foundation knows.
+#[derive(Default)]
+struct UrlResources {
+    added: Option<SystemTime>,
+    extension_hidden: bool,
+    type_description: Option<String>,
+}
+
+/// `NSURL resourceValuesForKeys:error:` for Date Added, the extension-hidden
+/// flag and the localized type description. Any individual key may be absent
+/// (Date Added, for one, only exists on filesystems that record it).
+#[allow(unused_unsafe)] // see volumes_blocking
+fn url_resource_values(path: &Path) -> Option<UrlResources> {
+    use objc2_foundation::{
+        NSArray, NSDate, NSNumber, NSString, NSURL, NSURLAddedToDirectoryDateKey,
+        NSURLHasHiddenExtensionKey, NSURLLocalizedTypeDescriptionKey, NSURLResourceKey,
+    };
+
+    let keys: [&NSURLResourceKey; 3] = unsafe {
+        [
+            NSURLAddedToDirectoryDateKey,
+            NSURLHasHiddenExtensionKey,
+            NSURLLocalizedTypeDescriptionKey,
+        ]
+    };
+    let keys = NSArray::from_slice(&keys);
+    let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())) };
+    let values = unsafe { url.resourceValuesForKeys_error(&keys) }.ok()?;
+
+    let added = unsafe { values.objectForKey(NSURLAddedToDirectoryDateKey) }
+        .and_then(|value| value.downcast_ref::<NSDate>().map(system_time_from))
+        .flatten();
+    let extension_hidden = unsafe { values.objectForKey(NSURLHasHiddenExtensionKey) }
+        .and_then(|value| value.downcast_ref::<NSNumber>().map(|n| n.boolValue()))
+        .unwrap_or(false);
+    let type_description = unsafe { values.objectForKey(NSURLLocalizedTypeDescriptionKey) }
+        .and_then(|value| value.downcast_ref::<NSString>().map(|s| s.to_string()));
+
+    Some(UrlResources {
+        added,
+        extension_hidden,
+        type_description,
+    })
+}
+
+/// `NSDate` → [`SystemTime`]. Foundation dates can predate the unix epoch and
+/// can be non-finite, so both directions are handled and anything
+/// unrepresentable becomes `None` rather than a panic.
+#[allow(unused_unsafe)] // see volumes_blocking
+fn system_time_from(date: &objc2_foundation::NSDate) -> Option<SystemTime> {
+    let seconds = unsafe { date.timeIntervalSince1970() };
+    if !seconds.is_finite() {
+        return None;
+    }
+    let magnitude = Duration::try_from_secs_f64(seconds.abs()).ok()?;
+    if seconds.is_sign_negative() {
+        SystemTime::UNIX_EPOCH.checked_sub(magnitude)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_add(magnitude)
+    }
 }
 
 /// How long to wait for QuickLook before giving up and trying the fallback.
@@ -442,6 +621,112 @@ mod tests {
         std::fs::write(&path, b"not an image").unwrap();
         let err = decode_image_blocking(&path, 64).unwrap_err();
         assert!(format!("{err:#}").contains("notes.txt"), "{err:#}");
+    }
+
+    #[test]
+    fn file_attrs_reports_the_real_mode_owner_and_type() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let before = SystemTime::now() - Duration::from_secs(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = png_fixture(dir.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let platform = MacPlatform::new(Arc::new(TestSpawner::new()));
+        let attrs = block_on(platform.file_attrs(&path)).expect("attrs");
+
+        let perms = attrs.perms.expect("a mode on a real APFS file");
+        assert_eq!(perms.octal(), "640");
+        assert_eq!(perms.symbolic(), "rw-r-----");
+        // Owner and group always resolve to *something* — a name, or the id.
+        assert!(attrs.owner.is_some_and(|o| !o.is_empty()));
+        assert!(attrs.group.is_some_and(|g| !g.is_empty()));
+        assert!(!attrs.locked, "a freshly written file is not locked");
+        // Foundation describes a .png; the exact wording is localized, so only
+        // its presence is asserted.
+        assert!(
+            attrs.type_description.is_some(),
+            "no localized type description"
+        );
+        // Date Added is recorded by APFS, so on a temp dir it is always there
+        // and always inside the window the fixture was written in. Asserting
+        // only `is_none_or(post-epoch)` would pass even if the key were misread
+        // or `system_time_from` returned `None` for everything.
+        let added = attrs.added.expect("APFS records Date Added");
+        assert!(
+            added >= before && added <= SystemTime::now() + Duration::from_secs(1),
+            "Date Added {added:?} is outside the window the fixture was written in"
+        );
+    }
+
+    #[test]
+    fn system_time_from_handles_both_sides_of_the_epoch_and_rejects_the_rest() {
+        use objc2_foundation::NSDate;
+
+        let at = |seconds: f64| NSDate::dateWithTimeIntervalSince1970(seconds);
+        assert_eq!(
+            system_time_from(&at(0.0)),
+            Some(std::time::UNIX_EPOCH),
+            "the epoch itself"
+        );
+        assert_eq!(
+            system_time_from(&at(1.0)),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(1))
+        );
+        assert_eq!(
+            // 1969: `NSDate` predates the unix epoch happily, and a sign slip
+            // here would report a *future* date.
+            system_time_from(&at(-86_400.0)),
+            Some(std::time::UNIX_EPOCH - Duration::from_secs(86_400))
+        );
+        assert_eq!(system_time_from(&at(f64::NAN)), None);
+        assert_eq!(system_time_from(&at(f64::INFINITY)), None);
+    }
+
+    #[test]
+    fn file_attrs_of_a_missing_path_fails() {
+        let platform = MacPlatform::new(Arc::new(TestSpawner::new()));
+        let err = block_on(platform.file_attrs(Path::new("/definitely/not/here.bin"))).unwrap_err();
+        assert!(format!("{err:#}").contains("here.bin"), "{err:#}");
+    }
+
+    #[test]
+    fn file_attrs_describes_the_symlink_itself_not_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"payload").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let platform = MacPlatform::new(Arc::new(TestSpawner::new()));
+        let attrs = block_on(platform.file_attrs(&link)).expect("attrs");
+        // lstat, so the mode is the link's own — never the target's.
+        let expected = {
+            use std::os::macos::fs::MetadataExt as _;
+            UnixPerms::from_mode(std::fs::symlink_metadata(&link).unwrap().st_mode())
+        };
+        assert_eq!(attrs.perms, Some(expected));
+        assert_ne!(
+            attrs.perms.expect("mode").octal(),
+            "644",
+            "the target's mode leaked through: stat was used instead of lstat"
+        );
+    }
+
+    #[test]
+    fn account_names_fall_back_to_the_numeric_ids() {
+        let named = AccountNames {
+            owner: Some("alice".into()),
+            group: Some("staff".into()),
+        };
+        assert_eq!(
+            named.into_pair_or(501, 20),
+            ("alice".to_string(), "staff".to_string())
+        );
+        assert_eq!(
+            AccountNames::default().into_pair_or(501, 20),
+            ("501".to_string(), "20".to_string())
+        );
     }
 
     #[test]

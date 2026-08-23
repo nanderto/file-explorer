@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 
+use crate::attrs::FileAttrs;
 use crate::exec::Spawner;
 use crate::thumbnail::Thumbnail;
 use crate::watcher::WatchGuard;
@@ -92,6 +93,17 @@ pub trait Platform: Send + Sync {
     /// already handed to a background thread may run to completion and be
     /// discarded, but no shared state may be left half-written.
     async fn thumbnail(&self, path: &Path, px: u32) -> Result<Thumbnail>;
+
+    /// Attributes that need an OS call beyond [`crate::Vfs::metadata`]: unix
+    /// mode, owner/group names, the locked flag, Date Added, extension-hidden,
+    /// and the localized type description (M5's info panel).
+    ///
+    /// Blocking work goes through [`crate::SpawnerExt::unblock`], so the UI
+    /// thread only ever awaits this. An `Err` means the item could not be
+    /// stat'ed at all (gone, or unreadable); a *field* that could not be
+    /// resolved degrades to `None`/`false` inside a successful [`FileAttrs`],
+    /// because the panel would rather show four of six rows than none.
+    async fn file_attrs(&self, path: &Path) -> Result<FileAttrs>;
 }
 
 /// Watch the volume list for changes by polling [`Platform::volumes`] every
@@ -263,6 +275,80 @@ mod tests {
         let tiny = block_on(platform.thumbnail(path, 1)).unwrap();
         assert_eq!(tiny.width().max(tiny.height()), 1);
         assert_eq!(tiny.byte_len(), 4);
+    }
+
+    #[test]
+    fn stub_file_attrs_are_deterministic_and_path_derived() {
+        let platform = StubPlatform::new();
+        let path = Path::new("/root/photo.png");
+
+        let first = block_on(platform.file_attrs(path)).unwrap();
+        let second = block_on(StubPlatform::new().file_attrs(path)).unwrap();
+        assert_eq!(first, second, "same path ⇒ identical attributes");
+
+        // Fixed, asserted values — the whole point of the stub.
+        assert_eq!(first.owner.as_deref(), Some("stub-owner"));
+        assert_eq!(first.group.as_deref(), Some("stub-group"));
+        assert_eq!(first.type_description.as_deref(), Some("PNG image"));
+        let mode = first.perms.expect("perms").mode();
+        assert!(
+            [0o644, 0o755, 0o600, 0o664].contains(&mode),
+            "unexpected stub mode {mode:o}"
+        );
+
+        // Date Added sits inside the fixed 2024-01-01 day, with no clock read.
+        let base = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+        let added = first.added.expect("added");
+        assert!(added >= base && added < base + Duration::from_secs(86_400));
+
+        // Different paths get different attributes (not one constant blob).
+        let other = block_on(platform.file_attrs(Path::new("/root/notes.md"))).unwrap();
+        assert_eq!(
+            other.type_description.as_deref(),
+            Some("Plain text document")
+        );
+        assert_ne!(other.added, first.added);
+
+        // No extension ⇒ nothing to describe.
+        let extensionless = block_on(platform.file_attrs(Path::new("/root/Makefile"))).unwrap();
+        assert_eq!(extensionless.type_description, None);
+    }
+
+    /// The stub's `locked` and `extension_hidden` are path-derived, so **both**
+    /// values occur — which is why no test may assert one of them over a path
+    /// it did not fix (a `tempfile` directory's random suffix, say). Pinned
+    /// here because the portable `tests/attrs.rs` used to assert `!locked` over
+    /// exactly such paths and failed on roughly half of all runs off macOS.
+    #[test]
+    fn stub_file_attrs_flags_are_path_derived_not_constant() {
+        let platform = StubPlatform::new();
+        let flags: Vec<(bool, bool)> = (0..64)
+            .map(|ix| {
+                let attrs =
+                    block_on(platform.file_attrs(&PathBuf::from(format!("/root/f{ix}.txt"))))
+                        .unwrap();
+                (attrs.locked, attrs.extension_hidden)
+            })
+            .collect();
+        assert!(
+            flags.iter().any(|(locked, _)| *locked) && flags.iter().any(|(locked, _)| !*locked),
+            "the stub's locked flag must vary with the path: {flags:?}"
+        );
+        assert!(
+            flags.iter().any(|(_, hidden)| *hidden) && flags.iter().any(|(_, hidden)| !*hidden),
+            "…and so must extension_hidden: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn stub_file_attrs_need_no_filesystem() {
+        // A path that cannot exist still answers — visual scenarios and
+        // FakeVfs-backed tests depend on that.
+        let attrs = block_on(StubPlatform::new().file_attrs(Path::new("/nope/missing.jpg")));
+        assert_eq!(
+            attrs.unwrap().type_description.as_deref(),
+            Some("JPEG image")
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ This table is the **literal source of truth for `crates/app/src/keymap.rs`** and
 | §2 Toolbar | View mode switcher (columns) | **none in v1** — the switcher ships two buttons and the binding is deliberately left off; the handler exists and announces unavailability (`COLUMNS_UNAVAILABLE_NOTICE`) rather than no-opping. Miller columns are post-v1. | `SetViewColumns` | `Pane` | Pane | post-v1 |
 | §2 Panes | Split-pane toggle | `cmd-shift-o`, toolbar | `ToggleSplitPane` | `Workspace` | Workspace | M4 |
 | §2 Info panel | Info panel toggle | `cmd-shift-i`, toolbar | `ToggleInfoPanel` | `Workspace` | Workspace | M5 |
+| §2 Info panel | Collapse/expand the panel's General and Permissions sections | section-header click (mouse only) | *not an action* — an `InfoPanel`-local toggle, deliberately: the sections are the panel's own presentation state, with no keymap, menu item or other dispatcher. A `ToggleInfoSection` action becomes worth it when M8's menu bar or a keyboard-navigable panel needs a second caller. | — | info_panel | M5 |
 | §2 Toolbar | Search field focus | `cmd-f` | `FocusSearch` | `Workspace` | Workspace | M6 |
 
 Every §3 row is covered. Context menus (M3) and the native menu bar (M8) dispatch **the same boxed actions**, so each command's logic exists exactly once.
@@ -410,10 +411,18 @@ pub struct FileEntry {
     pub size: u64,
     pub modified: SystemTime, pub created: Option<SystemTime>,
     pub hidden: bool,             // dotfile or Finder hidden flag
-    pub perms: Option<UnixPerms>, // populated lazily for info panel
     pub tags: Vec<TagId>,         // M6
 }
 ```
+
+> **Amended at M5** (was: `perms: Option<UnixPerms>`, "populated lazily for
+> info panel"). Permissions are **not** a `FileEntry` field. They — and the
+> owner, group, locked flag, Date Added, extension-hidden flag and localized
+> type description — are fetched per *selection* through
+> `Platform::file_attrs(path) -> FileAttrs` (`fs-core/src/attrs.rs`), which is
+> what §9's M5 line describes. A lazily-empty field on every listing row would
+> have cost a `FileEntry` churn across all of M1–M4 for data only the info
+> panel reads, and one `stat` per row for data only one row needs.
 
 **`listing.rs`** — `ListingSnapshot { dir: Arc<Path>, entries: Arc<Vec<FileEntry>>, sort: SortSpec, generation: u64, show_hidden: bool }`. `list_dir(vfs, dir, sort, show_hidden)` streams `read_dir`, collects, sorts once. `patch_listing(&snapshot, batch) -> ListingSnapshot` applies a debounced event batch: binary-search removal, sorted insertion (comparator gives the index — no full re-sort for single events), full reload on `Rescan`. Snapshots are cheap-clone (`Arc` inside).
 
@@ -533,7 +542,7 @@ What we take instead:
 | | `dir_view.rs` | Enter=open vs Confirm-in-rename; F2 *and* slow-second-click enter rename; Escape/blur teardown; type-ahead (fake timer reset); Delete blocked while `renaming`; ExpandSelected/CollapseSelected re-projection |
 | | `address_bar.rs` | cmd-l focus, edit→confirm navigates, escape restores breadcrumb, autocomplete list, **tab AcceptSuggestion completes in place** |
 | | `jobs_model.rs` / dialogs | JobEvent stream → JobsModel rows; NeedsDecision → Workspace modal; ConflictDialog keys (`r`/`s`/`k`/`a`/enter/escape) reach `queue.resolve` (FakeVfs); Completed pushes undo entry exactly once |
-| **Visual scenarios** (`visual_test_runner`, macOS CI — infra exists per AS_BUILT) | per milestone | existing `workspace_dark/light`; add M1 `listing_populated`, `listing_sorted_by_size`, `address_bar_editing`; M2 `sidebar_tree_expanded`, `details_folder_expanded`; M3 `rename_editing`, `context_menu_open`, `conflict_dialog`, `cut_dimmed`, `marquee_active`; M4 `icon_grid`, `split_panes`; M5 `info_panel_jpeg`; M7 `user_theme_applied`. All fed by FakeVfs fixture trees for determinism (fixed 1200×760, Helvetica, no wall-clock UI — per CLAUDE.md). |
+| **Visual scenarios** (`visual_test_runner`, macOS CI — infra exists per AS_BUILT) | per milestone | existing `workspace_dark/light`; add M1 `listing_populated`, `listing_sorted_by_size`, `address_bar_editing`; M2 `sidebar_tree_expanded`, `details_folder_expanded`; M3 `rename_editing`, `context_menu_open`, `conflict_dialog`, `cut_dimmed`, `marquee_active`; M4 `icon_grid`, `split_panes`; M5 `info_panel_jpeg` (this row's original name — a selected `.jpg`, the milestone's acceptance criterion) plus `info_panel_selection` (the same shape over a `.pdf` in a populated folder) and `info_panel_multi_selection` (the summary state, which nothing else pins); M7 `user_theme_applied`. All fed by FakeVfs fixture trees for determinism (fixed 1200×760, Helvetica, no wall-clock UI — per CLAUDE.md). |
 | **Manual per-milestone on real Mac** | gate checklist | native watcher quirks, real trash/restore, Finder drag interop, appearance switching — the things FakeVfs can't prove |
 
 ---
@@ -551,7 +560,7 @@ What we take instead:
 
 **M4 — Icon view + dual pane.** `views/icon_grid.rs`, view-mode switcher on Pane, `panes` Vec grows to 2 + `ToggleSplitPane`, cross-pane drag (already works — payload is window-global), `Platform::thumbnail` + LRU byte-budget cache, auto-hide scrollbar.
 
-**M5 — Info panel.** `info_panel.rs` reading lazy `Vfs::metadata`/`Platform` extras per selection change (debounced via `Spawner::timer`); multi-selection summary; `perms` display; `ToggleInfoPanel`.
+**M5 — Info panel.** `info_panel.rs` reading lazy `Vfs::metadata`/`Platform` extras per selection change (debounced via `Spawner::timer`); multi-selection summary; `perms` display; `ToggleInfoPanel`. Built: the extras arrive as `FileAttrs` from the new `Platform::file_attrs` (not as a `FileEntry` field — see §6), the debounce/stat/attrs/preview share one cancellable `Task` slot, and the panel is workspace-level but follows the **active** pane. Permissions are read-only at M5; editing them is M6.
 
 **M6 — Search, tags, permission editing.** fs-core: recursive streamed search over Vfs, `Platform` tags read/write, chmod/chown ops as FileOps (undoable). app: `search.rs` toolbar field (reuses TextInput, `FocusSearch`), tag dots in rows, sidebar tag filter, editable permissions grid.
 
