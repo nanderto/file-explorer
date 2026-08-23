@@ -1192,6 +1192,13 @@ impl Render for DirView {
             .as_ref()
             .and_then(|p| p.read(cx).load_error().map(str::to_string));
         let view_mode = self.view_mode(cx);
+        // One measurement, handed to *both* the header and the body rows: a
+        // narrow pane (the M4 split leaves ~270 px) cannot fit Name + Size +
+        // Date, and if the two disagree within a frame values stop aligning
+        // under their headers. Width comes from the same painted bounds the
+        // grid's column count and every gesture hit test read.
+        let columns =
+            details_list::visible_columns(f32::from(marquee::list_viewport(self).size.width));
 
         // The auto-hide scrollbar (M4): compare this frame's scroll offset
         // with the last one and (re)arm the fade. Before the projection is
@@ -1237,7 +1244,7 @@ impl Render for DirView {
             // handle, and both read the same path-keyed selection — which is
             // what makes switching mode a pure re-render.
             match view_mode {
-                ViewMode::List => details_list::render_rows(self, cx).into_any_element(),
+                ViewMode::List => details_list::render_rows(self, columns, cx).into_any_element(),
                 ViewMode::Icons => {
                     // The one place `cols` is measured: from here on this
                     // frame — and every hit test against the pixels it paints
@@ -1397,7 +1404,7 @@ impl Render for DirView {
             // has no columns to sort by clicking (the `SortBy` action itself
             // still works — it lives on the pane, not on the header).
             .children(match view_mode {
-                ViewMode::List => Some(details_list::render_header(&theme, sort, cx)),
+                ViewMode::List => Some(details_list::render_header(&theme, sort, columns, cx)),
                 ViewMode::Icons => None,
             })
             // The rows live inside the marquee's background surface (§8): it
