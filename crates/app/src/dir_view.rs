@@ -76,9 +76,9 @@ use gpui::{
 
 use crate::actions::Cancel;
 use crate::actions::{
-    CollapseSelected, Copy, Cut, DeleteToTrash, Duplicate, ExpandSelected, ExtendSelectionNext,
-    ExtendSelectionPrev, OpenSelected, PageDown, PageUp, Paste, RenameSelected, SelectAll,
-    SelectFirst, SelectLast, SelectNext, SelectPrev,
+    CollapseSelected, Copy, Cut, DeleteToTrash, Duplicate, ExpandSelected, ExtendSelectionLeft,
+    ExtendSelectionNext, ExtendSelectionPrev, ExtendSelectionRight, OpenSelected, PageDown, PageUp,
+    Paste, RenameSelected, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrev,
 };
 use crate::app_state::FsContext;
 use crate::context_menu::{self, ContextMenuState};
@@ -86,8 +86,10 @@ use crate::drag::{self, DropState};
 use crate::marquee::{self, MarqueeState};
 use crate::pane::{Pane, ViewMode};
 use crate::rename::RenameState;
+use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionModel;
 use crate::theme::Theme;
+use crate::thumbnails::ThumbnailState;
 use crate::views::{details_list, icon_grid};
 
 /// Quiet period after which the type-ahead prefix resets. Every keystroke
@@ -174,6 +176,31 @@ pub struct DirView {
     /// (see [`crate::context_menu`]). Holds the invocation point and the
     /// boxed actions its rows dispatch.
     pub(crate) menu: Option<ContextMenuState>,
+    /// Icon-grid thumbnails (M4): the byte-budget cache, the decoded images
+    /// the painted tiles reference, and the single-slot fetch task that
+    /// cancels itself on scroll-away. See [`crate::thumbnails`].
+    pub(crate) thumbnails: ThumbnailState,
+    /// The auto-hide scrollbar's visibility + fade timer (M4). See
+    /// [`crate::scrollbar`].
+    pub(crate) scrollbar: ScrollbarState,
+    /// The icon grid's column count **as the last painted frame laid it out**.
+    ///
+    /// Not derived on demand from the scroll handle's bounds: those bounds are
+    /// only updated during `prepaint`, so a `cols` recomputed inside a hit
+    /// test can be a frame *ahead* of the tiles on screen — and then the
+    /// context menu, the drop target and the marquee all name a different
+    /// entry than the tile under the pointer. Every piece of grid arithmetic
+    /// therefore reads this field (see [`Self::grid_cols`]), which `render`
+    /// writes with exactly the value it hands [`icon_grid::render_grid`].
+    /// Convergence after a resize is [`Self::note_painted_grid_cols`]'s job.
+    painted_cols: usize,
+    /// The [`ViewMode`] the last frame painted, so the *first* frame of a new
+    /// mode can put the cursor back on screen. The two views share one pixel
+    /// scroll offset but measure their items differently (a 22px row per
+    /// entry vs an 88px line per `cols` entries), so the selection a switch
+    /// preserves is not necessarily still visible; see
+    /// [`Self::scroll_cursor_into_view`].
+    painted_mode: ViewMode,
 }
 
 impl DirView {
@@ -197,6 +224,12 @@ impl DirView {
             drag_selection: Arc::from(Vec::new()),
             drop: None,
             menu: None,
+            thumbnails: ThumbnailState::default(),
+            scrollbar: ScrollbarState::default(),
+            // One column until the first layout, which makes an unpainted
+            // grid behave exactly like the list rather than dividing by zero.
+            painted_cols: 1,
+            painted_mode: ViewMode::default(),
         }
     }
 
@@ -281,7 +314,34 @@ impl DirView {
     ) {
         let keep = self.listing_ids(snapshot);
         self.selection.retain(|id| keep.contains(id));
+        self.prune_expansion_state(&keep);
         cx.notify();
+    }
+
+    /// Drop expansion state for folders that have left the listing.
+    ///
+    /// The selection and the cursor are pruned above because an invisible row
+    /// must not be actionable; `expanded`/`children` used to be left alone
+    /// because the projection only injects children of folders it actually
+    /// paints, so a dead entry was merely inert. Inert is not free: the maps
+    /// grew for the life of the pane (a `children` entry holds a whole child
+    /// listing), and a folder deleted and later re-created with the same name
+    /// came back **pre-expanded from a stale cache**.
+    ///
+    /// A key survives iff some ancestor of it is still a row: `/a/b`'s cached
+    /// children live on while `/a` is listed and are dropped with it. The open
+    /// directory itself is not in `keep` (its entries are), so a path outside
+    /// the listing entirely is pruned as well.
+    fn prune_expansion_state(&mut self, keep: &BTreeSet<EntryId>) {
+        let alive = |path: &Arc<Path>| {
+            path.ancestors()
+                .any(|ancestor| keep.contains(&EntryId(Arc::from(ancestor))))
+        };
+        self.expanded.retain(alive);
+        self.children.retain(|path, _| alive(path));
+        // ...and an in-flight child load for a folder that has gone: dropping
+        // the task cancels it, so nothing lands in `children` afterwards.
+        self._child_loads.retain(|path, _| alive(path));
     }
 
     /// Every id the projection would render over `snapshot`: its rows, plus
@@ -362,15 +422,21 @@ impl DirView {
         cx.notify();
     }
 
-    /// `cmd-v`: turn the clipboard into a job (§4b) — `Copy` for copy-mode,
-    /// `Move` for cut-mode (consuming the clipboard, so the dimming clears).
-    /// Keep-both names (incl. paste-into-same-folder) are planned by ops.
-    pub fn paste_into_current(&mut self, cx: &mut Context<Self>) {
-        let Some(dest) = self
-            .pane
-            .upgrade()
-            .and_then(|pane| pane.read(cx).path().map(Path::to_path_buf))
-        else {
+    /// `cmd-v` / a menu's Paste: turn the clipboard into a job (§4b) —
+    /// `Copy` for copy-mode, `Move` for cut-mode (consuming the clipboard, so
+    /// the dimming clears). Keep-both names (incl. paste-into-same-folder) are
+    /// planned by ops.
+    ///
+    /// `dest` is the folder to paste into, defaulting to the pane's open
+    /// directory. The row context menu passes the **right-clicked folder**
+    /// (Explorer's behavior); because it is a parameter of the one action,
+    /// that menu row is not a second implementation of paste.
+    pub fn paste_into(&mut self, dest: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(dest) = dest.or_else(|| {
+            self.pane
+                .upgrade()
+                .and_then(|pane| pane.read(cx).path().map(Path::to_path_buf))
+        }) else {
             return;
         };
         let Some(op) = FsContext::global_mut(cx).clipboard.paste_op(&dest) else {
@@ -446,11 +512,28 @@ impl DirView {
     /// Build the flat row projection: snapshot rows at depth 0, each expanded
     /// folder's cached children spliced beneath it with `depth + 1`, sorted
     /// and hidden-filtered by the snapshot's current settings.
+    ///
+    /// **In the icon grid the splice is skipped.** A tile has no indentation,
+    /// no disclosure triangle, and `left`/`right` are 2D cursor motion there
+    /// rather than expand/collapse — so children projected into the grid paint
+    /// as ordinary top-level tiles of a folder they do not live in, with no
+    /// way to collapse them short of `cmd-1`. Explorer's icon and tiles views
+    /// never show a subfolder's contents inline. `self.expanded` is left
+    /// untouched, so `cmd-1` restores the tree exactly as it was and switching
+    /// mode stays a pure re-render.
     pub fn projected_rows(&self, cx: &App) -> Vec<ProjectedRow> {
         let mut flat = Vec::new();
+        let splice_children = self.view_mode(cx) == ViewMode::List;
         if let Some(snapshot) = self.snapshot(cx) {
             for entry in snapshot.entries.iter() {
-                self.project_into(&mut flat, entry, 0, snapshot.sort, snapshot.show_hidden);
+                self.project_into(
+                    &mut flat,
+                    entry,
+                    0,
+                    snapshot.sort,
+                    snapshot.show_hidden,
+                    splice_children,
+                );
             }
         }
         // §4c `New ▸`: the phantom row of an entry being named but not yet
@@ -486,21 +569,27 @@ impl DirView {
         depth: usize,
         sort: SortSpec,
         show_hidden: bool,
+        splice_children: bool,
     ) {
         let expanded = entry.is_dir_like() && self.expanded.contains(&*entry.path);
         flat.push(ProjectedRow {
             entry: entry.clone(),
             depth,
-            expanded,
+            // The grid paints no disclosure triangle, so an "expanded" tile
+            // would be an unreadable claim about rows that are not there.
+            expanded: expanded && splice_children,
         });
-        if expanded && let Some(kids) = self.children.get(&*entry.path) {
+        if splice_children
+            && expanded
+            && let Some(kids) = self.children.get(&*entry.path)
+        {
             let mut kids: Vec<&FileEntry> = kids
                 .iter()
                 .filter(|kid| show_hidden || !kid.hidden)
                 .collect();
             kids.sort_by(|a, b| sort.compare(a, b));
             for kid in kids {
-                self.project_into(flat, kid, depth + 1, sort, show_hidden);
+                self.project_into(flat, kid, depth + 1, sort, show_hidden, splice_children);
             }
         }
     }
@@ -694,12 +783,65 @@ impl DirView {
             .unwrap_or_default()
     }
 
-    /// Tiles across the icon grid, from the list's painted width (§8: "`cols`
-    /// recomputed from pane width"). One column before the first layout,
-    /// which makes the grid behave exactly like the list rather than
-    /// dividing by zero.
+    /// Tiles across the icon grid (§8: "`cols` recomputed from pane width") —
+    /// **the value the tiles on screen were laid out with**, not a fresh
+    /// measurement. Every hit test and every index/geometry conversion goes
+    /// through here, so none of them can ever disagree with the pixels.
     pub(crate) fn grid_cols(&self) -> usize {
+        self.painted_cols.max(1)
+    }
+
+    /// The column count this frame's list width *would* give. Only `render`
+    /// and [`Self::note_painted_grid_cols`] may use it: read anywhere else it
+    /// is a frame ahead of the paint.
+    pub(crate) fn measured_grid_cols(&self) -> usize {
         icon_grid::cols_for_width(f32::from(marquee::list_viewport(self).size.width))
+    }
+
+    /// Called from the grid's `uniform_list` processor, which runs *after*
+    /// gpui has written this frame's real list bounds onto the scroll handle
+    /// (`Interactivity::prepaint` -> `clamp_scroll_position`). If the width it
+    /// finds there no longer agrees with the `cols` this frame is painting,
+    /// ask for one more frame: a resize otherwise leaves the grid laid out for
+    /// the old width until some unrelated repaint happens along.
+    ///
+    /// Cannot loop: `cols_for_width` is a pure function of a width that no
+    /// longer changes, so the very next frame paints the value measured here
+    /// and the two agree.
+    pub(crate) fn note_painted_grid_cols(
+        &mut self,
+        painting_with: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.measured_grid_cols() == painting_with {
+            return;
+        }
+        // Deferred, not a plain `notify`: we are *inside* the draw that is
+        // painting this view, where gpui swallows both `notify` and
+        // `Window::refresh` (`WindowInvalidator::not_drawing`) precisely to
+        // stop an element dirtying the frame it is part of. `Window::defer`
+        // runs after the draw, which is exactly when the follow-up frame can
+        // be asked for.
+        let this = cx.entity();
+        window.defer(cx, move |_, cx| {
+            this.update(cx, |_, cx| cx.notify());
+        });
+    }
+
+    /// The full height of the projection in content pixels — rows in the
+    /// details list, **grid lines** in the icon view. The one place that
+    /// arithmetic lives: the marquee's autoscroll clamp and the auto-hide
+    /// scrollbar's thumb both need it, and a grid whose content height was
+    /// still counted in row heights would scroll to the wrong bottom.
+    pub(crate) fn content_height(&self, cx: &App) -> f32 {
+        let len = self.flat_rows().len();
+        match self.view_mode(cx) {
+            ViewMode::List => len as f32 * details_list::ROW_HEIGHT,
+            ViewMode::Icons => {
+                icon_grid::grid_row_count(len, self.grid_cols()) as f32 * icon_grid::TILE_HEIGHT
+            }
+        }
     }
 
     /// The entry index under a point in marquee **content** space, or `None`
@@ -1012,6 +1154,14 @@ impl DirView {
         marquee::list_viewport(self)
     }
 
+    /// Expansion bookkeeping sizes: `(expanded folders, cached child
+    /// listings)`. Test observability for the pruning rule — nothing in the
+    /// UI depends on the counts.
+    #[cfg(test)]
+    pub(crate) fn expansion_state_sizes(&self) -> (usize, usize) {
+        (self.expanded.len(), self.children.len())
+    }
+
     pub(crate) fn theme(&self) -> &Theme {
         &self.theme
     }
@@ -1043,12 +1193,33 @@ impl Render for DirView {
             .and_then(|p| p.read(cx).load_error().map(str::to_string));
         let view_mode = self.view_mode(cx);
 
+        // The auto-hide scrollbar (M4): compare this frame's scroll offset
+        // with the last one and (re)arm the fade. Before the projection is
+        // rebuilt, because it reads only the scroll handle.
+        self.note_scroll_for_scrollbar(cx);
+
         // Rebuild the flat projection this frame; the uniform_list row
         // processor reads it back by index.
         self.flat = self.projected_rows(cx);
         // ...and, once, the drag payload's selection (§8), which every
         // drag-capable row shares by cloning the Arc.
         self.drag_selection = Arc::from(self.selection.selected_rootmost());
+
+        // First frame in a new mode: Explorer keeps the selected item in view
+        // across a view change, and the shared *pixel* offset does not. Uses
+        // the freshly measured column count rather than `painted_cols`, which
+        // still describes the mode being left behind.
+        if self.painted_mode != view_mode {
+            self.painted_mode = view_mode;
+            if let Some(ix) = self.cursor_ix(&self.flat) {
+                let item = match view_mode {
+                    ViewMode::List => ix,
+                    ViewMode::Icons => ix / self.measured_grid_cols().max(1),
+                };
+                self.scroll_handle
+                    .scroll_to_item(item, ScrollStrategy::Nearest);
+            }
+        }
 
         let body: gpui::AnyElement = if let Some(error) = load_error {
             div()
@@ -1068,7 +1239,20 @@ impl Render for DirView {
             match view_mode {
                 ViewMode::List => details_list::render_rows(self, cx).into_any_element(),
                 ViewMode::Icons => {
-                    icon_grid::render_grid(self, self.grid_cols(), cx).into_any_element()
+                    // The one place `cols` is measured: from here on this
+                    // frame — and every hit test against the pixels it paints
+                    // — reads `painted_cols` instead.
+                    let cols = self.measured_grid_cols();
+                    self.painted_cols = cols;
+                    // M4: keep the visible band's thumbnails coming. Driven
+                    // from `render`, once per frame, off the scroll offset and
+                    // viewport rather than off the row range `uniform_list`
+                    // asks for — gpui calls that processor twice per frame
+                    // with `0..1` just to measure an item, and a window that
+                    // flipped like that would cancel and restart its own
+                    // fetch on every repaint.
+                    self.request_thumbnails(cols, window, cx);
+                    icon_grid::render_grid(self, cols, cx).into_any_element()
                 }
             }
         } else {
@@ -1139,6 +1323,21 @@ impl Render for DirView {
                 };
                 this.extend_selection(delta, cx)
             }))
+            // The horizontal half of the same §0 row. Only the grid has an
+            // axis for it: a details-list row is full width, so there is no
+            // entry to its left or right to extend onto, and aliasing these
+            // to up/down would make `shift-left` mean "extend backwards" in
+            // one view and "extend a line" in the other.
+            .on_action(cx.listener(|this, _: &ExtendSelectionRight, _, cx| {
+                if this.view_mode(cx) == ViewMode::Icons {
+                    this.extend_selection(icon_grid::GridStep::Right.delta(this.grid_cols()), cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExtendSelectionLeft, _, cx| {
+                if this.view_mode(cx) == ViewMode::Icons {
+                    this.extend_selection(icon_grid::GridStep::Left.delta(this.grid_cols()), cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &PageDown, _, cx| this.step_cursor(this.page_step(cx), cx)),
             )
@@ -1166,7 +1365,9 @@ impl Render for DirView {
             // §0 clipboard rows (M3): cut dims sources, paste moves on cut.
             .on_action(cx.listener(|this, _: &Cut, _, cx| this.cut_selection(cx)))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy_selection(cx)))
-            .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste_into_current(cx)))
+            .on_action(
+                cx.listener(|this, action: &Paste, _, cx| this.paste_into(action.dest.clone(), cx)),
+            )
             // §0 delete-to-trash (M3). DeletePermanently deliberately has no
             // handler here: it bubbles to the workspace, which owns the
             // ConfirmDialog guard.
@@ -1285,6 +1486,237 @@ mod tests {
             .iter()
             .map(|(path, depth)| (PathBuf::from(path), *depth))
             .collect()
+    }
+
+    /// A 60-entry `/grid`, open in the icon grid.
+    fn open_grid(cx: &mut TestAppContext) -> (Entity<Pane>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            let spawner: Arc<dyn Spawner> =
+                Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
+            let vfs = FakeVfs::new(spawner.clone());
+            let mut files = serde_json::Map::new();
+            for i in 0..60 {
+                files.insert(format!("f{i:03}.txt"), json!("x"));
+            }
+            vfs.insert_tree("/grid", serde_json::Value::Object(files));
+            crate::keymap::init(cx);
+            crate::app_state::install(
+                cx,
+                vfs,
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
+        });
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| {
+            pane.navigate_to(Path::new("/grid"), cx);
+            pane.set_view_mode(ViewMode::Icons, cx);
+        });
+        cx.run_until_parked();
+        (pane, cx)
+    }
+
+    /// Every tile whose painted centre is inside the list viewport, paired
+    /// with the entry the pointer hit test names for that centre.
+    fn tiles_vs_hit_tests(
+        dir_view: &Entity<DirView>,
+        cx: &mut VisualTestContext,
+        len: usize,
+    ) -> (usize, Vec<(usize, Option<usize>)>) {
+        let viewport = dir_view.read_with(cx, |view, _| crate::marquee::list_viewport(view));
+        let mut mismatches = Vec::new();
+        let mut first_line = 0usize;
+        for ix in 0..len {
+            // `debug_bounds` wants a `'static` selector and these are built
+            // per index; a test-only leak of a handful of short strings.
+            let selector: &'static str = format!("dir-tile-{ix}").leak();
+            let Some(bounds) = cx.debug_bounds(selector) else {
+                continue;
+            };
+            if bounds.origin.y == viewport.origin.y {
+                first_line += 1;
+            }
+            let centre = bounds.center();
+            if !viewport.contains(&centre) {
+                continue;
+            }
+            let hit = dir_view.read_with(cx, |view, cx| {
+                let scroll_y = crate::marquee::scroll_y(view);
+                view.index_at_content(
+                    crate::marquee::ContentPoint::from_window(centre, viewport, scroll_y),
+                    cx,
+                )
+            });
+            if hit != Some(ix) {
+                mismatches.push((ix, hit));
+            }
+        }
+        (first_line, mismatches)
+    }
+
+    #[gpui::test]
+    fn the_icon_grid_shows_the_folder_it_is_open_on_and_nothing_spliced_into_it(
+        cx: &mut TestAppContext,
+    ) {
+        // An expansion made in the details list kept projecting its children
+        // into the grid, where a tile carries no indentation, no disclosure
+        // triangle, and `left`/`right` are 2D cursor motion rather than
+        // expand/collapse — so the user saw entries of `/root/sub` sitting in
+        // `/root` with no way to collapse them short of `cmd-1`.
+        let (pane, cx) = open_root(cx);
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |view, cx| {
+            view.toggle_expanded(Path::new("/root/sub"), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[
+                ("/root/sub", 0),
+                ("/root/sub/deep", 1),
+                ("/root/sub/inner.txt", 1),
+                ("/root/zeta", 0),
+                ("/root/a.txt", 0),
+            ]),
+            "the details list splices the expansion in, as M2 built it"
+        );
+
+        pane.update(cx, |pane, cx| pane.set_view_mode(ViewMode::Icons, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[("/root/sub", 0), ("/root/zeta", 0), ("/root/a.txt", 0)]),
+            "the grid shows exactly what /root contains"
+        );
+        assert!(
+            !rows(&pane, cx)
+                .iter()
+                .any(|(path, _)| path.to_string_lossy().contains("inner.txt")),
+            "a child of an expanded folder must not paint as a top-level tile"
+        );
+
+        // ...and the expansion itself is intact, so cmd-1 restores the tree
+        // rather than silently dropping state.
+        pane.update(cx, |pane, cx| pane.set_view_mode(ViewMode::List, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[
+                ("/root/sub", 0),
+                ("/root/sub/deep", 1),
+                ("/root/sub/inner.txt", 1),
+                ("/root/zeta", 0),
+                ("/root/a.txt", 0),
+            ]),
+            "switching mode is a pure re-render, so the expansion survives it"
+        );
+    }
+
+    // Switching mode preserved the selection but not its *visibility*: the
+    // two views share one pixel scroll offset while the item metric changes
+    // from a 22px row per entry to an 88px line per `cols` entries, so the
+    // cursor the switch carefully preserved could be anywhere — including off
+    // the top of the grid, with nothing to scroll it back. Explorer keeps the
+    // selected item in view across a view change.
+    #[gpui::test]
+    fn switching_view_mode_scrolls_the_cursor_back_into_view(cx: &mut TestAppContext) {
+        let (pane, cx) = open_grid(cx);
+        // Eight tiles wide: a grid line then covers eight entries' worth of
+        // list rows, so the offset that shows an entry in the list is far
+        // below the one that shows it in the grid.
+        cx.simulate_resize(gpui::size(px(800.0), px(400.0)));
+        set_view_mode(&pane, cx, ViewMode::List);
+        cx.run_until_parked();
+        let dir_view = dir_view_of(&pane, cx);
+
+        // Put the cursor on a middle entry and scroll it into view *as the
+        // list*, which is the state a user arrives in.
+        focus_dir_view(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                view.select_paths(&[Path::new("/grid/f029.txt")], cx)
+            })
+        });
+        // A cursor *move* is what scrolls in the list, so step onto f030 the
+        // way a user does.
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dir-row-30").is_some(),
+            "the cursor is on screen in the list before the switch"
+        );
+
+        set_view_mode(&pane, cx, ViewMode::Icons);
+        cx.run_until_parked();
+
+        let viewport = dir_view.read_with(cx, |view, _| crate::marquee::list_viewport(view));
+        let tile = cx
+            .debug_bounds("dir-tile-30")
+            .expect("the cursor's tile is painted after the switch, not scrolled past");
+        assert!(
+            viewport.contains(&tile.center()),
+            "the cursor's tile is inside the grid viewport: tile={tile:?} viewport={viewport:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_resized_grid_hit_tests_the_tile_the_pointer_is_actually_over(cx: &mut TestAppContext) {
+        // `cols` used to be recomputed on demand from the scroll handle's
+        // bounds, which gpui only writes during `prepaint` — so the frame
+        // drawn *in response to* a resize painted the old width's columns
+        // while every hit test already divided by the new one. The tile
+        // showing `f020.txt` right-clicked as `f006.txt`, and Delete/Cut/
+        // Rename from that menu acted on a file the user never pointed at.
+        let (pane, cx) = open_grid(cx);
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        let wide = dir_view.read_with(cx, |view, _| view.grid_cols());
+        assert!(wide > 6, "the default test window is wide: {wide} cols");
+
+        // Exactly the one draw a real resize produces.
+        cx.simulate_resize(gpui::size(gpui::px(600.0), gpui::px(900.0)));
+        cx.run_until_parked();
+
+        let narrow = dir_view.read_with(cx, |view, _| view.grid_cols());
+        assert!(
+            narrow < wide,
+            "the grid converged on the narrower width: {wide} -> {narrow}"
+        );
+        let (first_line, mismatches) = tiles_vs_hit_tests(&dir_view, cx, 60);
+        assert_eq!(
+            mismatches,
+            vec![],
+            "every visible tile must hit-test as itself (cols={narrow})"
+        );
+        assert_eq!(
+            first_line, narrow,
+            "...and the painted line holds exactly the columns the arithmetic assumes"
+        );
+    }
+
+    #[gpui::test]
+    fn repeated_resizes_all_converge_without_an_unrelated_repaint(cx: &mut TestAppContext) {
+        // The convergence notify has to fire on *every* width change, and has
+        // to stop once the two agree — otherwise a resize either leaves the
+        // grid stale or spins the window redrawing forever.
+        let (pane, cx) = open_grid(cx);
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        for width in [900.0f32, 500.0, 720.0, 340.0] {
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(900.0)));
+            cx.run_until_parked();
+            let (first_line, mismatches) = tiles_vs_hit_tests(&dir_view, cx, 60);
+            let cols = dir_view.read_with(cx, |view, _| view.grid_cols());
+            assert_eq!(mismatches, vec![], "at {width}px wide, cols={cols}");
+            assert_eq!(
+                first_line, cols,
+                "at {width}px wide the painted line and the arithmetic disagree"
+            );
+            assert_eq!(
+                dir_view.read_with(cx, |view, _| view.measured_grid_cols()),
+                cols,
+                "at {width}px wide the grid had not settled: another frame is still owed"
+            );
+        }
     }
 
     fn open_root(cx: &mut TestAppContext) -> (Entity<Pane>, &mut VisualTestContext) {
@@ -1759,6 +2191,31 @@ mod tests {
                 None,
                 "and the cursor is not left on a row that does not exist"
             );
+            // ...and the expansion bookkeeping for the dead folder is gone
+            // too, so it cannot come back pre-expanded from a stale cache if
+            // a folder of the same name is created later.
+            assert_eq!(
+                dir_view.expansion_state_sizes(),
+                (0, 0),
+                "the vanished folder's expansion state and cached children were pruned"
+            );
+        });
+
+        // A folder that is still listed keeps its expansion across the same
+        // kind of patch — the pruning rule is "gone from the listing", not
+        // "any change at all".
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/zeta"), cx)
+        });
+        cx.run_until_parked();
+        vfs.insert_tree("/root/b.txt", serde_json::Value::String("b".into()));
+        settle_watch(cx);
+        dir_view.read_with(cx, |dir_view, _| {
+            assert_eq!(
+                dir_view.expansion_state_sizes(),
+                (1, 1),
+                "an unrelated change must not collapse what is still there"
+            );
         });
     }
 
@@ -1819,7 +2276,7 @@ mod tests {
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root/zeta"), cx));
         cx.run_until_parked();
         let dir_view = dir_view_of(&pane, cx);
-        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.paste_into_current(cx)));
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.paste_into(None, cx)));
         cx.run_until_parked();
 
         assert!(
@@ -1859,7 +2316,7 @@ mod tests {
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root/zeta"), cx));
         cx.run_until_parked();
         let dir_view = dir_view_of(&pane, cx);
-        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.paste_into_current(cx)));
+        cx.update(|_, cx| dir_view.update(cx, |view, cx| view.paste_into(None, cx)));
         cx.run_until_parked();
 
         assert!(
@@ -1880,7 +2337,7 @@ mod tests {
         cx.update(|_, cx| {
             dir_view.update(cx, |view, cx| {
                 view.copy_selection(cx);
-                view.paste_into_current(cx);
+                view.paste_into(None, cx);
             })
         });
         cx.run_until_parked();
@@ -2049,6 +2506,75 @@ mod tests {
             cursor_index(&pane, cx),
             Some(cols - 1),
             "up from the first row holds rather than wrapping"
+        );
+    }
+
+    // §0 "Cursor movement (+shift- extends)" has a horizontal half that only
+    // the grid has an axis for. Without `shift-right`/`shift-left` the grid
+    // could grow a range only by a whole line (`shift-down` = +cols), so the
+    // tile beside the cursor was unreachable by keyboard entirely.
+    #[gpui::test]
+    fn shift_arrows_extend_the_grid_range_by_one_tile(cx: &mut TestAppContext) {
+        let (pane, cx) = open_grid(cx);
+        let dir_view = dir_view_of(&pane, cx);
+        let cols = cx.update(|_, cx| dir_view.read(cx).grid_cols());
+        assert!(cols > 2, "a one-tile-wide grid proves nothing here");
+
+        focus_dir_view(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                view.select_paths(&[Path::new("/grid/f003.txt")], cx)
+            })
+        });
+
+        cx.simulate_keystrokes("shift-right");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| dir_view.read(cx).selection().selected_paths()),
+            vec![
+                PathBuf::from("/grid/f003.txt"),
+                PathBuf::from("/grid/f004.txt")
+            ],
+            "one tile, not a whole line"
+        );
+        assert_eq!(cursor_index(&pane, cx), Some(4));
+
+        // ...and back the other way, past the anchor, which is what makes the
+        // range direction-agnostic rather than a growing-only band.
+        cx.simulate_keystrokes("shift-left shift-left shift-left");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| dir_view.read(cx).selection().selected_paths()),
+            vec![
+                PathBuf::from("/grid/f001.txt"),
+                PathBuf::from("/grid/f002.txt"),
+                PathBuf::from("/grid/f003.txt")
+            ],
+            "the anchor held while the far end walked left"
+        );
+    }
+
+    // The details list has nothing to the left or right of a full-width row,
+    // so the same keys are deliberately inert there — an alias of shift-up /
+    // shift-down would make one keystroke mean two different things.
+    #[gpui::test]
+    fn shift_arrows_are_inert_in_the_details_list(cx: &mut TestAppContext) {
+        let (_vfs, pane, cx) = open_root_with_vfs(cx);
+        let dir_view = dir_view_of(&pane, cx);
+        focus_dir_view(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                view.select_paths(&[Path::new("/root/zeta")], cx)
+            })
+        });
+        let before = cx.update(|_, cx| dir_view.read(cx).selection().selected_paths());
+
+        cx.simulate_keystrokes("shift-right shift-left");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| dir_view.read(cx).selection().selected_paths()),
+            before,
+            "the list selection did not move"
         );
     }
 

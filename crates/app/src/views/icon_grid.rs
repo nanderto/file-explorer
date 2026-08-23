@@ -19,10 +19,11 @@
 //! uses. Every color comes from the [`Theme`].
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
-    ClickEvent, Context, IntoElement, SharedString, Stateful, UniformList, div, prelude::*, px,
-    uniform_list,
+    ClickEvent, Context, IntoElement, RenderImage, SharedString, Stateful, UniformList, div, img,
+    prelude::*, px, uniform_list,
 };
 
 use crate::app_state::FsContext;
@@ -37,11 +38,11 @@ use crate::theme::Theme;
 pub(crate) const TILE_WIDTH: f32 = 96.0;
 /// One `uniform_list` item is one grid row, so this is the item height.
 pub(crate) const TILE_HEIGHT: f32 = 88.0;
-/// The square image slot at the top of a tile. Lane-4 thumbnails drop
-/// straight into it: [`tile_image`] returns the slot's *content*, so a real
-/// preview replaces the placeholder glyph without reshaping the tile — and
-/// this constant is the pixel size such a thumbnail should be requested at
-/// (`Platform::thumbnail(path, px)`).
+/// The square image slot at the top of a tile — the fixed box a decoded
+/// thumbnail is fitted into (see [`tile_image`]), and the logical size
+/// [`crate::thumbnails::THUMBNAIL_PX`] is derived from. Because the slot's
+/// size never depends on whether a preview has arrived, no tile geometry
+/// (and therefore no hit test above) changes when one does.
 pub(crate) const ICON_PX: f32 = 48.0;
 /// Selection tint alpha, matching the details list's selected row.
 const SELECTION_ALPHA: f32 = 0.35;
@@ -223,7 +224,15 @@ pub(crate) fn render_grid(
     uniform_list(
         "icon-grid-rows",
         grid_row_count(len, cols),
-        cx.processor(move |this, rows: Range<usize>, _window, cx| {
+        cx.processor(move |this, rows: Range<usize>, window, cx| {
+            // Runs after gpui has written this frame's real list bounds onto
+            // the shared scroll handle, so it is the earliest place a resize
+            // can be noticed — see `DirView::note_painted_grid_cols`. (The
+            // thumbnail window is *not* derived here: gpui calls this
+            // processor twice a frame with `0..1` merely to measure an item,
+            // and a request window that flipped like that would cancel its
+            // own fetch on every repaint. `DirView::render` drives it.)
+            this.note_painted_grid_cols(cols, window, cx);
             rows.map(|row| {
                 let items = row_items(row, cols, this.flat_rows().len());
                 let mut line = div()
@@ -275,6 +284,10 @@ fn render_tile(
     let cut_pending = FsContext::global(cx).clipboard.is_cut(&entry.path);
     let name: SharedString = SharedString::new(entry.name.clone());
     let click_entry = entry.clone();
+    // Resolved before the element chain is built, because it needs `this`
+    // mutably (the cache promotes on read) — and `None` simply means the
+    // placeholder, so an arriving preview swaps in without reflowing.
+    let thumbnail = this.thumbnail_image(entry);
 
     let mut tile = tile_frame(entry, ix)
         .cursor_pointer()
@@ -296,7 +309,7 @@ fn render_tile(
                 cx,
             );
         }))
-        .child(tile_image(entry, &theme))
+        .child(tile_image(entry, thumbnail, &theme))
         .child(
             div()
                 .w(px(TILE_WIDTH - 12.0))
@@ -363,32 +376,44 @@ fn tile_frame(entry: &fs_core::FileEntry, ix: usize) -> Stateful<gpui::Div> {
         .rounded(px(4.0))
 }
 
-/// The tile's fixed-size image slot.
+/// The tile's fixed-size image slot: the decoded thumbnail when there is one,
+/// the type glyph (folder vs file, from the theme) when there is not.
 ///
-/// Today it paints a type glyph (folder vs file) from the theme — the M4
-/// thumbnail lane replaces *this function's child* with the decoded
-/// [`fs_core::Thumbnail`] for `entry` at [`ICON_PX`], keeping the slot's size
-/// and position, so no tile geometry (and therefore no hit test above)
-/// changes when previews arrive.
-fn tile_image(entry: &fs_core::FileEntry, theme: &Theme) -> impl IntoElement + use<> {
-    div()
+/// The image is *fitted* inside the slot rather than filling it, so a portrait
+/// preview is not stretched (`Platform::thumbnail` preserves aspect ratio, so
+/// a thumbnail is usually smaller than the slot on one axis). Thumbnails are
+/// requested — and cancelled on scroll-away — by [`crate::thumbnails`]; this
+/// function only paints what has already arrived.
+fn tile_image(
+    entry: &fs_core::FileEntry,
+    thumbnail: Option<Arc<RenderImage>>,
+    theme: &Theme,
+) -> impl IntoElement + use<> {
+    let slot = div()
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
         .w(px(ICON_PX))
         .h(px(ICON_PX))
-        .rounded(px(3.0))
-        .bg(theme
-            .accent
-            .opacity(if entry.is_dir_like() { 0.20 } else { 0.10 }))
-        .text_size(px(20.0))
-        .text_color(theme.muted)
-        .child(SharedString::new_static(if entry.is_dir_like() {
-            "▣"
-        } else {
-            "▢"
-        }))
+        .rounded(px(3.0));
+    match thumbnail {
+        Some(image) => slot
+            .child(img(image).max_w(px(ICON_PX)).max_h(px(ICON_PX)))
+            .into_any_element(),
+        None => slot
+            .bg(theme
+                .accent
+                .opacity(if entry.is_dir_like() { 0.20 } else { 0.10 }))
+            .text_size(px(20.0))
+            .text_color(theme.muted)
+            .child(SharedString::new_static(if entry.is_dir_like() {
+                "▣"
+            } else {
+                "▢"
+            }))
+            .into_any_element(),
+    }
 }
 
 /// The tile of the entry being renamed (§4c): the label slot becomes the
@@ -402,6 +427,7 @@ fn render_rename_tile(
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
     let theme = this.theme().clone();
+    let thumbnail = this.thumbnail_image(&row.entry);
     let rename = this
         .rename
         .as_ref()
@@ -423,7 +449,7 @@ fn render_rename_tile(
     let mut tile = crate::rename::with_editor_actions(tile_frame(&row.entry, ix), &input, cx)
         .text_size(px(11.0))
         .text_color(theme.text)
-        .child(tile_image(&row.entry, &theme))
+        .child(tile_image(&row.entry, thumbnail, &theme))
         .child(div().w(px(TILE_WIDTH - 12.0)).flex_none().child(name_area));
 
     if let Some(message) = error {

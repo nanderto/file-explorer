@@ -10,30 +10,29 @@ limitations. Keep it truthful — this file is only useful if it matches the cod
 
 ## Status
 
-**M3 in progress** — the fs-core ops engine, the app job/event spine
-(JobsModel, dialogs, progress/toasts, undo), the keyboard file operations
-(cut/copy/paste with dimming, delete-to-trash, new folder/file) and the
-inline rename overlay (`f2` + slow-second-click) with `Duplicate` all work
-end-to-end, and the open directory is now **live** — the fs-core watcher is
-wired into the pane's listing pipeline, so external changes (and completed
-jobs) patch the listing with no explicit refresh. All three mouse surfaces are
-in: rubber-band marquee selection, **drag & drop** (within the pane, from
-Finder, out to Finder, with folder spring-load, plus the sidebar Favorites
-drag-to-add/reordering that M2 deferred), and now **context menus** — row and
-background, whose every row dispatches the same boxed action the keymap does.
-Two gaps closed with them: `New ▸ Folder / Text file…` now opens the §4c
-inline editor on a phantom row instead of auto-naming (nothing is created
-until the name is committed), and `DeletePermanently` — bound since the
-keyboard-ops step but reaching **no handler** — is now wired to the workspace's
-ConfirmDialog. The four mouse-surface lanes were then reviewed by four
-adversarial passes and the findings applied (watch registration moved off the
-UI thread, path-keyed row identity, an inline editor that could be orphaned by
-a watcher patch, Explorer's cross-volume copy rule, spring-load only on a
-target the drop would accept, click-in-empty-space deselect, and a patch that
-no longer yanks the scroll to the top); the three M3 visual scenarios
-(`cut_dimmed`, `context_menu_open`, `marquee_active`) are declared and **await
-their first baselines from the macOS runner**. 283 tests green (93 fs-core
-unit + 3 integration + 187 app).
+**M4 complete in code** — on top of M1–M3 (read-only browsing, the sidebar
+and in-place expansion, and the full file-operations engine: job spine, undo,
+keyboard operations, inline rename, marquee, drag & drop and context menus),
+M4 adds the second view and the second pane:
+
+* **Thumbnails in fs-core** — `Platform::thumbnail` (QuickLook on macOS behind
+  the `Platform` trait, with a deterministic stub elsewhere) feeding an
+  LRU byte-budget `ThumbnailCache` keyed on path + pixel size + content stamp.
+* **Icon view** — `views/icon_grid.rs`, a `uniform_list` whose items are grid
+  *lines*, with 2D keyboard navigation by index arithmetic, plus the two-button
+  view-mode switcher (`cmd-1` / `cmd-2`) on the pane.
+* **Dual pane** — `ToggleSplitPane` (`cmd-shift-o` and a titlebar button),
+  two fully independent `Pane` entities with a draggable splitter between them.
+* **Grid thumbnails** — requested for the visible band plus a line of margin,
+  off a window derived from the scroll offset and viewport (never from
+  `uniform_list`'s row range, which gpui also calls with `0..1` to measure),
+  cancelled when they scroll away, and pruned by full cache key.
+* **Auto-hide scrollbar** — an overlay, not a layout node, faded on a
+  `Spawner` timer so no captured baseline depends on wall-clock time.
+
+Four adversarial reviews of the M4 lanes have been applied; see the M4 rows of
+the change log for what they found. 355 tests green (113 fs-core unit +
+3 integration + 239 app).
 
 | Milestone | State |
 |---|---|
@@ -41,8 +40,8 @@ unit + 3 integration + 187 app).
 | Phase A architecture | ✅ merged (#3) |
 | M1 read-only browsing | ✅ merged (#4) |
 | M2 sidebar + in-place expansion | ✅ merged (#5) |
-| M3 file operations | 🔄 engine + job spine + keyboard ops + inline rename/duplicate + marquee + drag & drop + context menus + review fixes done; the three new visual scenarios need their baselines generated on the macOS runner |
-| M4 icon view + dual pane | 🔄 fs-core thumbnails + icon view / view-mode switcher done; dual pane and thumbnail rendering in progress. The `icon_grid` visual scenario needs its baseline generated on the macOS runner |
+| M3 file operations | ✅ engine + job spine + keyboard ops + inline rename/duplicate + marquee + drag & drop + context menus + review fixes; all baselines committed |
+| M4 icon view + dual pane | 🔄 complete in code, reviewed and fixed — fs-core thumbnails, icon view + view-mode switcher, dual pane, grid thumbnails (visible+margin, cancel-on-scroll-away) and the auto-hide scrollbar. **Every** visual baseline needs regenerating on the macOS runner, not only the two new scenarios — see Known gaps |
 | M5 → M8 ship | not started |
 
 ## Components
@@ -181,7 +180,11 @@ unit + 3 integration + 187 app).
 - `dir_view.rs` + `views/details_list.rs` (M1, expanded in M2): the details
   view — `uniform_list` over a **flat row projection** (ARCHITECTURE.md §2/§8):
   snapshot rows at depth 0, each expanded folder's background-loaded children
-  spliced beneath it with `depth + 1`. `expanded: BTreeSet<Arc<Path>>` +
+  spliced beneath it with `depth + 1` — **in `ViewMode::List` only**: a tile
+  has no indentation, no disclosure triangle, and `left`/`right` are 2D motion
+  there, so children projected into the grid painted as ordinary top-level
+  tiles of a folder they do not live in. `expanded` itself is untouched by the
+  switch, so `cmd-1` restores the tree exactly as it was. `expanded: BTreeSet<Arc<Path>>` +
   cached raw child listings (hidden entries included, loaded once; sorted and
   hidden-filtered at projection time with the snapshot's live
   `SortSpec`/show-hidden, so sort flips and the hidden toggle apply to
@@ -280,14 +283,93 @@ unit + 3 integration + 187 app).
   so no two gestures can disagree about what the pointer is over.
   `up`/`down` step a whole line and PageUp/PageDown a viewport of lines
   (`rows * cols` entries); `right`/`left` are horizontal motion in the grid
-  and expand/collapse in the list; `scroll_to_item` is called with `ix / cols`
-  in the grid, because a `uniform_list` item is a *line* there. The sortable
+  and expand/collapse in the list; `shift-left`/`shift-right`
+  (`ExtendSelectionLeft`/`Right`) extend the range by **one tile**, which is
+  the horizontal half of §0's "Cursor movement (+`shift-` extends)" and is
+  deliberately inert in the details list, where a full-width row has nothing
+  beside it to extend onto; `scroll_to_item` is called with `ix / cols`
+  in the grid, because a `uniform_list` item is a *line* there. A switch
+  between modes also scrolls the cursor back into view on the first frame
+  painted in the new mode (`painted_mode`): the two views share one **pixel**
+  scroll offset but measure their items differently (22px per entry vs 88px
+  per `cols` entries), so the selection the switch preserves would otherwise
+  often be off-screen with nothing to bring it back. The sortable
   column header paints only in list mode (the `SortBy` action still works — it
-  lives on the pane). The tile's image slot (`ICON_PX` 48) paints a type
-  placeholder today; the thumbnail lane replaces that slot's *child*, so no
-  tile geometry — and therefore no hit test — changes when previews arrive.
+  lives on the pane). The tile's image slot (`ICON_PX` 48) paints the decoded
+  thumbnail when there is one and a type glyph when there is not — the slot's
+  size never depends on which, which is what lets a preview arrive mid-scroll
+  without reflowing the grid or invalidating a hit test (see `thumbnails.rs`).
   A new `icon_grid` visual scenario (grid + a two-entry selection) is declared
   and **awaits its first baseline from the macOS runner**.
+- `thumbnails.rs` (M4, §8 "Icon grid — generate only for visible+margin
+  rows"): the **fifth field-shaped machine** on `DirView` (after rename,
+  marquee, drop and menu). `ThumbnailState` holds fs-core's byte-budget
+  `ThumbnailCache` (the decoded-RGBA source of truth), a small
+  `HashMap<ThumbnailKey, Arc<RenderImage>>` of the GPU-side images the painted
+  tiles actually reference, the set of keys with **no preview available**, and
+  one `Task` slot.
+  - **Where the window comes from**: the icon grid's `uniform_list` processor
+    is the only code that knows what is on screen, so it calls
+    `DirView::request_thumbnails(rows, cols, …)` with the grid-row range gpui
+    asked it to paint; `request_window` (pure, unit-tested) widens that by
+    `MARGIN_ROWS` = 1 line either side and converts it to entry indices,
+    saturating throughout because a row range can outlive a re-projection.
+    Folders are skipped — Explorer previews file *content*.
+  - **Cancel on scroll-away**: one task fetches the whole window
+    sequentially, and a window change *replaces* it — which drops it, and with
+    it the in-flight `Platform::thumbnail` future for a tile that has left the
+    viewport. Same single-slot pattern as the marquee's autoscroll ticker.
+    Proven, not asserted-by-comment: a test installs a deliberately **slow**
+    recording `Platform` (it parks on a `Spawner` timer), catches the top
+    band's first fetch in flight, scrolls to the bottom, and shows that fetch
+    *started and never finished* while the surviving window's did.
+  - **Nothing blocking on the UI thread**: each call is awaited via
+    `cx.background_executor().spawn`, so neither the QuickLook round-trip nor
+    the `image` fallback decode can reach the render thread even if a
+    `Platform` implementation forgot to unblock. Only the cache insert and the
+    `notify` run on the UI thread.
+  - **Idempotence** is what keeps this out of a render loop: an arriving
+    thumbnail notifies, the next frame re-requests the *same* window, and a
+    `fetching` flag makes that a no-op. A window that has since gained entries
+    is picked up when the flag clears, rather than by cancelling live work.
+  - **Two caches, on purpose**: the fs-core cache is the bounded bitmap store
+    (64 MB), the image map is viewport-sized and pruned on every window move,
+    with `cx.drop_image` handing each texture back rather than leaking an
+    atlas slot for the life of the window. Scrolling back is therefore a
+    re-upload, not a re-decode. Conversion is one pass:
+    fs-core hands out non-premultiplied **RGBA**, `RenderImage` is **BGRA**
+    (gpui's own loaders do the same swap), asserted by a unit test on a
+    known pixel — a silent channel swap would look plausible and be wrong.
+  - An `Err` from `Platform::thumbnail` is an ordinary "no preview": the key
+    goes in `missing` (stamped, so an edited file is retried) and the tile
+    keeps its glyph. Nothing is surfaced to the user and nothing retries in a
+    loop, per the trait's contract.
+- `scrollbar.rs` (M4, §8 widget list "Auto-hide scrollbar"): a thin overlay,
+  not a layout node — an absolutely-positioned child of the marquee's list
+  surface (the same positioning context as the rubber band), so it reserves no
+  width and shifts no row or tile, which matters because every mouse hit test
+  is arithmetic over the painted band. `thumb(viewport, content, offset)` is
+  pure and unit-tested: `None` when there is nothing to scroll (an auto-hide
+  bar shows *no* chrome for a folder that fits), proportional height with a
+  24px floor, clamped inside the track for over-scrolled or stale offsets, and
+  NaN-safe. Visibility is driven by comparing the scroll offset between two
+  frames in `render` (which deliberately does **not** notify — the frame it is
+  deciding about is the one being built), and the fade is a single-slot
+  `Spawner::timer` task, so a second scroll restarts the delay instead of
+  letting the first expire. **Determinism**: opening a folder is not a scroll,
+  so a captured scenario that never scrolls never shows a bar, and no baseline
+  depends on when the screenshot was taken; the fade is a timer, not an
+  animation, so there are exactly two states. `DirView::content_height(cx)` is
+  the one mode-aware content-height calculation, now shared with the marquee's
+  autoscroll clamp — which had been counting a grid in *row* heights and could
+  therefore scroll a long way past the last line of tiles.
+- `actions.rs` / `context_menu.rs` (M4): `Paste` is now parameterized —
+  `Paste { dest: Option<PathBuf> }` (`no_json`, like `SortBy`). `None` means
+  the pane's open directory (`cmd-v`, the background menu); the **row** menu
+  passes the right-clicked folder, so Explorer's "paste into this folder"
+  works through the one `DirView` handler rather than a second implementation
+  of paste. `MenuFacts` carries the destination so the menu builders stay pure.
+  Closes the Known-gaps entry that had been waiting on the M8 menu bar.
 - `rename.rs` + the rename row in `views/details_list.rs` (M3): the §4c
   inline-rename state machine as a **field** of `DirView`
   (`rename: Option<RenameState>`), not an entity. `begin_rename` (from `f2`
@@ -597,6 +679,55 @@ unit + 3 integration + 187 app).
   selection (singular/plural message) and `FileOp::Delete` is submitted only on
   `Confirmed`. `shift-delete` and the row menu's **Delete Permanently** are the
   same one path.
+- `workspace.rs` (M4 dual pane, §0 `ToggleSplitPane` / §2 "Dual-pane readiness
+  without PaneGroup"): `cmd-shift-o` (Workspace context) and a titlebar toolbar
+  button — which **dispatches the same boxed action**, so the toggle logic
+  exists once — grow `panes` from one entity to two and back. No recursive
+  member tree: the flat `Vec` + `active_pane_ix` the plan reserved for this is
+  what changed, plus a parallel `pane_subscriptions: Vec<Subscription>` so a
+  closed pane's `PaneEvent` subscription dies with it instead of lingering.
+  Decisions worth knowing:
+  - **A fresh split seeds only two things**: the *directory* (copied from the
+    active pane — a split whose new half said "No folder open" would make the
+    user re-navigate to where they just were) and the *view mode*, set to
+    `ViewMode::complement()` so the split lands as a details list beside an
+    icon grid (plan §2's blueprint screenshot). Everything else — history,
+    sort, selection, address bar, status line, scroll, `ListingCache` — is the
+    new `Pane`'s own and starts empty. `show_hidden` stays workspace-global
+    (§0 fans it out), so the new pane adopts the current value.
+  - **Collapsing keeps the ACTIVE pane**, not pane 0: collapsing while you work
+    in the right-hand pane must not throw away the directory you are looking
+    at. The closed pane's state is *not* stashed for a later re-split (a
+    resurrected pane pointing at a directory that has since changed is worse
+    than a fresh one); dropping the entity drops its watch registration, load
+    tasks and watch pump with it.
+  - **The splitter** reuses the M2 hand-built approach: `first_pane_width:
+    Option<f32>` where `None` = an even split (both panes `flex_1`, which is
+    what a fresh split and every collapse reset to) and a drag pins a width.
+    Its drag math is relative to the **pane strip**, not the body row, so the
+    strip carries its own `on_drag_move` and each handler ignores the other's
+    `SplitterSide` — gpui's drag-move listeners are not hover-gated, so both
+    fire for every mouse move and would otherwise fight over one width with
+    two different origins. `clamp_pane_width` (pure, unit-tested) keeps both
+    panes ≥ `PANE_MIN_WIDTH` = 240; the setter rejects non-finite widths, which
+    `f32::clamp` propagates rather than refusing.
+  - **Which pane is active is visible**: while split, each pane wears a 2px
+    marker above it, the active one in the theme accent. A focus ring inside a
+    pane would be invisible when focus sits on a breadcrumb or status line, and
+    "which pane does `cmd-z` act on" has to be answerable by looking.
+  - **Active-pane tracking** now has tests, which found the sharp edge: gpui
+    zeroes both focus paths of an **inactive** window, so no `focus_in`
+    listener fires there — a test window starts inactive, and a test that
+    focuses a pane must `window.activate_window()` first. Real usage always
+    does (a click both activates the window and focuses the pane). Every
+    workspace-level command already routed through `active_pane()`; the audit
+    found no index-0 assumptions left in `workspace.rs`, `sidebar.rs`, `main.rs`
+    or the visual runner, and the routing is now pinned by tests (`cmd-l`,
+    `cmd-shift-.` fan-out, `shift-delete` on the active pane's selection).
+  - **Cross-pane drag** needed no code: the payload is window-global, and
+    ARCHITECTURE's claim is now a test — a real mouse drag from the left pane
+    into the right one **moves** (one volume, per `drop_copies`), with the
+    destination pane arming the target and the source pane clearing its own.
 - `app_state.rs` (M3): `FsContext` grew `queue: Arc<JobQueue>`,
   `undo: SharedUndoStack`, and `jobs: Entity<JobsModel>`;
   `app_state::install(cx, vfs, spawner, opener, platform)` is the single
@@ -1136,16 +1267,37 @@ component sections; this list is the scannable index.
   selected rows beside a panel claiming nothing is selected. Cosmetic, but it
   makes four committed baselines look wrong to a reviewer. *M5 (info panel).*
 
-- **The three M3 visual scenarios are declared but have no baselines yet.**
-  `cut_dimmed`, `context_menu_open` and `marquee_active` are in `scenarios()`
-  (all three driven by real simulated mouse input at real painted pixels, via
-  the new public `DirView::list_viewport()` / `DirView::ROW_HEIGHT`), and a
-  scenario with no committed baseline **hard-fails** the macOS visual job — so
-  `gh workflow run update-visual-baselines.yml --ref m3-file-operations` has to
-  run on this branch before CI can be green. That run also confirms the two
-  layout changes their authors flagged (lane 2's `relative/flex_1/min_h(0)`
-  wrapper between the header and the row list, lane 3's Favorites section
-  wrapper) are pixel-neutral. *This PR, from the orchestrating session.*
+- **Every committed visual baseline needs regenerating for M4, not just the two
+  new scenarios.** `icon_grid` and `split_panes` are declared in `scenarios()`
+  and have no baseline at all, and a scenario with no committed baseline
+  **hard-fails** the macOS visual job. But the M4 chrome changes the other
+  twelve too: `Workspace::render_split_toggle` adds a button to the titlebar,
+  which is painted in every baseline, and the per-pane view-mode switcher adds
+  controls to every pane chrome row. So
+  `gh workflow run update-visual-baselines.yml --ref m4-icon-view-dual-pane`
+  rewrites all fourteen PNGs, and the required aggregate `CI` check (which
+  `needs: visual-tests`) is red until it has run. The M3 scenarios
+  (`cut_dimmed`, `context_menu_open`, `marquee_active`) *do* now have committed
+  baselines — that gap is closed. Note also that the code ships the scenario
+  as `split_panes`; ARCHITECTURE.md §8 was amended to match, rather than the
+  scenario renamed. *This PR, from the orchestrating session.*
+- **Thumbnails are requested for every non-folder in the window, one at a
+  time.** The only filter in `thumbnails.rs::pending_thumbnails` is
+  `!is_dir_like()` — no extension/UTI allowlist and no size ceiling — so an
+  icon-view pass over `/usr/lib` or a `target/` directory asks QuickLook for a
+  preview of every object file. And because the single-slot task awaits one key
+  at a time, one pathological file head-of-line-blocks every later tile in the
+  window for up to `MacPlatform`'s 10 s QuickLook timeout plus the
+  `image`-crate fallback attempt, leaving the tiles after it on their type
+  glyphs. Bounded and correct, just slower than it should be: the fix is a
+  previewable-type allowlist plus a size ceiling before requesting, and a small
+  amount of concurrency. Related and deliberate: a cancelled request is *not*
+  interrupted — `Spawner::unblock` polls the blocking closure exactly once, so
+  a QuickLook wait already handed to the background queue runs to completion and
+  has its result discarded (one orphan per cancellation; documented on
+  `Platform::thumbnail` and in the `thumbnails.rs` module docs). A real cancel
+  token through `unblock` would let the macOS path call `cancelRequest`
+  immediately. *M5 (info panel previews), which needs the same allowlist.*
 - **The open context menu's submenu is not pixel-pinned.** `context_menu_open`
   captures the background menu with no submenu expanded: opening one from the
   runner means computing a row centre from `context_menu.rs`'s private
@@ -1190,19 +1342,24 @@ component sections; this list is the scannable index.
   reading the scroll handle at capture time, which changes what several pane
   tests assert. *Still open after the M4 icon view: the grid scrolls by
   `ix / cols` items, which is the same handle and the same missing capture.*
-- **Expansion state is never pruned when a folder leaves the listing.** The
-  *selection* and the *cursor* are (a folder that vanished stops contributing
-  its cached children — see `DirView::listing_ids`), and nothing invisible can
-  be acted on any more, but `expanded`/`children` keep an entry for the dead
-  folder until the pane navigates away. Harmless today: the projection only
-  injects children of folders it actually paints. *Tidy up when M4 gives the
-  expansion state a second consumer.*
-- **The row menu's Paste pastes into the pane's directory, not into the
-  right-clicked folder** (Explorer pastes into the folder). It dispatches the
-  one `Paste` action; giving the menu its own destination would be a second
-  implementation of paste. Resolving it properly means a parameterized
-  `Paste { dest }`-style action so the single handler still owns the logic.
-  *Revisit when the M8 menu bar forces the action set to be parameterized.*
+- ~~**Expansion state is never pruned when a folder leaves the listing**~~
+  **resolved (2026-08-23)**: `DirView::prune_expansion_state`, called from the
+  same `retain_selection_in_listing` pass that prunes the selection, drops
+  `expanded`, `children` **and any in-flight `_child_loads`** for folders no
+  longer in the listing. A key survives iff some ancestor of it is still a row,
+  so a collapsed folder's cached children live on while it is listed and go
+  with it when it does not. Two bugs rather than mere untidiness: the maps grew
+  for the life of the pane (a `children` entry is a whole child listing), and a
+  folder deleted and later re-created with the same name came back
+  **pre-expanded from a stale cache**.
+- ~~**The row menu's Paste pastes into the pane's directory, not into the
+  right-clicked folder**~~ **resolved (2026-08-23)**: the action was
+  parameterized as predicted — `Paste { dest: Option<PathBuf> }`, `None`
+  meaning the open directory — so the row menu pastes into the folder under the
+  pointer with the same single handler. The right-clicked *entry* decides, not
+  the selection: a right-click on a folder inside a wider selection is still a
+  right-click on that folder. `Sort by ▸`'s direction rows still wait on M8;
+  they need `SortBy { key, direction }`, the same shape.
 - **Marquee edge autoscroll is rarely reachable in the details view.** Rows
   are full-width (Explorer's own details-view behavior), so the only empty
   space a marquee may start in is *below the last row* — which exists only
@@ -1215,7 +1372,11 @@ component sections; this list is the scannable index.
   of its last tile, and `index_at_content` correctly calls that empty), so the
   gesture is routinely reachable there; giving details rows Explorer's narrower
   (columns-only) hit region would make it routinely reachable in the list too.
-  *Details-list half only.*
+  Deliberately **not** done at M4: narrowing the row's hit region changes what
+  a click, a drag start and a right-click land on in the list, i.e. the three
+  gestures M3 spent its review fixes on, for a gain the grid already delivers.
+  *Details-list half only; M7 polish, with a test matrix for the new dead
+  zone.*
 - **Finder interop can only be proved on a real Mac.** The *inbound* half is
   covered headlessly (gpui turns a platform file drop into an internal
   `ExternalPaths` drag, so `FileDropEvent`s drive the real code path), but the
@@ -1250,7 +1411,20 @@ component sections; this list is the scannable index.
   or a volume row does nothing, and dropping a folder on the Favorites list
   pins it rather than moving it inside that favorite (the sidebar means "pin a
   place" here). Explorer moves into nav-pane folders; wiring the tree rows to
-  the same `plan_drop` is a small follow-up. *M4 (with cross-pane drag).*
+  the same `plan_drop` is a small follow-up. *Still open after M4's cross-pane
+  drag, which needed no sidebar work.*
+- **Dual pane has no keyboard way to switch panes and no pane-swap.** The
+  active pane follows *focus*, so it changes by clicking (or by the split
+  itself); there is no `tab`/`ctrl-tab` "focus the other pane" binding and no
+  "swap the two panes" or "open the other pane's folder here" command. §0 lists
+  none of them, so adding one means adding a table row first. *M7/M8 chrome.*
+- **Neither the split nor the splitter widths are persisted.** `panes.len()`,
+  `first_pane_width`, `sidebar_width` and `info_panel_width` are plain
+  `Workspace` fields, so every launch starts single-pane at the default widths.
+  `settings.rs` is the place for it. *M7 (settings).*
+- **The info panel is workspace-level, not per-pane**, so while split it still
+  shows one placeholder for the whole window rather than the active pane's
+  selection. *M5 (info panel), which owns the "whose selection" question.*
 - **A new entry is not created if the naming editor is abandoned** — the §4c
   design's consequence, and a deliberate divergence from Explorer, which
   creates `"New folder"` immediately and leaves it named if you press Escape.
@@ -1305,15 +1479,36 @@ component sections; this list is the scannable index.
   triggers CI — after baselines land, push a normal commit so the required `CI`
   check runs on the new HEAD. *Standing procedure.*
 
-- **No auto-hide scrollbar** (§8 widget list, "M4 polish"): both views use
-  `uniform_list`'s default scrolling, with no thin fading overlay bar. The icon
-  grid makes it more noticeable than the list did, since a grid is usually
-  taller than one viewport. *M4 polish / M7 chrome.*
-- **Icon-grid tiles paint a type placeholder, not a thumbnail.** `fs-core`'s
-  `Platform::thumbnail` + `ThumbnailCache` exist; the tile's fixed-size image
-  slot is the drop-in point (`icon_grid::tile_image`, `ICON_PX`), deliberately
-  shaped so a real preview changes no geometry and therefore no hit test.
-  *M4 thumbnail wiring.*
+- ~~**No auto-hide scrollbar**~~ **resolved (2026-08-23)**: `scrollbar.rs`, a
+  thin theme-colored overlay on a `Spawner::timer` fade. It is an
+  **indicator, not a control**: it cannot be dragged (no jump-to-position, no
+  page-on-track-click), and there is no horizontal bar because neither view
+  scrolls horizontally. *Dragging it: M7 chrome.*
+- **The scrollbar has no visual scenario.** It is unit-tested (thumb geometry)
+  and behavior-tested (appears on a scroll, fades on fake time), but no
+  captured frame pins how it looks, because every fixture folder fits in one
+  viewport and pinning it means adding a deliberately tall fixture tree. Cheap
+  to add with one; nothing else needs it yet. *M7 chrome, with the settings
+  work that adds more scenarios anyway.*
+- ~~**Icon-grid tiles paint a type placeholder, not a thumbnail**~~
+  **resolved (2026-08-23)**: see `thumbnails.rs`. What is deliberately *not*
+  there:
+  - **Thumbnails are per-pane, and per-`DirView`.** Two panes showing the same
+    folder decode the same previews twice, and navigating away and back
+    re-fetches (the cache lives on the view, and a `DirView` outlives
+    navigation but nothing shares it). A `FsContext`-level cache would fix both
+    and needs a decision about whose byte budget it is. *M7.*
+  - **No cross-tile request dedup.** The single-slot task means one fetch at a
+    time per pane, so a window is filled serially; a slow first preview delays
+    the rest of its window rather than being overtaken. Correct and bounded,
+    but not parallel. *Revisit only if a real folder of large images feels
+    slow on a Mac.*
+  - **Only the icon grid has previews.** The details list still shows no
+    thumbnail column and no per-row icon; Explorer's details view shows a small
+    one. *M7 polish.*
+  - **The tile requests at 2× `ICON_PX` unconditionally**, rather than reading
+    the window's real scale factor — sharp on a Retina display, slightly
+    over-fetched on a 1× one. *Accepted.*
 - **Tile labels are single-line and truncated**; Explorer wraps an icon-view
   label to two lines and shows the full name for the selected tile. Wrapping
   would make tile height depend on the label, which the fixed-height
@@ -1363,4 +1558,7 @@ component sections; this list is the scannable index.
 | 2026-08-23 | — | M3 context menus (`context_menu.rs`): row + background menus whose every row dispatches a boxed `actions.rs` action via `window.dispatch_action`, right-click hit-tested with the shared row-band arithmetic (selects its target first), disabled-not-absent rows, one-level `New ▸` / `Sort by ▸` submenus, full-window scrim dismissal + `escape` via a `menu` key-context token. Closes two gaps: `New ▸ Folder / Text file…` now opens the §4c inline editor on a phantom row (`is_new_entry`, nothing created until commit), and `DeletePermanently` — bound but unhandled — is wired to the workspace ConfirmDialog. 266 tests. |
 | 2026-08-23 | — | M3 review fixes + visual scenarios: watch registration **and** unregistration moved off the UI thread (`BackgroundWatchGuard`) and no longer torn down by an in-place reload (`watch_generation`); details/Favorites rows keyed by **path** so a mid-gesture re-projection can't hand a press to another entry; an inline editor whose row vanishes is torn down (it used to lock the whole view out) with focus handed back; a watcher patch no longer re-applies `scroll_top`; `listing_ids` stops the selection/cursor retaining children of a folder that left the listing; Explorer's volume rule for drag & drop (`drop_copies`: move within a volume, copy across, ⌥ copies, ⇧ moves) with the drop reading the armed state instead of the release modifiers; spring-load armed only for an accepted target and re-armed after a spent timer; a press in empty space deselects; the checked `Sort by` row is inert; `OpenSelected` opens the whole selection; Favorites drop zone given a minimum height, tints for every payload it accepts, and queued (never cancelled) probes. New scenarios `cut_dimmed`, `context_menu_open`, `marquee_active` — **baselines pending from the macOS runner**. 283 tests (93 fs-core unit + 3 integration + 187 app). |
 | 2026-08-23 | — | M4 view modes: `ViewMode` on `Pane` with `SetViewList`/`SetViewIcons` (`cmd-1`/`cmd-2` + toolbar switcher, same boxed actions) and `SetViewColumns` as an explicit "not implemented" notice; `views/icon_grid.rs` — chunked-row `uniform_list`, pure `(cols, len)` geometry, 2D index-arithmetic navigation, DirView's shared selection, cut-dimming/drag/drop/rename reuse; `rename::with_editor_actions` extracted; mode-aware `index_at_content` shared by marquee, drag and context menu; `icon_grid` visual scenario declared (baseline pending). 320 tests (112 fs-core unit + 3 integration + 205 app). |
+| 2026-08-23 | — | M4 dual pane: `ToggleSplitPane` (`cmd-shift-o` + titlebar button dispatching the same boxed action) grows `panes` 1↔2 on the flat `Vec`; a fresh pane inherits the active pane's directory and opens in the complementary `ViewMode`, everything else independent; collapsing keeps the **active** pane; hand-built pane splitter (`first_pane_width`, `clamp_pane_width`, 240px minimum per pane) reusing the M2 approach; per-pane active marker; `PaneEvent::FocusIn` active-pane routing now tested (incl. a real click) and cross-pane drag verified end to end; `split_panes` visual scenario declared (baseline pending). 330 tests (112 fs-core unit + 3 integration + 215 app). |
 | 2026-08-23 | — | M4 fs-core thumbnails: `Platform::thumbnail(path, px)` returning decoded RGBA (`thumbnail::Thumbnail`), QuickLookThumbnailing on macOS with a bounded wait and an `image`-crate fallback tier, deterministic synthesized pixels in the stub, and the LRU **byte-budget** `ThumbnailCache` keyed on `(path, px, mtime+size)`. 302 tests (112 fs-core unit + 3 integration + 187 app). |
+| 2026-08-23 | — | M4 thumbnails in the grid + polish: `thumbnails.rs` — visible+margin request window off the `uniform_list` processor's row range, **single-`Task`-slot cancel-on-scroll-away** (proven with a slow recording `Platform`), every fetch awaited on the background executor, RGBA→BGRA `RenderImage`s pruned with `drop_image` on each window move; `scrollbar.rs` — pure thumb geometry + `Spawner::timer` fade, invisible until the list actually scrolls so no baseline depends on the wall clock; `DirView::content_height` shared with the marquee autoscroll clamp (which had been measuring the grid in row heights). Three Known gaps closed: `Paste { dest }` parameterized so the row menu pastes **into** the right-clicked folder, expansion state (and in-flight child loads) pruned when a folder leaves the listing, auto-hide scrollbar built. 340 tests (112 fs-core unit + 3 integration + 225 app). |
+| 2026-08-24 | — | **M4 adversarial-review fixes.** Four blockers: (1) a pinned pane splitter is now clamped at *layout* time — the pinned first wrapper is `flex_shrink_1` with `min_w(PANE_MIN_WIDTH)` on **both** wrappers, so widening the side panels or narrowing the window degrades the pin instead of squeezing the second pane's breadcrumb, rows and free-space status line to 0px with the splitter parked out of reach; (2) the thumbnail request window is derived from the scroll offset + list viewport in `DirView::render`, never from the `uniform_list` row range (gpui calls that processor twice a frame with `0..1` to measure an item, which flipped the window every frame and cancelled + restarted the in-flight fetch, so no thumbnail slower than the repaint cadence ever loaded); (3) foreign probe artifacts removed from the tree; (4) `painted_cols` — the grid's hit tests (`index_at_content`, `tiles_in_rect`, `content_height`, `page_step`, scroll-into-view) read the column count the last frame actually *painted* with, and `note_painted_grid_cols` notifies when a fresh measurement disagrees, so a resize no longer left every right-click, drop-target and marquee naming a different entry than the tile under the pointer. Two majors beyond the thumbnail window (per-frame `drop_image`/re-upload churn, and pruning keyed on path instead of the full `ThumbnailKey`, which leaked the superseded stamp of a file rewritten while visible — `missing` is pruned the same way now): `projected_rows` skips the in-place-expansion splice in `ViewMode::Icons` (children were painting as top-level tiles with no depth cue and no way to collapse them), and `FileClipboard::paste_op` refuses a destination inside or equal to a source **without consuming the clipboard**, the same rule `drag::plan_drop` already applied — a cut folder pasted onto itself used to fail at execution *and* lose the cut. Two minors: `shift-left`/`shift-right` (`ExtendSelectionLeft`/`Right`) extend the grid range by one tile — inert in the details list, where a full-width row has nothing beside it — and the first frame in a new `ViewMode` scrolls the cursor back into view (`painted_mode`), because the two views share one *pixel* offset while measuring items differently. ARCHITECTURE §0 amended for both the new horizontal row and `SetViewColumns` having no trigger in v1. 355 tests (113 fs-core unit + 3 integration + 239 app). |

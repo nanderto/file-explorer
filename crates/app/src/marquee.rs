@@ -477,7 +477,10 @@ impl DirView {
             return false;
         }
         let viewport = list_viewport(self);
-        let content = self.flat_rows().len() as f32 * ROW_HEIGHT;
+        // Mode-aware: in the icon grid the content is `ceil(n / cols)` *tile*
+        // heights, not `n` row heights, so the clamp would otherwise let the
+        // autoscroll run far past the last line of tiles.
+        let content = self.content_height(cx);
         let max_scroll = (content - f32::from(viewport.size.height)).max(0.0);
         let offset = scroll_y(self);
         let target = (offset - scroll.step()).clamp(-max_scroll, 0.0);
@@ -533,6 +536,10 @@ pub(crate) fn list_surface(
         .on_mouse_up_out(MouseButton::Left, cx.listener(DirView::end_marquee))
         .child(body)
         .children(render_marquee(view))
+        // The M4 auto-hide scrollbar: an absolute overlay in the same
+        // positioning context as the band, so it reserves no width and
+        // shifts no row (see `crate::scrollbar`).
+        .children(crate::scrollbar::render(view, cx))
 }
 
 /// The band itself: an absolutely-positioned translucent accent rectangle,

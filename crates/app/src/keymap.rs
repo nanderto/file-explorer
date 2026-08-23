@@ -46,6 +46,21 @@ pub fn init(cx: &mut App) {
             ExtendSelectionPrev,
             Some("DirView && !renaming"),
         ),
+        // The horizontal half of the same §0 row, which exists only in the
+        // M4 icon grid: `shift-down` there jumps a whole line, so without
+        // these the grid could only grow a range by `cols` entries at a time.
+        // Inert in the details list (see the action's own comment), and the
+        // `TextInput` rows below win while an inline editor has focus.
+        KeyBinding::new(
+            "shift-right",
+            ExtendSelectionRight,
+            Some("DirView && !renaming"),
+        ),
+        KeyBinding::new(
+            "shift-left",
+            ExtendSelectionLeft,
+            Some("DirView && !renaming"),
+        ),
         KeyBinding::new("pageup", PageUp, Some("DirView && !renaming")),
         KeyBinding::new("pagedown", PageDown, Some("DirView && !renaming")),
         // §0 Views (M2): in-place folder expansion. The §0 "triangle click"
@@ -57,7 +72,13 @@ pub fn init(cx: &mut App) {
         // §0 Cut/paste (M3): cut sources render dimmed; paste moves on cut
         KeyBinding::new("cmd-x", Cut, Some("DirView && !renaming")),
         KeyBinding::new("cmd-c", Copy, Some("DirView && !renaming")),
-        KeyBinding::new("cmd-v", Paste, Some("DirView && !renaming")),
+        KeyBinding::new(
+            "cmd-v",
+            // `cmd-v` always means "into the folder I am looking at"; only the
+            // row context menu carries a destination of its own.
+            Paste::default(),
+            Some("DirView && !renaming"),
+        ),
         // §0 Rename (M3): f2, or a slow second click handled entirely by
         // DirView's own click-arming state (never a keymap row).
         KeyBinding::new("f2", RenameSelected, Some("DirView && !renaming")),
@@ -89,6 +110,10 @@ pub fn init(cx: &mut App) {
         // handler says so out loud rather than pretending to switch.
         KeyBinding::new("cmd-1", SetViewList, Some("Pane")),
         KeyBinding::new("cmd-2", SetViewIcons, Some("Pane")),
+        // §0 Split-pane toggle (M4). Workspace context, not Pane: the
+        // workspace owns `panes` and decides which pane survives a collapse,
+        // and the binding must work with focus anywhere in the window.
+        KeyBinding::new("cmd-shift-o", ToggleSplitPane, Some("Workspace")),
         // §0 Undo / Redo (M3)
         KeyBinding::new("cmd-z", Undo, Some("Workspace")),
         KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),
@@ -179,6 +204,8 @@ mod tests {
                 .on_action(record!(SelectLast, "SelectLast"))
                 .on_action(record!(ExtendSelectionNext, "ExtendSelectionNext"))
                 .on_action(record!(ExtendSelectionPrev, "ExtendSelectionPrev"))
+                .on_action(record!(ExtendSelectionRight, "ExtendSelectionRight"))
+                .on_action(record!(ExtendSelectionLeft, "ExtendSelectionLeft"))
                 .on_action(record!(PageUp, "PageUp"))
                 .on_action(record!(PageDown, "PageDown"))
                 .on_action(record!(ExpandSelected, "ExpandSelected"))
@@ -203,6 +230,8 @@ mod tests {
                 .on_action(record!(ConflictSkip, "ConflictSkip"))
                 .on_action(record!(ConflictKeepBoth, "ConflictKeepBoth"))
                 .on_action(record!(ToggleApplyToAll, "ToggleApplyToAll"))
+                .on_action(record!(ToggleHiddenFiles, "ToggleHiddenFiles"))
+                .on_action(record!(ToggleSplitPane, "ToggleSplitPane"))
                 .size_full()
         }
     }
@@ -230,7 +259,7 @@ mod tests {
     fn dir_view_context_dispatches_every_m1_binding(cx: &mut TestAppContext) {
         let (fired, cx) = probe(cx, "DirView");
         cx.simulate_keystrokes("enter backspace alt-up cmd-a down up home end pageup pagedown");
-        cx.simulate_keystrokes("shift-down shift-up right left");
+        cx.simulate_keystrokes("shift-down shift-up shift-right shift-left right left");
         cx.simulate_keystrokes("cmd-x cmd-c cmd-v delete shift-delete");
         cx.simulate_keystrokes("f2 cmd-d");
         assert_eq!(
@@ -248,6 +277,8 @@ mod tests {
                 "PageDown",
                 "ExtendSelectionNext",
                 "ExtendSelectionPrev",
+                "ExtendSelectionRight",
+                "ExtendSelectionLeft",
                 "ExpandSelected",
                 "CollapseSelected",
                 "Cut",
@@ -278,6 +309,21 @@ mod tests {
         let (fired, cx) = probe(cx, "Pane");
         cx.simulate_keystrokes("cmd-1 cmd-2");
         assert_eq!(*fired.borrow(), vec!["SetViewList", "SetViewIcons"]);
+    }
+
+    // §9 dispatch guard for the M4 `Workspace` split-pane row. The real
+    // entity's split/collapse behavior is covered in `workspace.rs` tests;
+    // this is the tripwire for the binding and its context (a `Pane`-context
+    // binding would fire only while a pane had focus, and the toolbar button
+    // dispatches with focus on the workspace root).
+    #[gpui::test]
+    fn workspace_context_dispatches_the_split_pane_row(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "Workspace");
+        cx.simulate_keystrokes("cmd-shift-o cmd-shift-.");
+        assert_eq!(
+            *fired.borrow(),
+            vec!["ToggleSplitPane", "ToggleHiddenFiles"]
+        );
     }
 
     // §8 marks Miller columns a post-v1 stretch, so `SetViewColumns` has no

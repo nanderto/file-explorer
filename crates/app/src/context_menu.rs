@@ -33,6 +33,8 @@
 //! guess — the menu's real geometry, including the `anchored()` fit, is part
 //! of what the tests exercise.
 
+use std::path::PathBuf;
+
 use fs_core::{SortKey, SortSpec};
 use gpui::{
     Action, AnyElement, App, Context, Div, MouseButton, MouseDownEvent, Pixels, Point,
@@ -177,20 +179,33 @@ pub struct MenuFacts {
     pub clipboard_empty: bool,
     pub show_hidden: bool,
     pub sort: SortSpec,
+    /// Where this menu's Paste should paste: `Some(folder)` when the row menu
+    /// was opened on a folder (Explorer pastes *into* it), `None` for the
+    /// pane's open directory.
+    pub paste_dest: Option<PathBuf>,
+    /// Whether that destination is inside — or *is* — something on the
+    /// clipboard. Right-click the very folder you just cut and Explorer offers
+    /// a disabled Paste, not one that submits a self-move; the operation is
+    /// refused in fs-core either way
+    /// ([`fs_core::FileClipboard::contains_destination`]), so this only decides
+    /// whether the item looks available.
+    pub paste_dest_inside_source: bool,
 }
 
 impl MenuFacts {
-    /// Paste needs somewhere to paste into *and* something to paste.
+    /// Paste needs somewhere to paste into, something to paste, and a
+    /// destination that is not one of the sources.
     fn can_paste(&self) -> bool {
-        self.has_dir && !self.clipboard_empty
+        self.has_dir && !self.clipboard_empty && !self.paste_dest_inside_source
     }
 }
 
 /// The row menu (right-click on an entry). Explorer's order and wording.
 ///
-/// `Paste` here pastes into the pane's **current directory**, not into a
-/// right-clicked folder: it dispatches the one `Paste` action, and giving the
-/// menu a destination of its own would mean a second implementation of paste.
+/// `Paste` pastes into [`MenuFacts::paste_dest`] — the right-clicked folder,
+/// when the click landed on one — via the parameterized `Paste { dest }`
+/// action, so the destination changes without the operation being implemented
+/// twice.
 pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     let any = facts.selection_len > 0;
     vec![
@@ -200,7 +215,13 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
         MenuItem::Separator,
         command("Cut", Box::new(Cut), any),
         command("Copy", Box::new(Copy), any),
-        command("Paste", Box::new(Paste), facts.can_paste()),
+        command(
+            "Paste",
+            Box::new(Paste {
+                dest: facts.paste_dest.clone(),
+            }),
+            facts.can_paste(),
+        ),
         MenuItem::Separator,
         command("Duplicate", Box::new(Duplicate), any),
         // One name, one editor: renaming a multi-selection is meaningless.
@@ -221,7 +242,13 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
 /// no key binding at all, so the context menu is its **only** entry point.
 pub fn background_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     vec![
-        command("Paste", Box::new(Paste), facts.can_paste()),
+        command(
+            "Paste",
+            Box::new(Paste {
+                dest: facts.paste_dest.clone(),
+            }),
+            facts.can_paste(),
+        ),
         MenuItem::Separator,
         MenuItem::Submenu {
             label: SharedString::new_static("New"),
@@ -315,7 +342,18 @@ impl DirView {
                 } else {
                     self.select_entry(&entry, cx);
                 }
-                row_menu(&self.menu_facts(cx))
+                let mut facts = self.menu_facts(cx);
+                // Explorer: Paste on a folder row pastes *into* that folder.
+                // The right-clicked entry decides, not the selection — a
+                // right-click on a folder inside a wider selection is still a
+                // right-click on that folder.
+                if entry.is_dir_like() {
+                    facts.paste_dest_inside_source = FsContext::global(cx)
+                        .clipboard
+                        .contains_destination(&entry.path);
+                    facts.paste_dest = Some(entry.path.to_path_buf());
+                }
+                row_menu(&facts)
             }
             None => background_menu(&self.menu_facts(cx)),
         };
@@ -360,6 +398,13 @@ impl DirView {
                 .as_ref()
                 .map(|pane| pane.read(cx).sort())
                 .unwrap_or_default(),
+            // The open directory, unless a row menu overrides it below.
+            paste_dest: None,
+            paste_dest_inside_source: pane.as_ref().is_some_and(|pane| {
+                pane.read(cx)
+                    .path()
+                    .is_some_and(|path| FsContext::global(cx).clipboard.contains_destination(path))
+            }),
         }
     }
 
@@ -690,6 +735,8 @@ mod tests {
             clipboard_empty: true,
             show_hidden: false,
             sort: SortSpec::default(),
+            paste_dest: None,
+            paste_dest_inside_source: false,
         }
     }
 
@@ -949,6 +996,68 @@ mod tests {
     }
 
     #[gpui::test]
+    fn paste_onto_the_folder_that_is_on_the_clipboard_is_refused(cx: &mut TestAppContext) {
+        // Drag & drop has always refused a destination inside or equal to a
+        // source (`drag::plan_drop`), because "fs-core fails these; refusing
+        // here means no failure toast for a slip of the mouse". The row
+        // menu's `Paste { dest }` bypassed that: cut a folder, right-click
+        // that same folder, Paste — `take_for_paste` CONSUMED the cut, the
+        // `Move` then failed at execution, and the user had a failure toast
+        // *and* a cut to redo.
+        let (vfs, pane, view, cx) = open_root(cx);
+        vfs.insert_tree("/root", json!({ "target": { "in.txt": "i" } }));
+        pane.update(cx, |pane, cx| pane.refresh(cx));
+        cx.run_until_parked();
+
+        let ix = view
+            .read_with(cx, |view, _| {
+                view.flat_rows()
+                    .iter()
+                    .position(|row| row.entry.path.ends_with("target"))
+            })
+            .expect("the folder is listed");
+
+        // Select and cut it, then right-click it.
+        let at = row_point(&view, cx, ix);
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(selected(&view, cx), vec![PathBuf::from("/root/target")]);
+        view.update(cx, |view, cx| view.cut_selection(cx));
+        cx.run_until_parked();
+        let at = row_point(&view, cx, ix);
+        right_click(cx, at);
+
+        let paste_enabled = view.read_with(cx, |view, _| {
+            let menu = view.context_menu().expect("the row menu opened");
+            enabled(&menu.items, "Paste")
+        });
+        assert!(
+            !paste_enabled,
+            "Paste must be offered disabled, not as a self-move"
+        );
+
+        // Clicking it anyway (a dispatch from anywhere, not just this menu)
+        // must submit nothing and leave the cut alone.
+        view.update(cx, |view, cx| {
+            view.paste_into(Some(PathBuf::from("/root/target")), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| {
+                crate::app_state::FsContext::global(cx)
+                    .clipboard
+                    .is_cut(Path::new("/root/target"))
+            }),
+            "the cut survived the refused paste, so it does not have to be redone"
+        );
+        assert!(tree_has(&vfs, "/root/target/in.txt"), "and nothing moved");
+        assert!(
+            !tree_has(&vfs, "/root/target/target"),
+            "no nested self-copy either"
+        );
+    }
+
+    #[gpui::test]
     fn right_click_on_an_unselected_row_selects_it_and_opens_the_row_menu(cx: &mut TestAppContext) {
         let (_vfs, _pane, view, cx) = open_root(cx);
 
@@ -1087,6 +1196,57 @@ mod tests {
         assert!(
             tree_has(&vfs, "/root/a copy.txt"),
             "the Paste row submitted a real Copy op"
+        );
+    }
+
+    // Explorer's row menu pastes *into* the folder under the pointer, not
+    // into the folder the pane is showing — the parameterized `Paste { dest }`
+    // action, dispatched by the same single handler `cmd-v` reaches.
+    #[gpui::test]
+    fn the_row_menu_pastes_into_the_right_clicked_folder(cx: &mut TestAppContext) {
+        let (vfs, pane, view, cx) = open_root(cx);
+        vfs.insert_tree("/root/target", json!({}));
+        pane.update(cx, |pane, cx| pane.refresh(cx));
+        cx.run_until_parked();
+        // Folders sort first, so the new folder is row 0.
+        view.read_with(cx, |view, _| {
+            assert_eq!(&*view.flat_rows()[0].entry.name, "target")
+        });
+
+        cx.update(|_, cx| {
+            FsContext::global_mut(cx).clipboard.set(
+                vec![EntryId(Arc::from(Path::new("/root/a.txt")))],
+                ClipboardMode::Copy,
+            )
+        });
+
+        let at = row_point(&view, cx, 0);
+        right_click(cx, at);
+        view.read_with(cx, |view, _| {
+            let items = view.context_menu().unwrap().items();
+            assert!(enabled(items, "Paste"));
+        });
+        click_item(cx, "context-menu-item-Paste");
+        cx.run_until_parked();
+
+        assert!(
+            tree_has(&vfs, "/root/target/a.txt"),
+            "the copy landed inside the right-clicked folder"
+        );
+        assert!(
+            !tree_has(&vfs, "/root/a copy.txt"),
+            "and not beside the original in the pane's own directory"
+        );
+
+        // The *background* menu still means the open directory: same action,
+        // no destination.
+        let below = background_point(&view, cx);
+        right_click(cx, below);
+        click_item(cx, "context-menu-item-Paste");
+        cx.run_until_parked();
+        assert!(
+            tree_has(&vfs, "/root/a copy.txt"),
+            "a background Paste is still a paste into the pane's folder"
         );
     }
 

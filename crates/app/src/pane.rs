@@ -187,6 +187,18 @@ pub enum ViewMode {
     Icons,
 }
 
+impl ViewMode {
+    /// The *other* shipped mode. A fresh split pane opens in it (plan §2's
+    /// blueprint screenshot is a details list beside an icon grid), so the
+    /// split is immediately useful as two different views of the same tree.
+    pub fn complement(self) -> Self {
+        match self {
+            ViewMode::List => ViewMode::Icons,
+            ViewMode::Icons => ViewMode::List,
+        }
+    }
+}
+
 pub struct Pane {
     focus_handle: FocusHandle,
     theme: Theme,
@@ -1742,6 +1754,19 @@ mod tests {
             assert_eq!(pane.path(), Some(Path::new("/other")));
             assert_eq!(pane.item_count(), 2, "cmd-r reloaded the listing");
         });
+    }
+
+    // A fresh split pane opens in the *other* mode (plan §2's list-beside-grid
+    // blueprint), so the complement must be an involution — flipping twice is
+    // where you started, and neither mode maps to itself.
+    #[test]
+    fn view_mode_complement_is_the_other_shipped_mode() {
+        assert_eq!(ViewMode::List.complement(), ViewMode::Icons);
+        assert_eq!(ViewMode::Icons.complement(), ViewMode::List);
+        for mode in [ViewMode::List, ViewMode::Icons] {
+            assert_ne!(mode.complement(), mode);
+            assert_eq!(mode.complement().complement(), mode);
+        }
     }
 
     // §0 "View mode switcher": the keystrokes and the toolbar buttons are two

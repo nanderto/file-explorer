@@ -7,13 +7,17 @@
 //! Panes live in a `Vec` from day one (len 1 for M1) so the M4 split-pane
 //! toggle grows the vector instead of reshaping the tree.
 
+use std::path::Path;
+
 use fs_core::{Conflict, FileOp, JobId, UndoOutcome};
 use gpui::{
     AnyElement, App, Context, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, Render,
     SharedString, Subscription, Window, deferred, div, prelude::*, px,
 };
 
-use crate::actions::{DeletePermanently, FocusAddressBar, Redo, ToggleHiddenFiles, Undo};
+use crate::actions::{
+    DeletePermanently, FocusAddressBar, Redo, ToggleHiddenFiles, ToggleSplitPane, Undo,
+};
 use crate::app_state::FsContext;
 use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
 use crate::jobs_model::{JobsEvent, JobsModel};
@@ -34,14 +38,38 @@ pub const SIDEBAR_MAX_WIDTH: f32 = 400.0;
 pub const INFO_PANEL_DEFAULT_WIDTH: f32 = 260.0;
 pub const INFO_PANEL_MIN_WIDTH: f32 = 180.0;
 pub const INFO_PANEL_MAX_WIDTH: f32 = 420.0;
+/// Narrowest a pane may be squeezed to by the split splitter (M4). Below this
+/// the details list's columns stop being readable at all, so the drag stops
+/// rather than letting one pane be dragged out of existence — collapsing the
+/// split is `cmd-shift-o`, not a gesture you can trigger by accident.
+pub const PANE_MIN_WIDTH: f32 = 240.0;
 /// Width of the invisible grab strip straddling each region border.
 const SPLITTER_HITBOX_WIDTH: f32 = 6.0;
+/// Height of the per-pane active marker painted above a split pane (M4).
+const PANE_MARKER_HEIGHT: f32 = 2.0;
 
 /// Which divider is being dragged (the `on_drag` payload).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitterSide {
     Sidebar,
     InfoPanel,
+    /// The divider between the two panes of a split (M4). Its drag math is
+    /// relative to the **pane strip**, not the whole body row, so it is
+    /// handled by the strip's own `on_drag_move` (see
+    /// [`Workspace::handle_pane_splitter_drag`]).
+    Pane,
+}
+
+/// Clamp a dragged first-pane width so **both** panes keep at least
+/// [`PANE_MIN_WIDTH`]. Pure so the edge cases (a strip too narrow to honor
+/// both minimums, a degenerate zero-width strip) are unit-testable without a
+/// window.
+fn clamp_pane_width(width: f32, strip_width: f32) -> f32 {
+    // A strip narrower than two minimums cannot satisfy both; the first pane
+    // wins the minimum and the second is simply squeezed (it is still
+    // scrollable, and the user's next drag can only make things better).
+    let max = (strip_width - PANE_MIN_WIDTH).max(PANE_MIN_WIDTH);
+    width.clamp(PANE_MIN_WIDTH, max)
 }
 
 /// Drag payload for a splitter; carries no data beyond the side.
@@ -92,11 +120,21 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     theme: Theme,
     sidebar: Entity<Sidebar>,
+    /// One or two panes (§2 "Dual-pane readiness without PaneGroup"): a flat
+    /// `Vec`, never a recursive member tree.
     panes: Vec<gpui::Entity<Pane>>,
+    /// Parallel to `panes` — index `i` is the `PaneEvent` subscription for
+    /// `panes[i]`, so collapsing a split drops the closed pane's subscription
+    /// with the pane instead of leaving a dead one behind.
+    pane_subscriptions: Vec<Subscription>,
     active_pane_ix: usize,
     show_hidden: bool,
     sidebar_width: f32,
     info_panel_width: f32,
+    /// Width of the **first** pane while split. `None` = an even split (both
+    /// panes `flex_1`), which is what a fresh split and every collapse reset
+    /// to; a splitter drag pins it.
+    first_pane_width: Option<f32>,
     jobs: Entity<JobsModel>,
     jobs_indicator: Entity<JobsIndicator>,
     toast_layer: Entity<ToastLayer>,
@@ -128,15 +166,17 @@ impl Workspace {
             theme,
             sidebar,
             panes: vec![pane],
+            pane_subscriptions: vec![pane_subscription],
             active_pane_ix: 0,
             show_hidden: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             info_panel_width: INFO_PANEL_DEFAULT_WIDTH,
+            first_pane_width: None,
             jobs,
             jobs_indicator,
             toast_layer,
             modal: None,
-            _subscriptions: vec![sidebar_subscription, pane_subscription, jobs_subscription],
+            _subscriptions: vec![sidebar_subscription, jobs_subscription],
         }
     }
 
@@ -442,6 +482,109 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------------
+    // Dual pane (§0 `ToggleSplitPane`, §2 "Dual-pane readiness")
+    // ------------------------------------------------------------------
+
+    /// Whether the second pane is open.
+    pub fn is_split(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    /// Index of the pane every workspace-level command targets. Set by
+    /// `PaneEvent::FocusIn`, so any click inside a pane retargets them.
+    pub fn active_pane_ix(&self) -> usize {
+        self.active_pane_ix
+    }
+
+    fn handle_toggle_split_pane(
+        &mut self,
+        _: &ToggleSplitPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_split_pane(window, cx);
+    }
+
+    /// §0 "Split-pane toggle": one pane becomes two, two become one.
+    pub fn toggle_split_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_split() {
+            self.collapse_split(window, cx);
+        } else {
+            self.split_pane(window, cx);
+        }
+    }
+
+    /// Open the second pane, showing the active pane's directory.
+    ///
+    /// The new pane is a **fully independent** `Pane` entity: its own history
+    /// (empty — the split is not a fork of where you have been), sort,
+    /// selection, address bar and status line. Two things are seeded rather
+    /// than defaulted:
+    ///
+    /// * the **directory**, copied from the active pane, because a split whose
+    ///   new half showed "No folder open" would make the user re-navigate to
+    ///   the place they just split from; and
+    /// * the **view mode**, set to the *complement* of the active pane's, per
+    ///   plan §2, whose blueprint screenshot is a details list beside an icon
+    ///   grid. One `cmd-1`/`cmd-2` undoes it if that is not wanted.
+    ///
+    /// `show_hidden` is workspace-global (§0 `ToggleHiddenFiles` fans out), so
+    /// the new pane adopts the current value instead of resetting it.
+    fn split_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (path, view_mode) = {
+            let active = self.active_pane().read(cx);
+            (
+                active.path().map(Path::to_path_buf),
+                active.view_mode().complement(),
+            )
+        };
+        let show_hidden = self.show_hidden;
+        let theme = self.theme.clone();
+        let pane = cx.new(|cx| Pane::new(theme, window, cx));
+        let subscription = cx.subscribe(&pane, Self::handle_pane_event);
+        pane.update(cx, |new_pane, cx| {
+            new_pane.set_show_hidden(show_hidden, cx);
+            new_pane.set_view_mode(view_mode, cx);
+            if let Some(path) = &path {
+                new_pane.navigate_to(path, cx);
+            }
+        });
+        self.panes.push(pane.clone());
+        self.pane_subscriptions.push(subscription);
+        // The new pane is the one you are working in, so it takes focus — and
+        // focus is what makes it active (`PaneEvent::FocusIn`); the index is
+        // set here too so the state is right even without a focus round trip.
+        self.active_pane_ix = self.panes.len() - 1;
+        self.first_pane_width = None;
+        let handle = pane.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Close the split. **The active pane survives** — collapsing while you
+    /// work in the right-hand pane must not throw away the directory you are
+    /// looking at. The closed pane's state (its history, selection, view mode
+    /// and scroll position) goes away with the entity: nothing is stashed for
+    /// a later re-split, because a resurrected pane pointing at a directory
+    /// that has since changed is worse than a fresh one.
+    fn collapse_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_split() {
+            return;
+        }
+        let survivor = self.panes[self.active_pane_ix].clone();
+        let subscription = self.pane_subscriptions.remove(self.active_pane_ix);
+        // Dropping the other handle drops the pane: its watch registration,
+        // load tasks and watch pump all die with it (§6).
+        self.panes = vec![survivor.clone()];
+        self.pane_subscriptions = vec![subscription];
+        self.active_pane_ix = 0;
+        self.first_pane_width = None;
+        let handle = survivor.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
     // Resizable splitters (§8: drag adjusts the shared widths, clamped)
     // ------------------------------------------------------------------
 
@@ -457,6 +600,28 @@ impl Workspace {
         let width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         if width != self.sidebar_width {
             self.sidebar_width = width;
+            cx.notify();
+        }
+    }
+
+    /// Pinned width of the first pane while split, or `None` for an even
+    /// split.
+    pub fn first_pane_width(&self) -> Option<f32> {
+        self.first_pane_width
+    }
+
+    /// Pin the first pane's width (M4 split splitter). Clamped to
+    /// [`PANE_MIN_WIDTH`]; the *upper* bound depends on the strip's painted
+    /// width, so the drag handler applies [`clamp_pane_width`] first.
+    pub fn set_first_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        // A non-finite width would poison the layout for the rest of the
+        // session (and `f32::clamp` propagates NaN rather than rejecting it).
+        if !width.is_finite() {
+            return;
+        }
+        let width = width.max(PANE_MIN_WIDTH);
+        if self.first_pane_width != Some(width) {
+            self.first_pane_width = Some(width);
             cx.notify();
         }
     }
@@ -486,7 +651,29 @@ impl Workspace {
                 let width = f32::from(event.bounds.right() - event.event.position.x);
                 self.set_info_panel_width(width, cx);
             }
+            // Measured against the pane strip, whose bounds this handler does
+            // not have — `handle_pane_splitter_drag` owns it. Both handlers
+            // run for every move (gpui's `on_drag_move` listeners are not
+            // hover-gated), so each must ignore the other's side or they would
+            // fight over the same width with different origins.
+            SplitterSide::Pane => {}
         }
+    }
+
+    /// The split splitter's drag math, on the pane strip's own bounds: the
+    /// pointer's offset into the strip *is* the first pane's width.
+    fn handle_pane_splitter_drag(
+        &mut self,
+        event: &DragMoveEvent<DraggedSplitter>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.drag(cx).side != SplitterSide::Pane {
+            return;
+        }
+        let width = f32::from(event.event.position.x - event.bounds.left());
+        let strip = f32::from(event.bounds.size.width);
+        self.set_first_pane_width(clamp_pane_width(width, strip), cx);
     }
 
     /// The invisible grab strip straddling a region border (§8 hand-built
@@ -494,11 +681,17 @@ impl Workspace {
     /// row's `on_drag_move` does the math.
     fn splitter_handle(&self, side: SplitterSide) -> impl IntoElement {
         let theme = self.theme.clone();
+        let name = match side {
+            SplitterSide::Sidebar => "sidebar-splitter",
+            SplitterSide::InfoPanel => "info-panel-splitter",
+            SplitterSide::Pane => "pane-splitter",
+        };
         let handle = div()
-            .id(match side {
-                SplitterSide::Sidebar => "sidebar-splitter",
-                SplitterSide::InfoPanel => "info-panel-splitter",
-            })
+            .id(name)
+            // So a test can assert *where* the grab strip was painted: a
+            // splitter pushed outside the strip it divides is undraggable, and
+            // that is invisible to any state assertion.
+            .debug_selector(move || name.to_string())
             .absolute()
             .top_0()
             .h_full()
@@ -511,9 +704,100 @@ impl Workspace {
                 cx.new(|_| SplitterGhost)
             });
         match side {
-            SplitterSide::Sidebar => handle.right(px(-SPLITTER_HITBOX_WIDTH / 2.0)),
+            // Both straddle the *right* edge of the region they follow.
+            SplitterSide::Sidebar | SplitterSide::Pane => {
+                handle.right(px(-SPLITTER_HITBOX_WIDTH / 2.0))
+            }
             SplitterSide::InfoPanel => handle.left(px(-SPLITTER_HITBOX_WIDTH / 2.0)),
         }
+    }
+
+    /// The pane strip: one pane (`flex_1`, exactly the M1–M3 layout) or two
+    /// with a draggable divider between them.
+    ///
+    /// While split, each pane wears a 2px marker above it — the active pane's
+    /// in the theme accent — because "which pane does `cmd-z` act on" must be
+    /// answerable by looking, and a focus ring inside a pane is invisible when
+    /// focus sits on a status line or a breadcrumb.
+    fn render_pane_strip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let split = self.is_split();
+        let mut strip = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .on_drag_move(cx.listener(Self::handle_pane_splitter_drag));
+        if !split {
+            return strip.children(self.panes.iter().cloned());
+        }
+        for (ix, pane) in self.panes.iter().enumerate() {
+            let first = ix == 0;
+            let active = ix == self.active_pane_ix;
+            // Both panes carry [`PANE_MIN_WIDTH`] as a floor at *layout* time,
+            // not only at drag time. A pinned first-pane width is a width the
+            // strip may since have stopped being able to honor — widen the
+            // sidebar and the info panel, or make the window narrower, and the
+            // stored value outgrows the strip. With the first pane
+            // `flex_none` (grow 0, **shrink 0**) and the second `min_w(0)`,
+            // that overflowed the strip and squeezed the second pane's whole
+            // content area — breadcrumb, rows and the §3 free-space status
+            // line — to zero pixels, with the splitter that caused it parked
+            // outside the strip where no drag can reach it. Making the pinned
+            // pane shrinkable and giving both a real minimum lets flexbox
+            // degrade the pin gracefully instead: the second pane freezes at
+            // its minimum and the first gives up the difference.
+            let mut wrapper = div().relative().flex().flex_col().min_w(px(PANE_MIN_WIDTH));
+            wrapper = match self.first_pane_width.filter(|_| first) {
+                Some(width) => wrapper.w(px(width)).flex_grow_0().flex_shrink_1(),
+                None => wrapper.flex_1(),
+            };
+            if first {
+                wrapper = wrapper.border_r_1().border_color(theme.border);
+            }
+            wrapper = wrapper
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(PANE_MARKER_HEIGHT))
+                        .w_full()
+                        .bg(if active { theme.accent } else { theme.border }),
+                )
+                .child(pane.clone());
+            if first {
+                wrapper = wrapper.child(self.splitter_handle(SplitterSide::Pane));
+            }
+            strip = strip.child(wrapper);
+        }
+        strip
+    }
+
+    /// The §0 toolbar affordance for `ToggleSplitPane`, in the titlebar beside
+    /// the jobs indicator (the workspace's own chrome — the split is not a
+    /// per-pane control). It **dispatches the boxed action** the keymap binds,
+    /// so the toggle logic exists exactly once (§0), and it deliberately does
+    /// *not* take focus first: whichever pane is active stays active, and the
+    /// new pane inherits that pane's directory.
+    fn render_split_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let active = self.is_split();
+        div()
+            .id("split-pane-toggle")
+            .debug_selector(|| "split-pane-toggle".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.0))
+            .h(px(20.0))
+            .rounded(px(3.0))
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .when(active, |el| el.bg(theme.accent.opacity(0.30)))
+            .text_color(if active { theme.text } else { theme.muted })
+            .hover(|s| s.bg(theme.accent.opacity(0.15)))
+            .on_click(cx.listener(|_, _, window: &mut Window, cx| {
+                window.dispatch_action(Box::new(ToggleSplitPane), cx);
+            }))
+            .child(SharedString::new_static("◫"))
     }
 
     fn handle_focus_address_bar(
@@ -601,6 +885,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .on_action(cx.listener(Self::handle_focus_address_bar))
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
+            .on_action(cx.listener(Self::handle_toggle_split_pane))
             .on_action(cx.listener(Self::handle_delete_permanently))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
@@ -623,7 +908,14 @@ impl Render for Workspace {
                     .border_color(theme.border)
                     .text_size(px(13.0))
                     .child("file-explorer")
-                    .child(self.jobs_indicator.clone()),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(self.render_split_toggle(cx))
+                            .child(self.jobs_indicator.clone()),
+                    ),
             )
             // Body: sidebar | pane(s) | info panel, separated by splitters
             .child(
@@ -646,8 +938,8 @@ impl Render for Workspace {
                             .child(self.sidebar.clone())
                             .child(self.splitter_handle(SplitterSide::Sidebar)),
                     )
-                    // Pane strip (len 1 in M1)
-                    .children(self.panes.iter().cloned())
+                    // Pane strip: one pane, or two with a divider (M4)
+                    .child(self.render_pane_strip(cx))
                     // Info panel (placeholder until M5), resizable
                     .child(
                         div()
@@ -678,7 +970,8 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use crate::app_state::{FsContext, GpuiSpawner, LoggingOpener};
-    use crate::pane::AddressBarMode;
+    use crate::dir_view::DirView;
+    use crate::pane::{AddressBarMode, ViewMode};
     use fs_core::{FakeVfs, Spawner, Vfs as _};
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -1148,6 +1441,567 @@ mod tests {
             assert!(workspace.active_modal().is_none());
         });
         assert!(!exists(&vfs, "/root/a.txt"), "confirmed, so it is gone");
+    }
+
+    // ------------------------------------------------------------------
+    // M4 dual pane (§0 `ToggleSplitPane`, §2 "Dual-pane readiness")
+    // ------------------------------------------------------------------
+
+    /// Focus the workspace root, where the `Workspace`-context bindings live.
+    fn focus_workspace(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let handle = workspace.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+    }
+
+    /// Focus a pane the way a click into it does (gpui focuses a descendant;
+    /// `on_focus_in` fires for the whole subtree either way).
+    ///
+    /// **The window must be active**: gpui zeroes both focus paths of an
+    /// inactive window, so no `focus_in`/`focus_out` listener fires there —
+    /// and a test window starts inactive. Activating it is not test
+    /// scaffolding around the feature, it is the state the app actually runs
+    /// in (a click that focuses a pane also activates the window).
+    fn focus_pane(pane: &Entity<Pane>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.activate_window();
+            let handle = pane.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn open_split_workspace(
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeVfs>, Entity<Workspace>, &mut VisualTestContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/root", json!({ "beta": { "kept.txt": "k" } }));
+        vfs.insert_tree("/other", json!({ "o.txt": "o" }));
+        let (workspace, cx) = build_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.toggle_split_pane(window, cx));
+        });
+        cx.run_until_parked();
+        (vfs, workspace, cx)
+    }
+
+    /// The painted content width of each pane's list, in pane order — the
+    /// thing that goes to zero when a pinned splitter overflows the strip.
+    fn pane_list_widths(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<f32> {
+        let panes = workspace.read_with(cx, |workspace, _| workspace.panes().to_vec());
+        panes
+            .iter()
+            .map(|pane| {
+                let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+                dir_view.read_with(cx, |view, _| {
+                    f32::from(crate::marquee::list_viewport(view).size.width)
+                })
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn the_titlebar_split_toggle_clicks_the_split_open_and_shut(cx: &mut TestAppContext) {
+        // The button dispatches the boxed `ToggleSplitPane` without focusing
+        // anything first (deliberately — whichever pane is active stays
+        // active), so it depends entirely on the focused element's dispatch
+        // path containing the Workspace node. Nothing clicked it, so a change
+        // to focus handling or key context would have broken it with no
+        // compile error and no failing test.
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let click_toggle = |cx: &mut VisualTestContext| {
+            let at = cx
+                .debug_bounds("split-pane-toggle")
+                .expect("the titlebar toggle paints")
+                .center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        // Focus inside a pane, which is where it is in practice.
+        focus_pane(&pane, cx);
+        click_toggle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.panes().len(), 2, "the click opened the split");
+        });
+        click_toggle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.panes().len(), 1, "and closed it again");
+        });
+
+        // ...and with focus on the workspace root, where the action's own
+        // context lives.
+        focus_workspace(&workspace, cx);
+        click_toggle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.panes().len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn a_pinned_splitter_never_squeezes_the_other_pane_out_of_existence(cx: &mut TestAppContext) {
+        // `PANE_MIN_WIDTH`'s own doc comment promises "the drag stops rather
+        // than letting one pane be dragged out of existence" — but the pin was
+        // only clamped against the strip *at drag time*. Widening the side
+        // panels afterwards (no window resize, no second drag) left the first
+        // pane overflowing the strip and the second with a 0px content area:
+        // no breadcrumb, no rows, and no free-space status line, with the
+        // splitter parked outside the strip under the info panel where no
+        // drag could undo it.
+        let (_vfs, workspace, cx) = open_split_workspace(cx);
+        let even = pane_list_widths(&workspace, cx);
+        assert_eq!(even.len(), 2);
+        let strip: f32 = even.iter().sum();
+
+        // Exactly what a legal splitter drag to the far right produces.
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_first_pane_width(clamp_pane_width(strip, strip), cx);
+        });
+        cx.run_until_parked();
+        for (ix, width) in pane_list_widths(&workspace, cx).iter().enumerate() {
+            assert!(
+                *width > 0.0,
+                "pane {ix} vanished on the drag itself: {width}"
+            );
+        }
+
+        // Now shrink the strip under the pin, both ways a user can: the side
+        // panels out to their own documented maxima...
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_sidebar_width(SIDEBAR_MAX_WIDTH, cx);
+            workspace.set_info_panel_width(INFO_PANEL_MAX_WIDTH, cx);
+        });
+        cx.run_until_parked();
+        let squeezed = pane_list_widths(&workspace, cx);
+        assert!(
+            squeezed.iter().all(|width| *width > 0.0),
+            "widening the side panels emptied a pane: {squeezed:?}"
+        );
+
+        // ...and the window itself narrower.
+        cx.simulate_resize(gpui::size(px(900.0), px(760.0)));
+        cx.run_until_parked();
+        let narrow = pane_list_widths(&workspace, cx);
+        assert!(
+            narrow.iter().all(|width| *width > 0.0),
+            "a narrower window emptied a pane: {narrow:?}"
+        );
+
+        // And the splitter is still to the left of the surviving pane's
+        // content rather than parked past it under the info panel, so the drag
+        // that produced this is reversible by mouse.
+        let handle = cx
+            .debug_bounds("pane-splitter")
+            .expect("the split splitter paints while split");
+        let second = workspace.read_with(cx, |workspace, _| workspace.panes()[1].clone());
+        let second_view = second.read_with(cx, |pane, _| pane.dir_view().clone());
+        let second_bounds =
+            second_view.read_with(cx, |view, _| crate::marquee::list_viewport(view));
+        assert!(
+            handle.origin.x < second_bounds.right(),
+            "the splitter drifted past the second pane: splitter={handle:?} pane={second_bounds:?}"
+        );
+    }
+
+    // §8 "Resizable splitters" for the split divider: both panes keep a
+    // usable width, and a strip too narrow for two minimums does not panic.
+    #[test]
+    fn clamp_pane_width_keeps_both_panes_usable() {
+        let strip = 1000.0;
+        assert_eq!(clamp_pane_width(500.0, strip), 500.0);
+        assert_eq!(clamp_pane_width(10.0, strip), PANE_MIN_WIDTH);
+        assert_eq!(
+            clamp_pane_width(990.0, strip),
+            strip - PANE_MIN_WIDTH,
+            "the second pane keeps its minimum"
+        );
+        // Degenerate strips: the minimum wins, and nothing panics on a
+        // clamp whose bounds would otherwise invert.
+        assert_eq!(clamp_pane_width(100.0, 0.0), PANE_MIN_WIDTH);
+        assert_eq!(clamp_pane_width(1_000.0, 100.0), PANE_MIN_WIDTH);
+        assert!(clamp_pane_width(f32::NAN, strip).is_nan());
+    }
+
+    #[gpui::test]
+    fn split_pane_width_clamps_and_rejects_non_finite(cx: &mut TestAppContext) {
+        let (_vfs, workspace, cx) = open_split_workspace(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.first_pane_width(),
+                None,
+                "a fresh split is an even split"
+            );
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_first_pane_width(400.0, cx);
+            workspace.set_first_pane_width(f32::NAN, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.first_pane_width(),
+                Some(400.0),
+                "NaN must not reach the layout"
+            );
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_first_pane_width(1.0, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.first_pane_width(), Some(PANE_MIN_WIDTH));
+        });
+    }
+
+    // §0 Split-pane toggle: cmd-shift-o grows the pane Vec to two and back to
+    // one, and the fresh pane opens on the same directory in the *other* view
+    // mode (plan §2's list-beside-grid blueprint).
+    #[gpui::test]
+    fn cmd_shift_o_splits_and_collapses(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/root", json!({ "beta": {} }));
+        let (workspace, cx) = build_workspace(cx);
+        let first = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        first.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        focus_workspace(&workspace, cx);
+        cx.simulate_keystrokes("cmd-shift-o");
+        cx.run_until_parked();
+
+        let second = workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.is_split());
+            assert_eq!(workspace.panes().len(), 2);
+            assert_eq!(
+                workspace.active_pane_ix(),
+                1,
+                "the new pane is the one you are working in"
+            );
+            let second = workspace.panes()[1].clone();
+            assert_eq!(
+                second.read(cx).path(),
+                Some(Path::new("/root")),
+                "the split opens where you split from"
+            );
+            assert_eq!(second.read(cx).view_mode(), ViewMode::Icons);
+            assert_eq!(workspace.panes()[0].read(cx).view_mode(), ViewMode::List);
+            second
+        });
+
+        cx.simulate_keystrokes("cmd-shift-o");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.is_split());
+            assert_eq!(workspace.panes().len(), 1);
+            assert_eq!(workspace.active_pane_ix(), 0);
+            assert_eq!(
+                workspace.active_pane(),
+                &second,
+                "the ACTIVE pane survives the collapse"
+            );
+        });
+        assert_ne!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone()),
+            first,
+            "and the other pane is gone with its state"
+        );
+    }
+
+    // Collapsing while the *first* pane is active keeps that one instead —
+    // the rule is "the active pane survives", not "pane 0 survives".
+    #[gpui::test]
+    fn collapsing_keeps_whichever_pane_is_active(cx: &mut TestAppContext) {
+        let (_vfs, workspace, cx) = open_split_workspace(cx);
+        let (first, second) = workspace.read_with(cx, |workspace, _| {
+            (workspace.panes()[0].clone(), workspace.panes()[1].clone())
+        });
+        second.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+
+        focus_pane(&first, cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.active_pane_ix(), 0, "focus retargets commands");
+        });
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.toggle_split_pane(window, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 1);
+            assert_eq!(workspace.active_pane(), &first);
+            assert_eq!(
+                workspace.active_pane().read(cx).path(),
+                Some(Path::new("/root")),
+                "the surviving pane keeps its own directory"
+            );
+        });
+    }
+
+    // §2 `PaneEvent::FocusIn` through the real gesture: a **click** inside a
+    // pane makes it the active one. gpui focuses the deepest handle under the
+    // pointer (a list row, not the pane node), which is why the pane
+    // subscribes with `on_focus_in` (subtree) rather than `on_focus`.
+    #[gpui::test]
+    fn clicking_into_a_pane_makes_it_active(cx: &mut TestAppContext) {
+        let (_vfs, workspace, cx) = open_split_workspace(cx);
+        let first = workspace.read_with(cx, |workspace, _| workspace.panes()[0].clone());
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.active_pane_ix(), 1, "the split focused pane 1");
+        });
+
+        let first_view = first.read_with(cx, |pane, _| pane.dir_view().clone());
+        let point = cx.update(|window, cx| {
+            window.activate_window();
+            let viewport = crate::marquee::list_viewport(first_view.read(cx));
+            gpui::point(
+                viewport.left() + px(40.0),
+                viewport.top() + px(DirView::ROW_HEIGHT / 2.0),
+            )
+        });
+        cx.run_until_parked();
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.active_pane_ix(),
+                0,
+                "a click inside a pane retargets every workspace command"
+            );
+            assert_eq!(workspace.active_pane(), &first);
+        });
+    }
+
+    // The second pane is a fully independent Pane: path, history, sort, view
+    // mode and selection all move on their own.
+    #[gpui::test]
+    fn the_two_panes_navigate_sort_and_select_independently(cx: &mut TestAppContext) {
+        let (_vfs, workspace, cx) = open_split_workspace(cx);
+        let (first, second) = workspace.read_with(cx, |workspace, _| {
+            (workspace.panes()[0].clone(), workspace.panes()[1].clone())
+        });
+
+        second.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+        second.update(cx, |pane, cx| pane.sort_by(fs_core::SortKey::Size, cx));
+        second.update(cx, |pane, cx| pane.set_view_mode(ViewMode::List, cx));
+        cx.run_until_parked();
+
+        first.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")));
+            assert_eq!(pane.sort().key, fs_core::SortKey::Name);
+            assert_eq!(pane.view_mode(), ViewMode::List);
+            assert!(!pane.can_go_back(), "the first pane never moved");
+        });
+        second.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/other")));
+            assert_eq!(pane.sort().key, fs_core::SortKey::Size);
+            assert!(pane.can_go_back(), "its own history, not a shared one");
+        });
+
+        // Selection is per-DirView too.
+        let first_view = first.read_with(cx, |pane, _| pane.dir_view().clone());
+        let second_view = second.read_with(cx, |pane, _| pane.dir_view().clone());
+        first_view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/a.txt")], cx)
+        });
+        second_view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/other/o.txt")], cx)
+        });
+        first_view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selection().selected_rootmost(),
+                vec![Arc::from(Path::new("/root/a.txt"))]
+            );
+        });
+        second_view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selection().selected_rootmost(),
+                vec![Arc::from(Path::new("/other/o.txt"))]
+            );
+        });
+
+        // Second pane's history works on its own: back returns it to /root
+        // while the first pane sits still.
+        second.update(cx, |pane, cx| pane.go_back(cx));
+        cx.run_until_parked();
+        second.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")))
+        });
+        first.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")))
+        });
+    }
+
+    // §2 `PaneEvent::FocusIn` → `active_pane_ix`: the workspace-level commands
+    // must follow focus, not an index. cmd-l is the cheapest probe (it edits
+    // exactly one pane's address bar), and `shift-delete` proves the same for
+    // the destructive path, which reads the ACTIVE pane's selection.
+    #[gpui::test]
+    fn workspace_actions_target_the_focused_pane(cx: &mut TestAppContext) {
+        let (vfs, workspace, cx) = open_split_workspace(cx);
+        let (first, second) = workspace.read_with(cx, |workspace, _| {
+            (workspace.panes()[0].clone(), workspace.panes()[1].clone())
+        });
+
+        // Splitting focused the new pane, so it is active.
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active_pane_ix(), 1));
+        cx.simulate_keystrokes("cmd-l");
+        cx.run_until_parked();
+        second.read_with(cx, |pane, _| {
+            assert_eq!(pane.address_bar_mode(), AddressBarMode::Editing)
+        });
+        first.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.address_bar_mode(),
+                AddressBarMode::Breadcrumb,
+                "the other pane's address bar is untouched"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // Focus the first pane: the same keystroke now lands there.
+        focus_pane(&first, cx);
+        workspace.read_with(cx, |workspace, _| assert_eq!(workspace.active_pane_ix(), 0));
+        cx.simulate_keystrokes("cmd-l");
+        cx.run_until_parked();
+        first.read_with(cx, |pane, _| {
+            assert_eq!(pane.address_bar_mode(), AddressBarMode::Editing)
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // Hidden files stay workspace-global: the toggle fans out to BOTH
+        // panes, whichever one is active.
+        focus_workspace(&workspace, cx);
+        cx.simulate_keystrokes("cmd-shift-.");
+        cx.run_until_parked();
+        for pane in [&first, &second] {
+            pane.read_with(cx, |pane, _| assert!(pane.show_hidden()));
+        }
+        cx.simulate_keystrokes("cmd-shift-.");
+        cx.run_until_parked();
+
+        // The destructive path reads the active pane's selection: with the
+        // *second* pane active, the first pane's selection must not be what
+        // shift-delete deletes.
+        let first_view = first.read_with(cx, |pane, _| pane.dir_view().clone());
+        let second_view = second.read_with(cx, |pane, _| pane.dir_view().clone());
+        first_view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/a.txt")], cx)
+        });
+        second_view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/beta")], cx)
+        });
+        cx.update(|window, cx| {
+            let handle = second_view.read(cx).focus_handle_ref().clone();
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-delete");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            !exists(&vfs, "/root/beta"),
+            "the active pane's selection is what went"
+        );
+        assert!(
+            exists(&vfs, "/root/a.txt"),
+            "the inactive pane's selection was never touched"
+        );
+    }
+
+    // ARCHITECTURE claims cross-pane drag "already works — the payload is
+    // window-global". This is that claim, tested: a real drag out of the left
+    // pane and into the right one, where `drop_copies`'s same-volume rule
+    // makes it a **move** (§3 Explorer behavior).
+    #[gpui::test]
+    fn dragging_between_panes_moves_the_entry(cx: &mut TestAppContext) {
+        let (vfs, workspace, cx) = open_split_workspace(cx);
+        let (first, second) = workspace.read_with(cx, |workspace, _| {
+            (workspace.panes()[0].clone(), workspace.panes()[1].clone())
+        });
+        second.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+
+        let source_view = first.read_with(cx, |pane, _| pane.dir_view().clone());
+        let dest_view = second.read_with(cx, |pane, _| pane.dir_view().clone());
+
+        // Rows of /root, dirs first: beta, a.txt.
+        let rows: Vec<std::path::PathBuf> = source_view.read_with(cx, |view, _| {
+            view.flat_rows()
+                .iter()
+                .map(|row| row.entry.path.to_path_buf())
+                .collect()
+        });
+        let source_ix = rows
+            .iter()
+            .position(|p| p == Path::new("/root/a.txt"))
+            .expect("a.txt is listed");
+
+        let (from, to) = cx.update(|_, cx| {
+            let source = crate::marquee::list_viewport(source_view.read(cx));
+            let dest = crate::marquee::list_viewport(dest_view.read(cx));
+            assert!(
+                source.right() <= dest.left(),
+                "the two panes must be laid out side by side, got {source:?} and {dest:?}"
+            );
+            (
+                gpui::point(
+                    source.left() + px(40.0),
+                    source.top()
+                        + px(source_ix as f32 * DirView::ROW_HEIGHT + DirView::ROW_HEIGHT / 2.0),
+                ),
+                // Empty space below the destination pane's single row: the
+                // background target, i.e. "into the folder this pane shows".
+                gpui::point(
+                    dest.left() + px(40.0),
+                    dest.top() + px(3.0 * DirView::ROW_HEIGHT),
+                ),
+            )
+        });
+
+        cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            from + gpui::point(px(6.0), px(6.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+
+        // The *destination* pane armed the target; the source pane cleared its
+        // own (the payload crossed the pane boundary because it is
+        // window-global — `DraggedEntries.source_pane` only records where it
+        // came from).
+        dest_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.active_drop_target(cx),
+                Some(&crate::drag::DropTarget::Background),
+                "the other pane accepted the drag"
+            );
+        });
+        source_view.read_with(cx, |view, cx| {
+            assert!(view.active_drop_target(cx).is_none());
+        });
+
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(exists(&vfs, "/other/a.txt"), "moved into the other pane");
+        assert!(
+            !exists(&vfs, "/root/a.txt"),
+            "one volume: a cross-pane drag moves (§3), it does not copy"
+        );
     }
 
     #[gpui::test]

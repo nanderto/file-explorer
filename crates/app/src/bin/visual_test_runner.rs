@@ -98,6 +98,12 @@ mod macos {
         /// one frame pins the tile lattice, the placeholder image slot, the
         /// truncating labels and the selection tint together (M4, §8).
         IconGrid(&'static str, &'static [&'static str]),
+        /// Navigate, split the workspace, then navigate the **new** pane
+        /// somewhere else (M4, §2): one frame pins the two-pane strip, the
+        /// divider, the per-pane active marker and the fresh pane's
+        /// complementary view mode (a details list beside an icon grid, the
+        /// plan §2 blueprint) together.
+        SplitPanes(&'static str, &'static str),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -161,6 +167,12 @@ mod macos {
                 "icon_grid",
                 Theme::dark(),
                 Setup::IconGrid("/home", &["/home/Documents", "/home/readme.md"]),
+            ),
+            // M4: the dual-pane layout of the plan §2 screenshot.
+            (
+                "split_panes",
+                Theme::dark(),
+                Setup::SplitPanes("/home", "/home/Documents"),
             ),
         ]
     }
@@ -419,6 +431,21 @@ mod macos {
                     });
                 })
                 .map_err(|e| anyhow!("icon grid setup failed: {e:?}"))?;
+            }
+            Setup::SplitPanes(path, second_path) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| workspace.toggle_split_pane(window, cx));
+                })
+                .map_err(|e| anyhow!("split failed: {e:?}"))?;
+                cx.run_until_parked();
+                // The split focused the new pane, so this is that pane.
+                let second = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                cx.update_window(handle, |_, _, cx| {
+                    second.update(cx, |pane, cx| pane.navigate_to(Path::new(second_path), cx));
+                })
+                .map_err(|e| anyhow!("second pane navigate failed: {e:?}"))?;
             }
         }
         Ok(())

@@ -85,6 +85,12 @@ pub trait Platform: Send + Sync {
     /// Every implementation runs its blocking work (QuickLook, objc2, image
     /// decode) through [`crate::SpawnerExt::unblock`]; the UI thread only ever
     /// awaits this.
+    ///
+    /// **Cancellation is expected and must be safe.** The icon grid drops this
+    /// future whenever the tile it belongs to scrolls out of view, so an
+    /// implementation must leave nothing behind that a drop would corrupt: work
+    /// already handed to a background thread may run to completion and be
+    /// discarded, but no shared state may be left half-written.
     async fn thumbnail(&self, path: &Path, px: u32) -> Result<Thumbnail>;
 }
 
