@@ -143,17 +143,19 @@ impl Workspace {
     /// The sidebar tree caches child listings of its own, so an external
     /// change a pane's watcher reported has to reach it too (§6: cached child
     /// listings must not survive a change to the folder they came from).
-    fn handle_pane_event(
-        &mut self,
-        _pane: Entity<Pane>,
-        event: &PaneEvent,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_pane_event(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
         match event {
             PaneEvent::DirsChanged(dirs) => {
                 let dirs = dirs.clone();
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.invalidate_children(&dirs, cx));
+            }
+            // Focus landed anywhere inside a pane, so that pane becomes the
+            // one every workspace-level command targets (M4 dual pane).
+            PaneEvent::FocusIn => {
+                if let Some(ix) = self.panes.iter().position(|p| p == &pane) {
+                    self.active_pane_ix = ix;
+                }
             }
         }
     }

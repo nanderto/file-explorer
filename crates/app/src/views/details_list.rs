@@ -17,11 +17,10 @@ use gpui::{
     deferred, div, prelude::*, px, uniform_list,
 };
 
-use crate::actions::{Cancel, Confirm, SortBy};
+use crate::actions::SortBy;
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 use crate::drag;
-use crate::input::text_input as ti;
 use crate::pane::format_bytes;
 use crate::theme::Theme;
 
@@ -302,11 +301,11 @@ fn size_cell(entry: &fs_core::FileEntry) -> SharedString {
 }
 
 /// The row of the entry being renamed (ARCHITECTURE.md §4c/§8): the name
-/// cell is the vendored [`ti`] editor (or, once `Confirm` has submitted the
-/// op, the plain pending name — not editable); `Confirm`/`Cancel` and the
-/// editor's own editing keys are wired here, same pattern as
-/// `address_bar.rs`'s `TextInput` context. An inline validation error (local
-/// or reported by the op) renders as a `deferred` popup under the row.
+/// cell is the vendored text editor (or, once `Confirm` has submitted the op,
+/// the plain pending name — not editable). Its `Confirm`/`Cancel` and editing
+/// keys come from [`crate::rename::with_editor_actions`], the same wiring the
+/// grid tile uses. An inline validation error (local or reported by the op)
+/// renders as a `deferred` popup under the row.
 fn render_rename_row(
     this: &mut DirView,
     row: &crate::dir_view::ProjectedRow,
@@ -346,98 +345,47 @@ fn render_rename_row(
         input.clone().into_any_element()
     };
 
-    // `track_focus` so the row's `TextInput` key context is actually part of
-    // the dispatch chain while the embedded editor holds focus (a plain
-    // `.child(input)` without it leaves `Confirm`/`Cancel` unreachable).
-    let input_focus = input.read(cx).focus_handle(cx);
-    let mut styled_row = div()
-        // Path-keyed for the same reason as the normal row above; only one of
-        // the two ever paints for a given path in a frame.
-        .id(gpui::ElementId::Path(row.entry.path.clone()))
-        .debug_selector(|| format!("dir-row-{ix}"))
-        .track_focus(&input_focus)
-        .key_context("TextInput")
-        .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm_rename(window, cx)))
-        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel_rename(window, cx)))
-        // Forward the vendored input's editing actions (bound in
-        // keymap.rs, `TextInput` context) into the row's editor, same
-        // pattern as `address_bar.rs`.
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Left, w, cx| input.update(cx, |i, cx| i.left(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Right, w, cx| input.update(cx, |i, cx| i.right(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::SelectLeft, w, cx| input.update(cx, |i, cx| i.select_left(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::SelectRight, w, cx| input.update(cx, |i, cx| i.select_right(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::SelectAll, w, cx| input.update(cx, |i, cx| i.select_all(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Home, w, cx| input.update(cx, |i, cx| i.home(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::End, w, cx| input.update(cx, |i, cx| i.end(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Backspace, w, cx| input.update(cx, |i, cx| i.backspace(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Delete, w, cx| input.update(cx, |i, cx| i.delete(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Copy, w, cx| input.update(cx, |i, cx| i.copy(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Cut, w, cx| input.update(cx, |i, cx| i.cut(a, w, cx))
-        }))
-        .on_action(cx.listener({
-            let input = input.clone();
-            move |_, a: &ti::Paste, w, cx| input.update(cx, |i, cx| i.paste(a, w, cx))
-        }))
-        .flex()
-        .items_center()
-        .w_full()
-        .h(px(ROW_HEIGHT))
-        .px(px(8.0))
-        .text_size(px(13.0))
-        .text_color(theme.text)
-        .child(div().w(px(depth as f32 * DISCLOSURE_WIDTH)).flex_none())
-        .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
-        .child(name_area)
-        .child(
-            div()
-                .w(px(SIZE_COL_WIDTH))
-                .flex_none()
-                .flex()
-                .justify_end()
-                .text_color(theme.muted)
-                .child(size),
-        )
-        .child(
-            div()
-                .w(px(DATE_COL_WIDTH))
-                .flex_none()
-                .flex()
-                .justify_end()
-                .text_color(theme.muted)
-                .child(modified),
-        );
+    // The editor's dispatch node — focus, `TextInput` key context,
+    // `Confirm`/`Cancel` and the vendored input's editing actions — is
+    // [`crate::rename::with_editor_actions`], shared with the grid tile so
+    // the wiring exists exactly once.
+    let mut styled_row = crate::rename::with_editor_actions(
+        div()
+            // Path-keyed for the same reason as the normal row above; only one
+            // of the two ever paints for a given path in a frame.
+            .id(gpui::ElementId::Path(row.entry.path.clone()))
+            .debug_selector(|| format!("dir-row-{ix}")),
+        &input,
+        cx,
+    )
+    .flex()
+    .items_center()
+    .w_full()
+    .h(px(ROW_HEIGHT))
+    .px(px(8.0))
+    .text_size(px(13.0))
+    .text_color(theme.text)
+    .child(div().w(px(depth as f32 * DISCLOSURE_WIDTH)).flex_none())
+    .child(div().w(px(DISCLOSURE_WIDTH)).flex_none())
+    .child(name_area)
+    .child(
+        div()
+            .w(px(SIZE_COL_WIDTH))
+            .flex_none()
+            .flex()
+            .justify_end()
+            .text_color(theme.muted)
+            .child(size),
+    )
+    .child(
+        div()
+            .w(px(DATE_COL_WIDTH))
+            .flex_none()
+            .flex()
+            .justify_end()
+            .text_color(theme.muted)
+            .child(modified),
+    );
 
     if let Some(message) = error {
         styled_row = styled_row.child(deferred(

@@ -17,7 +17,7 @@
 //! menu item calls a method on a view.
 //!
 //! **Which menu.** Right-click is hit-tested with the same arithmetic the
-//! marquee and the drop targets use ([`row_at`] over the uniform row band), so
+//! marquee and the drop targets use ([`DirView::index_at_content`]), so
 //! a `uniform_list`-virtualized row is found as reliably as a painted one: a
 //! press on a row band opens the **row menu** (selecting that row first unless
 //! it is already part of the selection), a press in the empty space below the
@@ -45,9 +45,7 @@ use crate::actions::{
 };
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
-use crate::drag::row_at;
 use crate::marquee::{ContentPoint, list_viewport, scroll_y};
-use crate::views::details_list::ROW_HEIGHT;
 
 // ----------------------------------------------------------------------
 // Geometry. Fixed row heights, so a panel's height is its content's — no
@@ -305,7 +303,7 @@ impl DirView {
         window.focus(self.focus_handle_ref(), cx);
         self.disarm_rename_click();
 
-        let target = self.row_at_pointer(event.position);
+        let target = self.row_at_pointer(event.position, cx);
         let items = match target {
             Some(entry) => {
                 // Explorer: right-clicking a row outside the selection selects
@@ -329,16 +327,17 @@ impl DirView {
         cx.notify();
     }
 
-    /// The projected row under a window-space pointer, or `None` for the empty
-    /// space past the last row. Arithmetic against the uniform band, so a
-    /// virtualized row is found like any other (see [`row_at`]).
-    fn row_at_pointer(&self, pointer: Point<Pixels>) -> Option<fs_core::FileEntry> {
+    /// The projected row (or grid tile) under a window-space pointer, or
+    /// `None` for empty space. Arithmetic against the painted lattice, so a
+    /// virtualized item is found like any other.
+    fn row_at_pointer(&self, pointer: Point<Pixels>, cx: &App) -> Option<fs_core::FileEntry> {
         let viewport = list_viewport(self);
         if viewport.size.height <= px(0.0) {
             return None;
         }
         let content = ContentPoint::from_window(pointer, viewport, scroll_y(self));
-        row_at(content.y, ROW_HEIGHT, self.flat_rows().len())
+        // Mode-aware (rows vs tiles) — see `DirView::index_at_content`.
+        self.index_at_content(content, cx)
             .and_then(|ix| self.flat_rows().get(ix))
             // A not-yet-created phantom row (§4c `New ▸`) is not a menu target;
             // it can only exist while the editor is up, which already returned.
@@ -672,6 +671,7 @@ mod tests {
     //! sort column flipped — never just that a click happened.
 
     use super::*;
+    use crate::views::details_list::ROW_HEIGHT;
 
     use std::path::{Path, PathBuf};
     use std::sync::Arc;

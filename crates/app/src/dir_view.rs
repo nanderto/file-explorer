@@ -84,11 +84,11 @@ use crate::app_state::FsContext;
 use crate::context_menu::{self, ContextMenuState};
 use crate::drag::{self, DropState};
 use crate::marquee::{self, MarqueeState};
-use crate::pane::Pane;
+use crate::pane::{Pane, ViewMode};
 use crate::rename::RenameState;
 use crate::selection::SelectionModel;
 use crate::theme::Theme;
-use crate::views::details_list;
+use crate::views::{details_list, icon_grid};
 
 /// Quiet period after which the type-ahead prefix resets. Every keystroke
 /// restarts it (the previous timer task is dropped, cancelling it).
@@ -667,9 +667,73 @@ impl DirView {
             return;
         };
         self.selection.select_only(row.entry.id());
-        self.scroll_handle
-            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        self.scroll_cursor_into_view(ix, cx);
         cx.notify();
+    }
+
+    /// Keep entry index `ix` on screen. `uniform_list` items are *rows*, and
+    /// in the icon grid one row holds `cols` entries — so the details list
+    /// scrolls to the entry index and the grid to `ix / cols`. Getting this
+    /// wrong does not fail loudly: it scrolls to the wrong place.
+    fn scroll_cursor_into_view(&self, ix: usize, cx: &App) {
+        let item = match self.view_mode(cx) {
+            ViewMode::List => ix,
+            ViewMode::Icons => ix / self.grid_cols().max(1),
+        };
+        self.scroll_handle
+            .scroll_to_item(item, ScrollStrategy::Nearest);
+    }
+
+    /// The pane's current layout. The DirView renders it but does not own it
+    /// (§2: `Pane … view_mode`), so every mode-dependent decision reads it
+    /// here rather than caching a copy that could go stale.
+    pub(crate) fn view_mode(&self, cx: &App) -> ViewMode {
+        self.pane
+            .upgrade()
+            .map(|pane| pane.read(cx).view_mode())
+            .unwrap_or_default()
+    }
+
+    /// Tiles across the icon grid, from the list's painted width (§8: "`cols`
+    /// recomputed from pane width"). One column before the first layout,
+    /// which makes the grid behave exactly like the list rather than
+    /// dividing by zero.
+    pub(crate) fn grid_cols(&self) -> usize {
+        icon_grid::cols_for_width(f32::from(marquee::list_viewport(self).size.width))
+    }
+
+    /// The entry index under a point in marquee **content** space, or `None`
+    /// for empty space. The one hit test both mouse gestures use (the
+    /// marquee's empty-space rule and drag & drop's target arming), so the
+    /// two can never disagree about where a tile is.
+    pub(crate) fn index_at_content(
+        &self,
+        point: crate::marquee::ContentPoint,
+        cx: &App,
+    ) -> Option<usize> {
+        let len = self.flat_rows().len();
+        match self.view_mode(cx) {
+            ViewMode::List => drag::row_at(point.y, details_list::ROW_HEIGHT, len),
+            ViewMode::Icons => icon_grid::tile_at(point.x, point.y, self.grid_cols(), len),
+        }
+    }
+
+    /// 2D cursor movement in the icon grid (§8: "index arithmetic"). The edge
+    /// rules live in [`icon_grid::step_index`], unit-tested there.
+    fn grid_step_cursor(&mut self, step: icon_grid::GridStep, cx: &mut Context<Self>) {
+        let rows = self.projected_rows(cx);
+        if rows.is_empty() {
+            return;
+        }
+        let cols = self.grid_cols();
+        let ix = match self.cursor_ix(&rows) {
+            Some(ix) => icon_grid::step_index(ix, rows.len(), cols, step),
+            // No cursor yet: forward motion lands on the first tile, backward
+            // on the last — the same rule the list uses.
+            None if step.delta(cols) >= 0 => 0,
+            None => rows.len() - 1,
+        };
+        self.move_cursor_to(ix, &rows, cx);
     }
 
     /// `shift-down`/`shift-up`: move the cursor and re-range the selection
@@ -687,8 +751,7 @@ impl DirView {
         };
         let order: Vec<EntryId> = rows.iter().map(|row| row.entry.id()).collect();
         self.selection.select_range_to(order[ix].clone(), &order);
-        self.scroll_handle
-            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        self.scroll_cursor_into_view(ix, cx);
         cx.notify();
     }
 
@@ -719,7 +782,13 @@ impl DirView {
     }
 
     /// Rows in one page: derived from the laid-out viewport when available.
-    fn rows_per_page(&self) -> usize {
+    /// A "row" is a `uniform_list` item, so in the icon grid it is a whole
+    /// line of tiles — [`Self::page_step`] turns that into entries.
+    fn rows_per_page(&self, cx: &App) -> usize {
+        let item_height = match self.view_mode(cx) {
+            ViewMode::List => details_list::ROW_HEIGHT,
+            ViewMode::Icons => icon_grid::TILE_HEIGHT,
+        };
         let viewport = self
             .scroll_handle
             .0
@@ -728,8 +797,18 @@ impl DirView {
             .bounds()
             .size
             .height;
-        let rows = (f32::from(viewport) / details_list::ROW_HEIGHT) as usize;
+        let rows = (f32::from(viewport) / item_height) as usize;
         if rows == 0 { FALLBACK_PAGE_ROWS } else { rows }
+    }
+
+    /// Entries one PageUp/PageDown moves the cursor: a viewport of rows in
+    /// the list, a viewport of *lines* — `rows * cols` entries — in the grid.
+    fn page_step(&self, cx: &App) -> isize {
+        let rows = self.rows_per_page(cx) as isize;
+        match self.view_mode(cx) {
+            ViewMode::List => rows,
+            ViewMode::Icons => rows * self.grid_cols().max(1) as isize,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -962,6 +1041,7 @@ impl Render for DirView {
         let load_error = pane
             .as_ref()
             .and_then(|p| p.read(cx).load_error().map(str::to_string));
+        let view_mode = self.view_mode(cx);
 
         // Rebuild the flat projection this frame; the uniform_list row
         // processor reads it back by index.
@@ -981,7 +1061,16 @@ impl Render for DirView {
                 .child(format!("Can't read folder: {error}"))
                 .into_any_element()
         } else if !self.flat.is_empty() {
-            details_list::render_rows(self, cx).into_any_element()
+            // §8: which widget paints the same projection is the pane's
+            // `ViewMode`. Both are `uniform_list`s over the same scroll
+            // handle, and both read the same path-keyed selection — which is
+            // what makes switching mode a pure re-render.
+            match view_mode {
+                ViewMode::List => details_list::render_rows(self, cx).into_any_element(),
+                ViewMode::Icons => {
+                    icon_grid::render_grid(self, self.grid_cols(), cx).into_any_element()
+                }
+            }
         } else {
             div()
                 .flex()
@@ -1009,8 +1098,22 @@ impl Render for DirView {
                 (false, false) => "DirView",
             })
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| this.open_selected(cx)))
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step_cursor(1, cx)))
-            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.step_cursor(-1, cx)))
+            // §0 cursor movement. In the details list `down`/`up` step one
+            // row; in the icon grid they step one *line* (±cols) and
+            // `right`/`left` take over horizontal movement from
+            // expand/collapse below — the §3 "2D keyboard nav" rows.
+            .on_action(
+                cx.listener(|this, _: &SelectNext, _, cx| match this.view_mode(cx) {
+                    ViewMode::List => this.step_cursor(1, cx),
+                    ViewMode::Icons => this.grid_step_cursor(icon_grid::GridStep::Down, cx),
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectPrev, _, cx| match this.view_mode(cx) {
+                    ViewMode::List => this.step_cursor(-1, cx),
+                    ViewMode::Icons => this.grid_step_cursor(icon_grid::GridStep::Up, cx),
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &SelectFirst, _, cx| this.move_cursor_to_end(true, cx)),
             )
@@ -1018,21 +1121,46 @@ impl Render for DirView {
                 cx.listener(|this, _: &SelectLast, _, cx| this.move_cursor_to_end(false, cx)),
             )
             // §0 shift-arrows: extend the range from the anchor (M3).
+            // §0 shift-arrows: extend the range from the anchor. The grid
+            // extends by whole lines; unlike a cursor *move* it clamps rather
+            // than holding at the last line, because a range that stops
+            // growing at a ragged row cannot reach the final entries.
+            .on_action(cx.listener(|this, _: &ExtendSelectionNext, _, cx| {
+                let delta = match this.view_mode(cx) {
+                    ViewMode::List => 1,
+                    ViewMode::Icons => icon_grid::GridStep::Down.delta(this.grid_cols()),
+                };
+                this.extend_selection(delta, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendSelectionPrev, _, cx| {
+                let delta = match this.view_mode(cx) {
+                    ViewMode::List => -1,
+                    ViewMode::Icons => icon_grid::GridStep::Up.delta(this.grid_cols()),
+                };
+                this.extend_selection(delta, cx)
+            }))
             .on_action(
-                cx.listener(|this, _: &ExtendSelectionNext, _, cx| this.extend_selection(1, cx)),
+                cx.listener(|this, _: &PageDown, _, cx| this.step_cursor(this.page_step(cx), cx)),
             )
             .on_action(
-                cx.listener(|this, _: &ExtendSelectionPrev, _, cx| this.extend_selection(-1, cx)),
+                cx.listener(|this, _: &PageUp, _, cx| this.step_cursor(-this.page_step(cx), cx)),
             )
-            .on_action(cx.listener(|this, _: &PageDown, _, cx| {
-                this.step_cursor(this.rows_per_page() as isize, cx)
-            }))
-            .on_action(cx.listener(|this, _: &PageUp, _, cx| {
-                this.step_cursor(-(this.rows_per_page() as isize), cx)
-            }))
-            // §0 Views (M2): in-place expansion.
-            .on_action(cx.listener(|this, _: &ExpandSelected, _, cx| this.expand_selected(cx)))
-            .on_action(cx.listener(|this, _: &CollapseSelected, _, cx| this.collapse_selected(cx)))
+            // §0 Views (M2): in-place expansion — a details-list affordance
+            // (the grid has no disclosure triangles and no depth). In the
+            // icon grid the same `right`/`left` keys are the horizontal half
+            // of 2D navigation, which is what Explorer does in both views.
+            .on_action(
+                cx.listener(|this, _: &ExpandSelected, _, cx| match this.view_mode(cx) {
+                    ViewMode::List => this.expand_selected(cx),
+                    ViewMode::Icons => this.grid_step_cursor(icon_grid::GridStep::Right, cx),
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &CollapseSelected, _, cx| match this.view_mode(cx) {
+                    ViewMode::List => this.collapse_selected(cx),
+                    ViewMode::Icons => this.grid_step_cursor(icon_grid::GridStep::Left, cx),
+                },
+            ))
             // §0 select-all over the visible projection (M3).
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             // §0 clipboard rows (M3): cut dims sources, paste moves on cut.
@@ -1064,7 +1192,13 @@ impl Render for DirView {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .child(details_list::render_header(&theme, sort, cx))
+            // Sortable column headers belong to the details list; the grid
+            // has no columns to sort by clicking (the `SortBy` action itself
+            // still works — it lives on the pane, not on the header).
+            .children(match view_mode {
+                ViewMode::List => Some(details_list::render_header(&theme, sort, cx)),
+                ViewMode::Icons => None,
+            })
             // The rows live inside the marquee's background surface (§8): it
             // is the element gpui's drag hangs off, and the positioning
             // context for the band it paints. The same element carries the
@@ -1090,7 +1224,7 @@ mod tests {
 
     use super::*;
     use crate::app_state::{GpuiSpawner, LoggingOpener};
-    use crate::pane::Pane;
+    use crate::pane::{Pane, ViewMode};
     use fs_core::{FakeVfs, Spawner};
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -1789,5 +1923,158 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == ".fake-trash")),
             "the entry is recoverable from the trash, not destroyed"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M4 view modes (§8 "Icon grid")
+    // ------------------------------------------------------------------
+
+    /// The entry index the (path-keyed) cursor sits on, as the grid's
+    /// arithmetic sees it.
+    fn cursor_index(pane: &Entity<Pane>, cx: &mut VisualTestContext) -> Option<usize> {
+        let dir_view = dir_view_of(pane, cx);
+        cx.update(|_, cx| {
+            let view = dir_view.read(cx);
+            let rows = view.projected_rows(cx);
+            view.cursor_ix(&rows)
+        })
+    }
+
+    fn set_view_mode(pane: &Entity<Pane>, cx: &mut VisualTestContext, mode: ViewMode) {
+        pane.update(cx, |pane, cx| pane.set_view_mode(mode, cx));
+        cx.run_until_parked();
+    }
+
+    fn focus_dir_view(pane: &Entity<Pane>, cx: &mut VisualTestContext) {
+        let dir_view = dir_view_of(pane, cx);
+        cx.update(|window, cx| {
+            let handle = dir_view.read(cx).focus_handle_ref().clone();
+            window.focus(&handle, cx);
+        });
+    }
+
+    // The reason the grid reads DirView's one `SelectionModel` instead of
+    // owning tile indices: switching layout is a re-render of the same data,
+    // so a multi-selection and the cursor have to come out the other side
+    // untouched — a user who selects fifty files and then switches view must
+    // not lose them (and must not delete a *different* fifty afterwards).
+    #[gpui::test]
+    fn switching_view_mode_preserves_selection_and_cursor(cx: &mut TestAppContext) {
+        let (_vfs, pane, cx) = open_root_with_vfs(cx);
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                // `select_paths` leaves the cursor on the last path, so
+                // this is a two-entry selection with a cursor inside it.
+                view.select_paths(&[Path::new("/root/sub"), Path::new("/root/a.txt")], cx);
+            })
+        });
+
+        let before = cx.update(|_, cx| {
+            let selection = dir_view.read(cx).selection();
+            (selection.selected_paths(), selection.cursor().cloned())
+        });
+        assert_eq!(
+            before.0,
+            vec![PathBuf::from("/root/a.txt"), PathBuf::from("/root/sub")],
+            "two entries selected before the switch"
+        );
+
+        for mode in [ViewMode::Icons, ViewMode::List, ViewMode::Icons] {
+            set_view_mode(&pane, cx, mode);
+            let after = cx.update(|_, cx| {
+                let selection = dir_view.read(cx).selection();
+                (selection.selected_paths(), selection.cursor().cloned())
+            });
+            assert_eq!(after, before, "selection survived the switch to {mode:?}");
+            // Nothing reloaded either: the switch is a pure re-render.
+            pane.read_with(cx, |pane, _| {
+                assert_eq!(pane.path(), Some(Path::new("/root")));
+                assert_eq!(pane.item_count(), 3);
+            });
+        }
+    }
+
+    // §8: 2D navigation is index arithmetic, and `up`/`down` step a whole
+    // *line* of tiles rather than one entry. The arithmetic itself is
+    // unit-tested in `views/icon_grid.rs`; this asserts the grid's `cols`
+    // (from the painted width) is what the bindings actually apply, which is
+    // the half that can silently regress to the list's ±1.
+    #[gpui::test]
+    fn grid_arrow_keys_step_by_a_whole_line(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let mut wide = serde_json::Map::new();
+        for i in 0..60 {
+            wide.insert(format!("f{i:03}.txt"), json!("x"));
+        }
+        vfs.insert_tree("/grid", serde_json::Value::Object(wide));
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/grid"), cx));
+        cx.run_until_parked();
+        set_view_mode(&pane, cx, ViewMode::Icons);
+
+        let dir_view = dir_view_of(&pane, cx);
+        let cols = cx.update(|_, cx| dir_view.read(cx).grid_cols());
+        assert!(
+            cols > 1,
+            "the test window must be wider than one tile for this to mean anything"
+        );
+
+        focus_dir_view(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                view.set_cursor(Some(entry_id("/grid/f000.txt")), cx)
+            })
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(cursor_index(&pane, cx), Some(cols), "down = +cols");
+
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        assert_eq!(cursor_index(&pane, cx), Some(cols + 1), "right = +1");
+
+        cx.simulate_keystrokes("left left");
+        cx.run_until_parked();
+        assert_eq!(
+            cursor_index(&pane, cx),
+            Some(cols - 1),
+            "left walks back across the row boundary, in reading order"
+        );
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(
+            cursor_index(&pane, cx),
+            Some(cols - 1),
+            "up from the first row holds rather than wrapping"
+        );
+    }
+
+    // The same `right`/`left` keys mean expand/collapse in the details list
+    // and horizontal motion in the grid (§0 Views vs §3 2D nav). A regression
+    // here is invisible in the list tests above, and would leave the grid
+    // splicing children into a layout that has no depth to show them at.
+    #[gpui::test]
+    fn right_arrow_moves_in_the_grid_instead_of_expanding(cx: &mut TestAppContext) {
+        let (_vfs, pane, cx) = open_root_with_vfs(cx);
+        set_view_mode(&pane, cx, ViewMode::Icons);
+        let dir_view = dir_view_of(&pane, cx);
+        cx.update(|_, cx| {
+            dir_view.update(cx, |view, cx| {
+                view.set_cursor(Some(entry_id("/root/sub")), cx)
+            })
+        });
+        focus_dir_view(&pane, cx);
+
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[("/root/sub", 0), ("/root/zeta", 0), ("/root/a.txt", 0)]),
+            "no children were spliced in: the grid has no disclosure triangles"
+        );
+        assert_eq!(cursor_index(&pane, cx), Some(1), "the cursor moved instead");
     }
 }

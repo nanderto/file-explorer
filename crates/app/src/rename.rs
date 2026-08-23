@@ -35,10 +35,57 @@ use gpui::{
     Context, Entity, FocusHandle, ScrollStrategy, SharedString, Subscription, Window, prelude::*,
 };
 
+use crate::actions::{Cancel, Confirm};
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 use crate::input::InputState;
 use crate::jobs_model::JobsEvent;
+
+/// Wire an element to *be* the inline editor's dispatch node: the input's
+/// focus handle (without `track_focus` the `TextInput` key context is not in
+/// the dispatch chain and `Confirm`/`Cancel` are silently unreachable), the
+/// `TextInput` key context, the rename machine's confirm/cancel, and the
+/// vendored input's own editing actions (bound in `keymap.rs`'s `TextInput`
+/// context).
+///
+/// Shared by every view mode that can host the editor — the details row
+/// (`views/details_list.rs`) and the grid tile (`views/icon_grid.rs`) — so
+/// the wiring, like every other command in §0, exists exactly once.
+pub(crate) fn with_editor_actions<E: gpui::InteractiveElement>(
+    element: E,
+    input: &Entity<InputState>,
+    cx: &mut Context<DirView>,
+) -> E {
+    use crate::input::text_input as ti;
+
+    let focus = input.read(cx).focus_handle(cx);
+    let mut element = element
+        .track_focus(&focus)
+        .key_context("TextInput")
+        .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm_rename(window, cx)))
+        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel_rename(window, cx)));
+    macro_rules! forward {
+        ($action:ty, $method:ident) => {{
+            let input = input.clone();
+            element = element.on_action(cx.listener(move |_, action: &$action, window, cx| {
+                input.update(cx, |input, cx| input.$method(action, window, cx))
+            }));
+        }};
+    }
+    forward!(ti::Left, left);
+    forward!(ti::Right, right);
+    forward!(ti::SelectLeft, select_left);
+    forward!(ti::SelectRight, select_right);
+    forward!(ti::SelectAll, select_all);
+    forward!(ti::Home, home);
+    forward!(ti::End, end);
+    forward!(ti::Backspace, backspace);
+    forward!(ti::Delete, delete);
+    forward!(ti::Copy, copy);
+    forward!(ti::Cut, cut);
+    forward!(ti::Paste, paste);
+    element
+}
 
 /// What a `New ▸` command is naming (ARCHITECTURE.md §4c `is_new_entry`).
 /// The editor for these runs the **identical** machine a rename does; only the

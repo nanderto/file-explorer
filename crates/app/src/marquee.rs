@@ -48,7 +48,9 @@ use gpui::{
 
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
+use crate::pane::ViewMode;
 use crate::views::details_list::ROW_HEIGHT;
+use crate::views::icon_grid;
 
 /// How close to a viewport edge the pointer must be for the *slow* autoscroll
 /// speed; at or past the edge itself it switches to the fast one (§8
@@ -310,8 +312,12 @@ impl DirView {
             return;
         }
         let origin = ContentPoint::from_window(event.position, viewport, scroll_y(self));
-        let occupied = self.flat_rows().len() as f32 * ROW_HEIGHT;
-        if origin.y < occupied {
+        // A press on a painted item belongs to the file drag (`drag.rs`), so
+        // it arms nothing. Which pixels are "painted" depends on the view
+        // mode — a grid leaves empty space to the right of a ragged row's
+        // last tile, not only below the last line — so the test is
+        // `DirView::index_at_content`, shared with drag & drop.
+        if self.index_at_content(origin, cx).is_some() {
             return;
         }
         let base = if event.modifiers.platform {
@@ -397,12 +403,24 @@ impl DirView {
         else {
             return;
         };
-        let rows = self.flat_rows();
-        let range = rows_in_rect(rect, ROW_HEIGHT, rows.len());
-        let ids: Vec<EntryId> = rows[range.clone()]
-            .iter()
-            .map(|row| row.entry.id())
-            .collect();
+        // The band's geometry is the view mode's geometry: fixed-height rows
+        // in the details list, a tile lattice in the grid (where the hits are
+        // not contiguous — a band can straddle two lines and miss columns).
+        let ids: Vec<EntryId> = match self.view_mode(cx) {
+            ViewMode::List => {
+                let rows = self.flat_rows();
+                let range = rows_in_rect(rect, ROW_HEIGHT, rows.len());
+                rows[range].iter().map(|row| row.entry.id()).collect()
+            }
+            ViewMode::Icons => {
+                let cols = self.grid_cols();
+                let rows = self.flat_rows();
+                icon_grid::tiles_in_rect(rect, cols, rows.len())
+                    .into_iter()
+                    .filter_map(|ix| rows.get(ix).map(|row| row.entry.id()))
+                    .collect()
+            }
+        };
         // The cursor follows the moving corner, so a following shift-arrow
         // extends from where the drag ended rather than from wherever the
         // cursor happened to be.

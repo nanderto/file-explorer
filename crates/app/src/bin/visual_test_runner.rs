@@ -33,6 +33,7 @@ mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
     use file_explorer_app::app_state::{FsContext, GpuiSpawner, LoggingOpener};
     use file_explorer_app::dir_view::DirView;
+    use file_explorer_app::pane::ViewMode;
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
     use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Vfs};
     use gpui::{
@@ -93,6 +94,10 @@ mod macos {
         /// **without releasing**, so the rubber band and the rows it has
         /// selected are both live in the captured frame (M3, §8).
         MarqueeActive(&'static str),
+        /// Navigate, switch the pane to the icon grid and select entries, so
+        /// one frame pins the tile lattice, the placeholder image slot, the
+        /// truncating labels and the selection tint together (M4, §8).
+        IconGrid(&'static str, &'static [&'static str]),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -148,6 +153,14 @@ mod macos {
                 "marquee_active",
                 Theme::dark(),
                 Setup::MarqueeActive("/home"),
+            ),
+            // M4: the icon grid, with a selection in it. One frame rather
+            // than two because the tint is drawn *by the tile* — a tile
+            // regression and a selection regression would both show here.
+            (
+                "icon_grid",
+                Theme::dark(),
+                Setup::IconGrid("/home", &["/home/Documents", "/home/readme.md"]),
             ),
         ]
     }
@@ -391,6 +404,21 @@ mod macos {
                     Modifiers::none(),
                 );
                 cx.simulate_mouse_move(handle, to, MouseButton::Left, Modifiers::none());
+            }
+            Setup::IconGrid(path, select) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                let dir_view = cx.read(|cx| pane.read(cx).dir_view().clone());
+                let selected: Vec<PathBuf> = select.iter().map(PathBuf::from).collect();
+                cx.update_window(handle, |_, _, cx| {
+                    pane.update(cx, |pane, cx| pane.set_view_mode(ViewMode::Icons, cx));
+                    dir_view.update(cx, |dir_view, cx| {
+                        let paths: Vec<&Path> = selected.iter().map(PathBuf::as_path).collect();
+                        dir_view.select_paths(&paths, cx);
+                    });
+                })
+                .map_err(|e| anyhow!("icon grid setup failed: {e:?}"))?;
             }
         }
         Ok(())

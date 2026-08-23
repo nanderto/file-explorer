@@ -44,6 +44,14 @@ actions!(
         Duplicate,
         // view
         ToggleHiddenFiles,
+        // view mode (M4, §0 "View mode switcher" — the pane owns the state)
+        SetViewList,
+        SetViewIcons,
+        SetViewColumns,
+        // dual pane (M4, §0 "Split-pane toggle" — the workspace owns the
+        // pane strip; declared here so the whole §0 M4 row set exists in one
+        // place)
+        ToggleSplitPane,
         // editing-mode (address bar / rename editor / dialogs)
         Confirm,
         Cancel,

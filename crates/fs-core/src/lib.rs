@@ -24,6 +24,7 @@ pub mod listing;
 pub mod ops;
 pub mod platform;
 pub mod sort;
+pub mod thumbnail;
 pub mod undo;
 pub mod vfs;
 pub mod watcher;
@@ -43,6 +44,10 @@ pub use ops::{
 pub use platform::MacPlatform;
 pub use platform::{Platform, StubPlatform, VolumeId, VolumeInfo, watch_volumes};
 pub use sort::{SortDirection, SortKey, SortSpec, natural_cmp};
+pub use thumbnail::{
+    ContentStamp, MAX_PX, Thumbnail, ThumbnailCache, ThumbnailKey,
+    validate_px as validate_thumbnail_px,
+};
 pub use undo::{Fingerprint, UndoEntry, UndoOutcome, UndoStack};
 pub use vfs::{
     CopyCancelled, CreateOptions, ProgressFn, RealVfs, RemoveOptions, RenameOptions, TrashId,

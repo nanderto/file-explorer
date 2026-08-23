@@ -82,6 +82,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some("Workspace")),
         // §0 Refresh (M1)
         KeyBinding::new("cmd-r", Refresh, Some("Pane")),
+        // §0 View mode switcher (M4). The §0 trigger column also names the
+        // toolbar control (`pane.rs`'s segmented buttons), which dispatches
+        // these same boxed actions. `SetViewColumns` is deliberately
+        // *unbound*: Miller columns are a post-v1 stretch (§8), and the pane's
+        // handler says so out loud rather than pretending to switch.
+        KeyBinding::new("cmd-1", SetViewList, Some("Pane")),
+        KeyBinding::new("cmd-2", SetViewIcons, Some("Pane")),
         // §0 Undo / Redo (M3)
         KeyBinding::new("cmd-z", Undo, Some("Workspace")),
         KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),
@@ -182,6 +189,9 @@ mod tests {
                 .on_action(record!(DeleteToTrash, "DeleteToTrash"))
                 .on_action(record!(DeletePermanently, "DeletePermanently"))
                 .on_action(record!(NewFolder, "NewFolder"))
+                .on_action(record!(SetViewList, "SetViewList"))
+                .on_action(record!(SetViewIcons, "SetViewIcons"))
+                .on_action(record!(SetViewColumns, "SetViewColumns"))
                 .on_action(record!(RenameSelected, "RenameSelected"))
                 .on_action(record!(Duplicate, "Duplicate"))
                 .on_action(record!(AcceptSuggestion, "AcceptSuggestion"))
@@ -258,6 +268,31 @@ mod tests {
         let (fired, cx) = probe(cx, "Pane");
         cx.simulate_keystrokes("cmd-shift-n");
         assert_eq!(*fired.borrow(), vec!["NewFolder"]);
+    }
+
+    // §9 dispatch guard for the M4 `Pane` view-mode rows. The real entity's
+    // state change is covered in `pane.rs` tests; this is the tripwire for
+    // the bindings themselves.
+    #[gpui::test]
+    fn pane_context_dispatches_the_view_mode_rows(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "Pane");
+        cx.simulate_keystrokes("cmd-1 cmd-2");
+        assert_eq!(*fired.borrow(), vec!["SetViewList", "SetViewIcons"]);
+    }
+
+    // §8 marks Miller columns a post-v1 stretch, so `SetViewColumns` has no
+    // binding at all — a key that quietly did nothing would be worse than no
+    // key. This test is what fails if someone adds one without implementing
+    // the view.
+    #[gpui::test]
+    fn set_view_columns_has_no_binding(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "Pane");
+        cx.simulate_keystrokes("cmd-3");
+        assert!(
+            fired.borrow().is_empty(),
+            "SetViewColumns must stay unbound while Miller columns are unimplemented, got {:?}",
+            fired.borrow()
+        );
     }
 
     #[gpui::test]

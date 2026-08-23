@@ -42,7 +42,8 @@ unit + 3 integration + 187 app).
 | M1 read-only browsing | ✅ merged (#4) |
 | M2 sidebar + in-place expansion | ✅ merged (#5) |
 | M3 file operations | 🔄 engine + job spine + keyboard ops + inline rename/duplicate + marquee + drag & drop + context menus + review fixes done; the three new visual scenarios need their baselines generated on the macOS runner |
-| M4 icon view + dual pane → M8 ship | not started |
+| M4 icon view + dual pane | 🔄 fs-core thumbnails + icon view / view-mode switcher done; dual pane and thumbnail rendering in progress. The `icon_grid` visual scenario needs its baseline generated on the macOS runner |
+| M5 → M8 ship | not started |
 
 ## Components
 
@@ -240,6 +241,53 @@ unit + 3 integration + 187 app).
   - `DirView::list_viewport()` / `DirView::ROW_HEIGHT` are now **public**, so
     the visual scenarios can aim real mouse input at real painted pixels
     instead of re-deriving the chrome's height.
+- `views/icon_grid.rs` + `pane.rs`'s `ViewMode` (M4, §0 "View mode switcher" /
+  §8 "Icon grid"): `ViewMode { List, Icons }` lives on the **Pane** (§3
+  "handlers live on the entity that owns the state"), which handles
+  `SetViewList` / `SetViewIcons` from `cmd-1` / `cmd-2` **and** from a
+  segmented toolbar control that dispatches the same boxed actions — so the
+  switch logic exists exactly once and the M8 menu bar can reuse it.
+  `SetViewColumns` is declared (the §0 table needs the row) but Miller columns
+  stay a §8 stretch: the handler pushes a `JobsModel` notice
+  (`COLUMNS_UNAVAILABLE_NOTICE`) and leaves the current mode alone, rather
+  than being a menu item that silently does nothing — and the action is
+  deliberately **unbound**, with a keymap test that fails if a binding
+  appears.
+  The grid is a `uniform_list` whose **items are grid rows**: each item lays
+  out up to `cols` fixed-size tiles (`TILE_WIDTH` 96 × `TILE_HEIGHT` 88), so
+  `ceil(n / cols)` items cover the listing and virtualization is untouched.
+  `cols` is recomputed from the list's painted width (`cols_for_width`, floor,
+  never zero). Every piece of geometry is a **pure function of `(cols, len)`**
+  — `grid_row_count`, `row_items`, `step_index` (2D nav: ±1 / ±cols, no
+  wrapping, `Down` from above a ragged last row lands on the last tile, stale
+  indices clamped), `tile_at`, `tiles_in_rect` — and all of it is unit-tested
+  without a window, because the cursor, the marquee and the drop-target hit
+  test have to agree with the painted lattice.
+  The grid renders **DirView's one path-keyed `SelectionModel`**, so switching
+  mode preserves a multi-selection and the cursor and reloads nothing (a
+  `#[gpui::test]` asserts exactly that). It reuses the details list's other
+  behaviors rather than copying them: cut-dimming (`CUT_DIM_OPACITY`),
+  theme-only colors, `handle_row_click` (double-click opens, cmd/shift select,
+  slow second click arms rename), the drag payload + external Finder payload,
+  the drop-target tint, and — via the new shared
+  `rename::with_editor_actions` — the inline editor's focus/`TextInput`
+  context/action wiring, which `views/details_list.rs` now also calls instead
+  of spelling out twelve `on_action` forwards.
+  Mode-dependent behavior on `DirView` is routed through three small readers:
+  `view_mode(cx)` (read from the pane, never cached), `grid_cols()`, and
+  `index_at_content()` — the single hit test shared by the marquee's
+  empty-space rule, drag & drop's target arming and the context menu's target,
+  so no two gestures can disagree about what the pointer is over.
+  `up`/`down` step a whole line and PageUp/PageDown a viewport of lines
+  (`rows * cols` entries); `right`/`left` are horizontal motion in the grid
+  and expand/collapse in the list; `scroll_to_item` is called with `ix / cols`
+  in the grid, because a `uniform_list` item is a *line* there. The sortable
+  column header paints only in list mode (the `SortBy` action still works — it
+  lives on the pane). The tile's image slot (`ICON_PX` 48) paints a type
+  placeholder today; the thumbnail lane replaces that slot's *child*, so no
+  tile geometry — and therefore no hit test — changes when previews arrive.
+  A new `icon_grid` visual scenario (grid + a two-entry selection) is declared
+  and **awaits its first baseline from the macOS runner**.
 - `rename.rs` + the rename row in `views/details_list.rs` (M3): the §4c
   inline-rename state machine as a **field** of `DirView`
   (`rename: Option<RenameState>`), not an entity. `begin_rename` (from `f2`
@@ -933,6 +981,67 @@ unit + 3 integration + 187 app).
   External SSD + Camera (/Volumes/..., ejectable); `eject` removes the volume
   from subsequent reads so the sidebar eject flow is testable; used by
   Windows/Linux dev builds, tests, and visual scenarios.
+- `platform/` (M4 addition): `Platform::thumbnail(path, px) -> Result<Thumbnail>`
+  — "longest edge at most `px`, aspect preserved, never upscaled", with an
+  `Err` meaning *no preview available* (an ordinary outcome the icon grid falls
+  back to a type icon on, not a failure). `macos.rs` implements it in two tiers
+  inside a single `SpawnerExt::unblock`, exactly as plan §4 prescribes:
+  **QuickLookThumbnailing** (`objc2-quick-look-thumbnailing`
+  `QLThumbnailGenerator generateBestRepresentationForRequest:completionHandler:`,
+  representation types `All`), then an **`image`-crate decode** for anything
+  QuickLook declines. Verified working locally on this Mac (a 300×200 PNG at
+  px=64 comes back 64×43 with byte order confirmed RGBA). Three notes worth
+  keeping: (1) the completion handler runs on a QuickLook-owned queue, so the
+  `CGImage` is converted to plain bytes *inside* the handler and only a
+  `Vec<u8>` crosses the channel — `CFRetained<CGImage>` is not `Send` and
+  moving one would be unsound though it would compile; (2) the wait is bounded
+  (10 s, then `cancelRequest`) because QuickLook is an XPC round-trip to a
+  helper that can be cold, stuck, or absent, and an unbounded wait would park
+  an executor thread forever — a timeout simply falls through to the decoder;
+  (3) `CGBitmapContext` cannot produce straight RGBA, so the draw uses
+  `kCGImageByteOrder32Big | kCGImageAlphaPremultipliedLast` and the
+  premultiplication is undone afterwards, which makes the QuickLook and
+  `image` tiers agree on one documented pixel format (opaque pixels, i.e. most
+  thumbnails, are untouched by that step). `stub.rs` synthesizes pixels
+  instead: an FNV-1a hash of the path picks a base colour and one of three
+  aspect ratios (square/landscape/portrait, longest edge exactly `px`), and a
+  checkerboard-under-a-diagonal-gradient fills the tile — no I/O, no clock,
+  byte-identical on every platform and every run, so icon-grid unit tests and
+  visual scenarios have something stable to paint. `DefaultHasher` was
+  deliberately avoided (its output is explicitly unstable across releases and
+  these pixels end up in committed baselines).
+- `thumbnail.rs` (M4): the pixel type and the cache.
+  **`Thumbnail`** carries `width`/`height` plus `Arc<[u8]>` of tightly packed,
+  non-premultiplied, top-down RGBA8, constructed through a checked
+  `Thumbnail::new` (the bytes come from OS APIs and decoders, so a length
+  mismatch is a runtime condition, not a caller bug). *Decoded* pixels rather
+  than an encoded blob, deliberately: gpui ingests raw RGBA, so a blob would
+  only move the decode into the render pass that the plan's threading rule
+  forbids; the byte budget below becomes exact (`w*h*4`) instead of
+  entropy-dependent; and no container format has to leak across the fs-core
+  seam. `MAX_PX = 4096` + `validate_px` are shared by every implementation so
+  the size contract is one rule rather than three.
+  **`ThumbnailCache`** is LRU bounded by *bytes resident* per ARCHITECTURE §M4
+  (an entry cap cannot bound this: 64 entries is 590 KB of 64px tiles or 67 MB
+  of 2048px ones), default budget 64 MB, styled after `ListingCache`
+  (MRU-first `VecDeque`, `get` promotes, `insert` is the write-back). `insert`
+  replaces the whole `(path, px)` slot, then evicts from the LRU end until the
+  newcomer fits, and **returns `false` for a thumbnail bigger than the entire
+  budget** — rejected rather than admitted, so it can neither be stored nor
+  wedge the cache by evicting everything and still not fitting.
+  **`ThumbnailKey` = `(path, px, ContentStamp)`** where `ContentStamp` is
+  `(mtime-as-nanos, size)`: `px` because the same file at 48px and 256px are
+  different images, and the stamp because a thumbnail keyed on path alone
+  survives an edit and a picture of the old contents is a real bug. Both stamp
+  fields are already on `FileEntry`, so the grid builds a key from a listing
+  row with no extra `stat` (`ThumbnailKey::for_entry`). One deliberate design
+  call: a stamp mismatch **misses without evicting** the entry it failed to
+  match — the cache cannot tell which of two stamps is newer, so evicting on
+  mismatch would let a caller holding a stale stamp discard a *fresher*
+  thumbnail; the stale bytes are reclaimed by the `insert` that follows the
+  miss. `invalidate(path)` drops every size and version of one path (the
+  write-back for a watcher removal/replacement); `clear()` drops everything
+  (e.g. leaving icon view).
 - `Vfs` grew `load(path) -> Vec<u8>` and `atomic_write(path, data)` (M2, per
   §6): RealVfs writes a `tempfile::NamedTempFile` **in the destination's own
   directory**, syncs, then persists (rename) over the destination — old or
@@ -1079,7 +1188,8 @@ component sections; this list is the scannable index.
   re-applying it (a patch no longer restores scroll at all, so external changes
   leave the list where the user left it). Fixing the restore properly means
   reading the scroll handle at capture time, which changes what several pane
-  tests assert. *M4, with the icon view's own scroll bookkeeping.*
+  tests assert. *Still open after the M4 icon view: the grid scrolls by
+  `ix / cols` items, which is the same handle and the same missing capture.*
 - **Expansion state is never pruned when a folder leaves the listing.** The
   *selection* and the *cursor* are (a folder that vanished stops contributing
   its cached children — see `DirView::listing_ids`), and nothing invisible can
@@ -1100,10 +1210,12 @@ component sections; this list is the scannable index.
   scroll. Autoscroll therefore only engages when the projection grows
   **mid-gesture** (an expanded folder's children landing — the path the
   `#[gpui::test]` drives — or a watcher patch) or the window shrinks under the
-  drag. It is fully implemented per §8 and pays off in the M4 icon grid, whose
-  empty space is plentiful; giving details rows Explorer's narrower
+  drag. It is fully implemented per §8 and now pays off in the M4 icon grid,
+  whose empty space *is* plentiful (a ragged last row leaves space to the right
+  of its last tile, and `index_at_content` correctly calls that empty), so the
+  gesture is routinely reachable there; giving details rows Explorer's narrower
   (columns-only) hit region would make it routinely reachable in the list too.
-  *M4.*
+  *Details-list half only.*
 - **Finder interop can only be proved on a real Mac.** The *inbound* half is
   covered headlessly (gpui turns a platform file drop into an internal
   `ExternalPaths` drag, so `FileDropEvent`s drive the real code path), but the
@@ -1193,6 +1305,21 @@ component sections; this list is the scannable index.
   triggers CI — after baselines land, push a normal commit so the required `CI`
   check runs on the new HEAD. *Standing procedure.*
 
+- **No auto-hide scrollbar** (§8 widget list, "M4 polish"): both views use
+  `uniform_list`'s default scrolling, with no thin fading overlay bar. The icon
+  grid makes it more noticeable than the list did, since a grid is usually
+  taller than one viewport. *M4 polish / M7 chrome.*
+- **Icon-grid tiles paint a type placeholder, not a thumbnail.** `fs-core`'s
+  `Platform::thumbnail` + `ThumbnailCache` exist; the tile's fixed-size image
+  slot is the drop-in point (`icon_grid::tile_image`, `ICON_PX`), deliberately
+  shaped so a real preview changes no geometry and therefore no hit test.
+  *M4 thumbnail wiring.*
+- **Tile labels are single-line and truncated**; Explorer wraps an icon-view
+  label to two lines and shows the full name for the selected tile. Wrapping
+  would make tile height depend on the label, which the fixed-height
+  `uniform_list` item (and every hit test derived from it) forbids — so this
+  needs a second, taller tile variant rather than a flexible one. *M7 polish.*
+
 ## Deviations from the plan
 
 - Theme lives as a module in `crates/app` instead of its own crate until the
@@ -1235,3 +1362,5 @@ component sections; this list is the scannable index.
 | 2026-08-23 | — | M3 drag & drop (`drag.rs`): `DraggedEntries` payload built at render, per-pane `DropTarget` with out-of-bounds self-clear, 500ms spring-load on `Spawner::timer`, move/copy modifier + cursor flip, `ExternalPaths` in and `external_drag_payload` out; sidebar Favorites drag-to-add and reordering (the M2-deferred gap) via path-keyed `AppSettings::move_favorite`. 242 tests. |
 | 2026-08-23 | — | M3 context menus (`context_menu.rs`): row + background menus whose every row dispatches a boxed `actions.rs` action via `window.dispatch_action`, right-click hit-tested with the shared row-band arithmetic (selects its target first), disabled-not-absent rows, one-level `New ▸` / `Sort by ▸` submenus, full-window scrim dismissal + `escape` via a `menu` key-context token. Closes two gaps: `New ▸ Folder / Text file…` now opens the §4c inline editor on a phantom row (`is_new_entry`, nothing created until commit), and `DeletePermanently` — bound but unhandled — is wired to the workspace ConfirmDialog. 266 tests. |
 | 2026-08-23 | — | M3 review fixes + visual scenarios: watch registration **and** unregistration moved off the UI thread (`BackgroundWatchGuard`) and no longer torn down by an in-place reload (`watch_generation`); details/Favorites rows keyed by **path** so a mid-gesture re-projection can't hand a press to another entry; an inline editor whose row vanishes is torn down (it used to lock the whole view out) with focus handed back; a watcher patch no longer re-applies `scroll_top`; `listing_ids` stops the selection/cursor retaining children of a folder that left the listing; Explorer's volume rule for drag & drop (`drop_copies`: move within a volume, copy across, ⌥ copies, ⇧ moves) with the drop reading the armed state instead of the release modifiers; spring-load armed only for an accepted target and re-armed after a spent timer; a press in empty space deselects; the checked `Sort by` row is inert; `OpenSelected` opens the whole selection; Favorites drop zone given a minimum height, tints for every payload it accepts, and queued (never cancelled) probes. New scenarios `cut_dimmed`, `context_menu_open`, `marquee_active` — **baselines pending from the macOS runner**. 283 tests (93 fs-core unit + 3 integration + 187 app). |
+| 2026-08-23 | — | M4 view modes: `ViewMode` on `Pane` with `SetViewList`/`SetViewIcons` (`cmd-1`/`cmd-2` + toolbar switcher, same boxed actions) and `SetViewColumns` as an explicit "not implemented" notice; `views/icon_grid.rs` — chunked-row `uniform_list`, pure `(cols, len)` geometry, 2D index-arithmetic navigation, DirView's shared selection, cut-dimming/drag/drop/rename reuse; `rename::with_editor_actions` extracted; mode-aware `index_at_content` shared by marquee, drag and context menu; `icon_grid` visual scenario declared (baseline pending). 320 tests (112 fs-core unit + 3 integration + 205 app). |
+| 2026-08-23 | — | M4 fs-core thumbnails: `Platform::thumbnail(path, px)` returning decoded RGBA (`thumbnail::Thumbnail`), QuickLookThumbnailing on macOS with a bounded wait and an `image`-crate fallback tier, deterministic synthesized pixels in the stub, and the LRU **byte-budget** `ThumbnailCache` keyed on `(path, px, mtime+size)`. 302 tests (112 fs-core unit + 3 integration + 187 app). |
