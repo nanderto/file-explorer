@@ -32,9 +32,13 @@ fn main() {
 mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
     use file_explorer_app::app_state::{FsContext, GpuiSpawner, LoggingOpener};
+    use file_explorer_app::dir_view::DirView;
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
     use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Vfs};
-    use gpui::{AnyWindowHandle, AppContext as _, Entity, VisualTestAppContext, px, size};
+    use gpui::{
+        AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, MouseButton, Pixels,
+        VisualTestAppContext, point, px, size,
+    };
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -79,6 +83,16 @@ mod macos {
         /// Navigate, then open the inline rename editor on one entry with its
         /// stem preselected (M3, §4c).
         RenameEditing(&'static str, &'static str),
+        /// Navigate, select entries and `Cut` them: the sources render dimmed
+        /// (M3, plan §3 "cut items render dimmed").
+        CutSelection(&'static str, &'static [&'static str]),
+        /// Navigate, then right-click the empty space below the last row so the
+        /// **background** context menu is open (M3, §8).
+        ContextMenuOpen(&'static str),
+        /// Navigate, then press in the empty space below the rows and drag up
+        /// **without releasing**, so the rubber band and the rows it has
+        /// selected are both live in the captured frame (M3, §8).
+        MarqueeActive(&'static str),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -118,6 +132,22 @@ mod macos {
                 "details_rename_editing",
                 Theme::dark(),
                 Setup::RenameEditing("/home/Documents", "/home/Documents/report.pdf"),
+            ),
+            // The three M3 mouse-surface states ARCHITECTURE §8 asks for.
+            (
+                "cut_dimmed",
+                Theme::dark(),
+                Setup::CutSelection("/home", &["/home/archive.zip", "/home/readme.md"]),
+            ),
+            (
+                "context_menu_open",
+                Theme::dark(),
+                Setup::ContextMenuOpen("/home"),
+            ),
+            (
+                "marquee_active",
+                Theme::dark(),
+                Setup::MarqueeActive("/home"),
             ),
         ]
     }
@@ -316,8 +346,91 @@ mod macos {
                 })
                 .map_err(|e| anyhow!("rename setup failed: {e:?}"))?;
             }
+            Setup::CutSelection(path, targets) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let dir_view = active_dir_view(cx, workspace);
+                cx.update_window(handle, |_, _, cx| {
+                    dir_view.update(cx, |dir_view, cx| {
+                        let paths: Vec<&Path> = targets.iter().map(|p| Path::new(*p)).collect();
+                        dir_view.select_paths(&paths, cx);
+                        dir_view.cut_selection(cx);
+                    });
+                })
+                .map_err(|e| anyhow!("cut setup failed: {e:?}"))?;
+            }
+            Setup::ContextMenuOpen(path) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                // Right-click the empty space below the last row: the
+                // background menu, which is the richer of the two (a ✓, two
+                // submenu arrows, and a disabled Paste).
+                let at = below_last_row(cx, workspace, 30.0);
+                cx.simulate_mouse_down(handle, at, MouseButton::Right, Modifiers::none());
+                cx.simulate_mouse_up(handle, at, MouseButton::Right, Modifiers::none());
+            }
+            Setup::MarqueeActive(path) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                // Press in the empty space below the rows, then drag up over
+                // them. The gesture is deliberately **not** released, so the
+                // band, its border and the rows it has selected all paint.
+                let viewport = list_geometry(cx, workspace).0;
+                let from = below_last_row(cx, workspace, 40.0);
+                let to = point(
+                    viewport.left() + px(360.0),
+                    viewport.top() + px(2.0 * DirView::ROW_HEIGHT + 10.0),
+                );
+                cx.simulate_mouse_down(handle, from, MouseButton::Left, Modifiers::none());
+                // The first move trips gpui's 2px drag threshold and creates
+                // the drag; the second is the one the marquee follows.
+                cx.simulate_mouse_move(
+                    handle,
+                    from + point(px(6.0), px(-6.0)),
+                    MouseButton::Left,
+                    Modifiers::none(),
+                );
+                cx.simulate_mouse_move(handle, to, MouseButton::Left, Modifiers::none());
+            }
         }
         Ok(())
+    }
+
+    fn active_dir_view(
+        cx: &mut VisualTestAppContext,
+        workspace: &Entity<Workspace>,
+    ) -> Entity<DirView> {
+        let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+        cx.read(|cx| pane.read(cx).dir_view().clone())
+    }
+
+    /// The details list's painted viewport and how many rows it is showing —
+    /// the two numbers every pointer coordinate below is derived from, so a
+    /// scenario never hard-codes the chrome's height.
+    fn list_geometry(
+        cx: &mut VisualTestAppContext,
+        workspace: &Entity<Workspace>,
+    ) -> (Bounds<Pixels>, usize) {
+        let dir_view = active_dir_view(cx, workspace);
+        cx.read(|cx| {
+            let view = dir_view.read(cx);
+            (view.list_viewport(), view.flat_rows().len())
+        })
+    }
+
+    /// A point `offset` px below the last row, inside the list's empty space —
+    /// where a marquee may start and where a right-click opens the background
+    /// menu.
+    fn below_last_row(
+        cx: &mut VisualTestAppContext,
+        workspace: &Entity<Workspace>,
+        offset: f32,
+    ) -> gpui::Point<Pixels> {
+        let (viewport, rows) = list_geometry(cx, workspace);
+        point(
+            viewport.left() + px(80.0),
+            viewport.top() + px(rows as f32 * DirView::ROW_HEIGHT + offset),
+        )
     }
 
     fn run_scenario(

@@ -28,6 +28,8 @@ This table is the **literal source of truth for `crates/app/src/keymap.rs`** and
 | §3 Cut/paste | Cut (dim sources), Copy, Paste (move on cut) | `cmd-x` / `cmd-c` / `cmd-v` | `Cut` / `Copy` / `Paste` | `DirView && !renaming` | DirView → FsContext | M3 |
 | §3 New folder/file | New folder | `cmd-shift-n`, context menu | `NewFolder` | `Pane` | Pane → DirView | M3 |
 | §3 New folder/file | New text file | context menu **New ▸ Text file…** | `NewFile` | `Pane` | Pane → DirView | M3 |
+| §8 Context menu | Open the row / background context menu | **right-click** (mouse, not keymap; macOS ctrl-click arrives as one) | — (the menu's rows dispatch the boxed actions in this table) | — | DirView / context_menu | M3 |
+| §8 Context menu | Dismiss the open context menu | `escape` (a click anywhere also dismisses) | `Cancel` | `DirView && menu` | DirView | M3 |
 | toolbar | Duplicate selection | `cmd-d`, toolbar | `Duplicate` | `DirView && !renaming` | DirView | M3 |
 | §3 Sorting | Sort by column, arrow indicator, folders-first | header click | `SortBy { key }` | — (mouse dispatch) | DirView | M1 |
 | §3 Selection | Select all | `cmd-a` | `SelectAll` | `DirView && !renaming` | DirView | M1 |

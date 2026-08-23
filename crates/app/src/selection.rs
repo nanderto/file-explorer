@@ -8,7 +8,8 @@
 //! rows or views.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fs_core::EntryId;
 
@@ -53,16 +54,33 @@ impl SelectionModel {
     /// expansion makes this easy), ops must act on the root-most paths only —
     /// trashing the folder already takes its children with it.
     pub fn selected_paths_rootmost(&self) -> Vec<PathBuf> {
-        self.selected
+        self.selected_rootmost()
             .iter()
-            .filter(|id| {
-                !self
-                    .selected
-                    .iter()
-                    .any(|other| *other != **id && id.0.starts_with(&other.0))
-            })
-            .map(|id| id.0.to_path_buf())
+            .map(|path| path.to_path_buf())
             .collect()
+    }
+
+    /// [`Self::selected_paths_rootmost`] without the `PathBuf` copies — the
+    /// `Arc<Path>` keys themselves, for the drag payload, which is rebuilt on
+    /// every frame a drag-capable row paints.
+    ///
+    /// Linear in the selection: the set is ordered by path, and path ordering
+    /// is component-wise, so *every* descendant of a kept path sorts directly
+    /// after it and before anything that is not a descendant. One walk with a
+    /// single "last kept" anchor therefore drops exactly the descendants
+    /// (`"/a"` keeps `"/a b"` — `Path::starts_with` is component-wise too —
+    /// while dropping `"/a/b"` and `"/a/b/c"`).
+    pub fn selected_rootmost(&self) -> Vec<Arc<Path>> {
+        let mut rootmost: Vec<Arc<Path>> = Vec::new();
+        for id in &self.selected {
+            let covered = rootmost
+                .last()
+                .is_some_and(|kept| id.0.starts_with(kept) && id.0 != *kept);
+            if !covered {
+                rootmost.push(id.0.clone());
+            }
+        }
+        rootmost
     }
 
     pub fn clear(&mut self) {
@@ -116,6 +134,33 @@ impl SelectionModel {
     /// `cmd-a`: select every visible row. Cursor and anchor are unchanged.
     pub fn select_all(&mut self, order: &[EntryId]) {
         self.selected = order.iter().cloned().collect();
+    }
+
+    /// Rubber-band marquee ([`crate::marquee`]): the selection becomes
+    /// `base ∪ rows`, recomputed from scratch on every pointer move.
+    ///
+    /// `base` is the selection the gesture started from — **empty** for a
+    /// plain drag, which replaces, and the pre-gesture set for an additive
+    /// `cmd`-drag, which unions (Explorer behavior). Recomputing rather than
+    /// accumulating is what makes shrinking the band give back exactly the
+    /// rows the band itself had added, and nothing the user had selected
+    /// before it.
+    ///
+    /// `focus` is the row under the band's moving corner: the cursor and
+    /// anchor follow it so a `shift`-arrow after the drag extends from where
+    /// the pointer stopped. An empty band leaves them where they were.
+    pub fn select_marquee(
+        &mut self,
+        base: &BTreeSet<EntryId>,
+        rows: &[EntryId],
+        focus: Option<EntryId>,
+    ) {
+        self.selected = base.clone();
+        self.selected.extend(rows.iter().cloned());
+        if let Some(focus) = focus {
+            self.cursor = Some(focus.clone());
+            self.anchor = Some(focus);
+        }
     }
 
     /// Survival across fresh loads and watcher patches: drop ids that
@@ -234,6 +279,44 @@ mod tests {
     }
 
     #[test]
+    fn select_marquee_replaces_or_unions_and_follows_the_moving_corner() {
+        let mut model = SelectionModel::default();
+        model.select_only(id("/d/a"));
+
+        // Plain drag: an empty base replaces the earlier selection, and the
+        // cursor/anchor land on the band's moving corner.
+        model.select_marquee(&BTreeSet::new(), &ids(&["/d/c", "/d/d"]), Some(id("/d/d")));
+        assert_eq!(selected(&model), ids(&["/d/c", "/d/d"]));
+        assert_eq!(model.cursor(), Some(&id("/d/d")));
+
+        // Additive drag: the base survives, and shrinking the band gives back
+        // only the row the band had added.
+        let base = ids(&["/d/a"]).into_iter().collect::<BTreeSet<_>>();
+        model.select_marquee(&base, &ids(&["/d/c", "/d/d"]), Some(id("/d/c")));
+        assert_eq!(selected(&model), ids(&["/d/a", "/d/c", "/d/d"]));
+        model.select_marquee(&base, &ids(&["/d/c"]), Some(id("/d/c")));
+        assert_eq!(
+            selected(&model),
+            ids(&["/d/a", "/d/c"]),
+            "/d/d let go, /d/a kept"
+        );
+        assert_eq!(model.cursor(), Some(&id("/d/c")));
+    }
+
+    #[test]
+    fn select_marquee_with_an_empty_band_clears_but_keeps_the_cursor() {
+        let mut model = SelectionModel::default();
+        model.select_only(id("/d/b"));
+        model.select_marquee(&BTreeSet::new(), &[], None);
+        assert!(model.is_empty(), "a band over nothing selects nothing");
+        assert_eq!(
+            model.cursor(),
+            Some(&id("/d/b")),
+            "the cursor is left where it was, unselected"
+        );
+    }
+
+    #[test]
     fn retain_prunes_vanished_ids_and_dangling_cursor() {
         let mut model = SelectionModel::default();
         model.select_only(id("/d/a"));
@@ -271,5 +354,41 @@ mod tests {
             vec![PathBuf::from("/d/other.txt"), PathBuf::from("/d/sub")]
         );
         assert_eq!(model.selected_paths().len(), 3, "raw list is unfiltered");
+    }
+
+    #[test]
+    fn rootmost_walks_the_ordered_set_once_without_over_pruning() {
+        // The linear "last kept" walk leans on path order being component-wise:
+        // every descendant sorts directly after its ancestor, and a *sibling*
+        // whose name merely starts with the same characters does not. Nested
+        // levels, a name that is a string-prefix of the kept folder, and a
+        // later unrelated subtree all have to come out right.
+        let mut model = SelectionModel::default();
+        for path in [
+            "/d/sub",
+            "/d/sub/deep",
+            "/d/sub/deep/leaf.txt",
+            "/d/subtle.txt",
+            "/d/zed/inner",
+            "/d/zed/inner/x.txt",
+        ] {
+            model.toggle(id(path));
+        }
+        // /d/sub covers both of its descendants (two levels down included);
+        // /d/subtle.txt is a sibling, not a child, so it stays; /d/zed/inner
+        // covers its own child even though /d/sub was the last kept before it.
+        let expected: Vec<Arc<Path>> = ["/d/sub", "/d/subtle.txt", "/d/zed/inner"]
+            .iter()
+            .map(|p| Arc::from(Path::new(p)))
+            .collect();
+        assert_eq!(model.selected_rootmost(), expected);
+        assert_eq!(
+            model.selected_paths_rootmost(),
+            vec![
+                PathBuf::from("/d/sub"),
+                PathBuf::from("/d/subtle.txt"),
+                PathBuf::from("/d/zed/inner"),
+            ]
+        );
     }
 }

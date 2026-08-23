@@ -1,7 +1,7 @@
 //! Directory listings: snapshots, incremental patching, and the per-pane LRU
 //! cache (ARCHITECTURE.md §6, `listing.rs`).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use futures::StreamExt as _;
 use crate::entry::FileEntry;
 use crate::sort::SortSpec;
 use crate::vfs::Vfs;
+use crate::watcher::{PathEvent, PathEventKind};
 
 /// One immutable, sorted view of a directory. Cheap to clone (`Arc` inside);
 /// replaced wholesale on load and on watcher patches.
@@ -95,6 +96,93 @@ pub fn patch_listing(snapshot: &ListingSnapshot, patches: Vec<ListingPatch>) -> 
         sort: snapshot.sort,
         generation: snapshot.generation,
         show_hidden: snapshot.show_hidden,
+    }
+}
+
+/// One debounced watcher batch resolved against the filesystem: what to fold
+/// into the snapshot, whether the batch forces a full reload, and which
+/// directories' contents it touched.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedBatch {
+    /// Patches for direct children of the watched directory, in event order
+    /// (feed straight to [`patch_listing`]).
+    pub patches: Vec<ListingPatch>,
+    /// A `Rescan` was in the batch: incremental events are no longer
+    /// trustworthy, so the consumer reloads the directory in full
+    /// ([`list_dir`]) instead of patching.
+    pub reload: bool,
+    /// Every directory whose contents the batch touched, sorted and
+    /// deduplicated — the watched directory itself when one of its children
+    /// changed, plus deeper directories when the backend reports descendants.
+    /// This is the invalidation set for *cached child listings* (the details
+    /// view's in-place expansion, the sidebar tree), which must not survive an
+    /// external change to the folder they came from.
+    pub changed_dirs: Vec<Arc<Path>>,
+}
+
+/// Turn one debounced watcher batch for `dir` into [`ListingPatch`]es.
+///
+/// Stats only the changed **direct children** of `dir` — a `Created`/`Changed`
+/// path that no longer stats (created and deleted inside one debounce window,
+/// or now unreadable) resolves to [`ListingPatch::Remove`], so a patched
+/// snapshot never keeps a row the filesystem no longer has. Events for deeper
+/// paths produce no patch; they only contribute their parent directory to
+/// [`ResolvedBatch::changed_dirs`].
+///
+/// Owned arguments so the returned future is `'static` — callers run it
+/// wholesale on the background executor (the UI thread never stats).
+pub async fn resolve_watch_batch(
+    vfs: Arc<dyn Vfs>,
+    dir: Arc<Path>,
+    batch: Vec<PathEvent>,
+) -> ResolvedBatch {
+    // Rescan swallows its batch in the watcher already; a full reload is the
+    // only sound response, and every cached child listing is suspect.
+    if batch
+        .iter()
+        .any(|event| event.kind == PathEventKind::Rescan)
+    {
+        return ResolvedBatch {
+            patches: Vec::new(),
+            reload: true,
+            changed_dirs: vec![dir],
+        };
+    }
+
+    let mut changed_dirs: BTreeSet<Arc<Path>> = BTreeSet::new();
+    // First-seen order, newest kind per path: one stat per changed child even
+    // when a paste-storm reported it several times.
+    let mut order: Vec<Arc<Path>> = Vec::new();
+    let mut kinds: HashMap<Arc<Path>, PathEventKind> = HashMap::new();
+    for event in batch {
+        let Some(parent) = event.path.parent() else {
+            continue; // a root has no listing to patch
+        };
+        changed_dirs.insert(Arc::from(parent));
+        if parent != dir.as_ref() {
+            continue;
+        }
+        if kinds.insert(event.path.clone(), event.kind).is_none() {
+            order.push(event.path);
+        }
+    }
+
+    let mut patches = Vec::with_capacity(order.len());
+    for path in order {
+        let meta = if kinds[&path] == PathEventKind::Removed {
+            None
+        } else {
+            vfs.metadata(&path).await.ok().flatten()
+        };
+        patches.push(match meta {
+            Some(meta) => ListingPatch::Upsert(meta.into_entry(path)),
+            None => ListingPatch::Remove(path),
+        });
+    }
+    ResolvedBatch {
+        patches,
+        reload: false,
+        changed_dirs: changed_dirs.into_iter().collect(),
     }
 }
 
@@ -318,6 +406,138 @@ mod tests {
         let showing = list(&vfs, SortSpec::default(), true);
         let patched = patch_listing(&showing, vec![ListingPatch::Upsert(file(".sneaky", true))]);
         assert!(names(&patched).contains(&".sneaky"));
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_watch_batch: watcher events → patches + invalidation set
+    // ------------------------------------------------------------------
+
+    fn event(path: &str, kind: PathEventKind) -> PathEvent {
+        PathEvent {
+            path: Arc::from(PathBuf::from(path).as_path()),
+            kind,
+        }
+    }
+
+    fn resolve(vfs: &Arc<FakeVfs>, dir: &str, batch: Vec<PathEvent>) -> ResolvedBatch {
+        block_on(resolve_watch_batch(
+            vfs.clone() as Arc<dyn Vfs>,
+            Arc::from(PathBuf::from(dir)),
+            batch,
+        ))
+    }
+
+    #[test]
+    fn resolve_watch_batch_folds_creates_and_removes_into_the_snapshot() {
+        let vfs = fixture_vfs();
+        // Snapshot first, then change the world behind it — exactly the order
+        // a live pane sees.
+        let snapshot = list(&vfs, SortSpec::default(), false);
+        vfs.insert_file("/root/file3.txt", 3);
+        vfs.remove_path("/root/file2.txt");
+
+        let resolved = resolve(
+            &vfs,
+            "/root",
+            vec![
+                event("/root/file3.txt", PathEventKind::Created),
+                event("/root/file2.txt", PathEventKind::Removed),
+            ],
+        );
+        let patched = patch_listing(&snapshot, resolved.patches);
+        assert_eq!(
+            names(&patched),
+            ["Alpha", "zeta", "file3.txt", "file10.txt"],
+            "the created file lands in sort position, the removed one is gone"
+        );
+    }
+
+    #[test]
+    fn resolve_watch_batch_treats_a_vanished_create_as_a_removal() {
+        // Created then deleted inside one debounce window: the stat misses, so
+        // the patch must be a removal, never an upsert of a ghost row.
+        let vfs = fixture_vfs();
+        let resolved = resolve(
+            &vfs,
+            "/root",
+            vec![event("/root/ghost.txt", PathEventKind::Created)],
+        );
+        assert!(matches!(
+            resolved.patches.as_slice(),
+            [ListingPatch::Remove(path)] if &**path == Path::new("/root/ghost.txt")
+        ));
+    }
+
+    #[test]
+    fn resolve_watch_batch_stats_each_changed_path_once() {
+        let vfs = fixture_vfs();
+        vfs.insert_file("/root/file2.txt", 77);
+        let resolved = resolve(
+            &vfs,
+            "/root",
+            vec![
+                event("/root/file2.txt", PathEventKind::Created),
+                event("/root/file2.txt", PathEventKind::Changed),
+            ],
+        );
+        assert_eq!(resolved.patches.len(), 1, "one patch per changed path");
+        assert!(matches!(
+            &resolved.patches[0],
+            ListingPatch::Upsert(entry) if entry.size == 77
+        ));
+    }
+
+    #[test]
+    fn resolve_watch_batch_reports_changed_dirs_without_patching_descendants() {
+        let vfs = fixture_vfs();
+        vfs.insert_file("/root/zeta/deep.txt", 1);
+        let resolved = resolve(
+            &vfs,
+            "/root",
+            vec![
+                event("/root/zeta/deep.txt", PathEventKind::Created),
+                event("/root/file2.txt", PathEventKind::Removed),
+            ],
+        );
+        assert_eq!(
+            resolved.patches.len(),
+            1,
+            "only direct children patch the listing"
+        );
+        let dirs: Vec<PathBuf> = resolved
+            .changed_dirs
+            .iter()
+            .map(|d| d.to_path_buf())
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/root"), PathBuf::from("/root/zeta")],
+            "both the watched dir and the deeper one are invalidation targets"
+        );
+        assert!(!resolved.reload);
+    }
+
+    #[test]
+    fn resolve_watch_batch_rescan_requests_a_full_reload() {
+        let vfs = fixture_vfs();
+        let resolved = resolve(
+            &vfs,
+            "/root",
+            vec![
+                event("/root/file2.txt", PathEventKind::Removed),
+                event("", PathEventKind::Rescan),
+            ],
+        );
+        assert!(resolved.reload, "Rescan cannot be applied incrementally");
+        assert!(resolved.patches.is_empty());
+        assert_eq!(
+            resolved
+                .changed_dirs
+                .iter()
+                .map(|d| d.to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/root")]
+        );
     }
 
     #[test]

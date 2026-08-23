@@ -10,23 +10,50 @@
 //! guard) and scroll bookkeeping; the cursor/selection is **owned by the
 //! child [`DirView`]** (ARCHITECTURE.md §2) — the accessors here delegate so
 //! `NavEntry` capture/restore keeps working against the one true cursor.
+//!
+//! The open directory is kept **live** by its own debounced watch
+//! (`Pane::start_watch`): each batch is resolved off the UI thread and folded
+//! in with [`fs_core::patch_listing`], so external changes — and completed
+//! file operations — appear with no explicit `Refresh` (§4b: "no explicit
+//! refresh — the dest dir's watcher batch patches the listing"). Because the
+//! pane owns the snapshot, the watch lives here rather than in the `DirView`
+//! as §4a's diagram sketches.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fs_core::{
-    EntryId, FileOp, ListingCache, ListingSnapshot, SortDirection, SortKey, SortSpec, Vfs, list_dir,
+    EntryId, ListingCache, ListingSnapshot, ResolvedBatch, SortDirection, SortKey, SortSpec, Vfs,
+    WatchGuard, list_dir, patch_listing, resolve_watch_batch,
 };
+use futures::StreamExt as _;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, NavigationDirection,
-    Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    App, BackgroundExecutor, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
+    MouseButton, NavigationDirection, Render, SharedString, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 
 use crate::actions::{GoBack, GoForward, GoUp, NewFile, NewFolder, Refresh, SortBy};
 use crate::address_bar::{AddressBar, AddressBarEvent};
 use crate::app_state::FsContext;
 use crate::dir_view::{DirView, DirViewEvent};
+use crate::rename::NewEntryKind;
 use crate::theme::Theme;
+
+/// Debounce window for the open directory's watcher (ARCHITECTURE.md §4a:
+/// `vfs.watch(path, 100ms)`). Runs on [`fs_core::Spawner::timer`], so
+/// `#[gpui::test]`s drive it with `advance_clock`.
+pub const WATCH_LATENCY: Duration = Duration::from_millis(100);
+
+/// Events up (ARCHITECTURE.md §2): the workspace subscribes and acts.
+pub enum PaneEvent {
+    /// A watcher batch reported external changes inside these directories.
+    /// The pane has already patched its own listing and invalidated its
+    /// details view's expansion children; the workspace forwards this to the
+    /// sidebar, whose tree caches child listings of its own.
+    DirsChanged(Vec<Arc<Path>>),
+}
 
 /// One history slot: where we were **and** what it looked like — back/forward
 /// must restore cursor and scroll, not just location (ARCHITECTURE.md §2).
@@ -90,6 +117,40 @@ impl NavHistory {
     }
 }
 
+/// A [`WatchGuard`] whose *unregistration* is kept off the UI thread.
+///
+/// Registering a watch is not the only blocking, disk-touching half of
+/// `Vfs::watch`: dropping the guard calls the backend's `unwatch`, which on
+/// macOS stops and joins an FSEvents run-loop thread and canonicalizes the
+/// path again. So the guard is never dropped in place — dropping this wrapper
+/// hands it to the background executor (§5: the UI thread never touches the
+/// disk).
+struct BackgroundWatchGuard {
+    guard: Option<WatchGuard>,
+    executor: BackgroundExecutor,
+}
+
+impl BackgroundWatchGuard {
+    fn new(guard: WatchGuard, executor: BackgroundExecutor) -> Self {
+        Self {
+            guard: Some(guard),
+            executor,
+        }
+    }
+}
+
+impl Drop for BackgroundWatchGuard {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            self.executor
+                .spawn(async move {
+                    drop(guard);
+                })
+                .detach();
+        }
+    }
+}
+
 /// Whether the address bar renders as breadcrumb segments or as the editable
 /// path input (ARCHITECTURE.md §2). The input itself is `address_bar.rs` (M1,
 /// separate build step); the mode lives here because the pane owns it.
@@ -129,6 +190,17 @@ pub struct Pane {
     load_error: Option<String>,
     _load_task: Option<Task<()>>,
     _free_space_task: Option<Task<()>>,
+    /// Registration for the open directory's watch: dropping it unregisters
+    /// (§6, off the UI thread — see [`BackgroundWatchGuard`]), and it is
+    /// replaced whenever the *directory* changes — so navigating away stops
+    /// watching the directory we left, and dropping the pane stops everything.
+    _watch_guard: Option<BackgroundWatchGuard>,
+    /// The pump folding that watch's debounced batches into the snapshot; a
+    /// field, never detached (§5), so it dies with the pane.
+    _watch_pump: Option<Task<()>>,
+    /// Bumped only when the *watched directory* changes, so an in-place reload
+    /// (refresh, sort flip, hidden toggle) does not invalidate the live pump.
+    watch_generation: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -181,6 +253,9 @@ impl Pane {
             load_error: None,
             _load_task: None,
             _free_space_task: None,
+            _watch_guard: None,
+            _watch_pump: None,
+            watch_generation: 0,
             _subscriptions: vec![subscription, bar_subscription],
         }
     }
@@ -274,20 +349,29 @@ impl Pane {
         cx.notify();
     }
 
-    /// §0 "New folder" (`cmd-shift-n`, context menu): create a fresh,
-    /// non-conflicting folder in the current directory through the job queue
-    /// (undoable; completion toasts via the JobsModel).
-    pub fn new_folder(&mut self, cx: &mut Context<Self>) {
-        self.create_new_entry(true, cx);
+    /// §0 "New folder" (`cmd-shift-n`, context menu).
+    pub fn new_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_new_entry(NewEntryKind::Folder, window, cx);
     }
 
     /// §0 "New text file" (context menu **New ▸ Text file…** — no key row).
-    pub fn new_file(&mut self, cx: &mut Context<Self>) {
-        self.create_new_entry(false, cx);
+    pub fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_new_entry(NewEntryKind::File, window, cx);
     }
 
-    fn create_new_entry(&mut self, folder: bool, cx: &mut Context<Self>) {
-        let Some(dir) = self.path.as_deref() else {
+    /// §0's handler column for both rows is "Pane → DirView": the pane owns
+    /// the destination directory and picks the non-conflicting placeholder
+    /// name, then the details view opens the §4c inline editor on a phantom
+    /// row so the user names it. The `CreateDir`/`CreateFile` op is submitted
+    /// by that editor's `Confirm` (see [`crate::rename`]), not here — so a
+    /// cancelled naming leaves nothing behind.
+    fn create_new_entry(
+        &mut self,
+        kind: NewEntryKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = self.path.clone() else {
             return;
         };
         let existing: std::collections::BTreeSet<String> = self
@@ -295,18 +379,13 @@ impl Pane {
             .as_ref()
             .map(|snap| snap.entries.iter().map(|e| e.name.to_string()).collect())
             .unwrap_or_default();
-        let name = if folder {
-            next_available_name("New Folder", "", &existing)
-        } else {
-            next_available_name("New Text File", ".txt", &existing)
+        let name = match kind {
+            NewEntryKind::Folder => next_available_name("New Folder", "", &existing),
+            NewEntryKind::File => next_available_name("New Text File", ".txt", &existing),
         };
-        let path = dir.join(name);
-        let op = if folder {
-            FileOp::CreateDir { path }
-        } else {
-            FileOp::CreateFile { path }
-        };
-        FsContext::global(cx).queue.submit(op);
+        self.dir_view.update(cx, |dir_view, cx| {
+            dir_view.begin_new_entry(kind, &dir, &name, window, cx);
+        });
     }
 
     fn reload_in_place(&mut self, cx: &mut Context<Self>) {
@@ -322,11 +401,13 @@ impl Pane {
     /// the fresh `list_dir` always runs on the background executor and
     /// replaces it, guarded by the generation counter.
     fn load(&mut self, path: Arc<Path>, restore: Option<NavEntry>, cx: &mut Context<Self>) {
-        // §4c "navigating away tears the editor down cleanly": in-place
-        // reloads (refresh, sort flip, hidden toggle, cache-miss back/
-        // forward to the *same* dir) keep an open rename; actually leaving
-        // the directory does not.
-        if self.path.as_deref() != Some(path.as_ref()) {
+        // Whether this load actually *leaves* the current directory, as
+        // opposed to reloading it in place (refresh, sort flip, hidden toggle,
+        // cache-miss back/forward to the same dir). Two things hang off it.
+        let path_changed = self.path.as_deref() != Some(path.as_ref());
+        // §4c "navigating away tears the editor down cleanly": an in-place
+        // reload keeps an open rename; actually leaving the directory does not.
+        if path_changed {
             self.dir_view
                 .update(cx, |dir_view, cx| dir_view.cancel_rename_for_navigation(cx));
         }
@@ -394,6 +475,19 @@ impl Pane {
             .ok();
         }));
 
+        // §4a: the open directory is kept live by its own watcher — no
+        // explicit refresh after a file operation. Only (re)registered when
+        // the directory really changed: an in-place reload watches the same
+        // path, and tearing the OS watch down and back up would both cost a
+        // full stop/restart cycle and open a window in which real changes are
+        // lost (a fresh stream starts from *now*, not from where the old one
+        // stopped).
+        if path_changed || self._watch_pump.is_none() {
+            self.watch_generation += 1;
+            let watch_generation = self.watch_generation;
+            self.start_watch(path.clone(), watch_generation, cx);
+        }
+
         let vfs = self.vfs.clone();
         self._free_space_task = Some(cx.spawn(async move |this, cx| {
             let free = cx
@@ -410,40 +504,162 @@ impl Pane {
         }));
     }
 
+    // ------------------------------------------------------------------
+    // Live directory (§4a watcher patch loop, §6 watcher.rs)
+    // ------------------------------------------------------------------
+
+    /// Watch the directory this load is for. The guard and the pump are both
+    /// fields: assigning them here drops the previous directory's watch (the
+    /// stream then ends, so the previous pump exits) and any pane drop tears
+    /// everything down. `generation` is the *watch* generation, so a batch
+    /// resolved for a directory the pane has already left can never apply,
+    /// while an in-place reload leaves the live pump alone.
+    ///
+    /// **Registration runs on the background executor.** `Vfs::watch` is a
+    /// blocking, disk-touching call — for `RealVfs` it stats and canonicalizes
+    /// the path and stops/starts the backend's run-loop thread — so it may
+    /// never be called from `render`/`load` on the UI thread (§5). Both halves
+    /// it returns are `Send`, so the pump task registers the watch itself and
+    /// only comes back to the UI thread to store the guard.
+    fn start_watch(&mut self, path: Arc<Path>, generation: u64, cx: &mut Context<Self>) {
+        let vfs = self.vfs.clone();
+        let register_vfs = self.vfs.clone();
+        let register_path = path.clone();
+        let executor = cx.background_executor().clone();
+        self._watch_pump = Some(cx.spawn(async move |this, cx| {
+            let (mut stream, guard) = cx
+                .background_spawn(async move { register_vfs.watch(&register_path, WATCH_LATENCY) })
+                .await;
+            // Wrapped *before* it can be dropped anywhere, so every path out
+            // of here — stored, superseded, or pane gone — unregisters off the
+            // UI thread. Storing it drops the previous directory's guard, which
+            // ends that stream and so retires its pump.
+            let guard = BackgroundWatchGuard::new(guard, executor);
+            let stored = this.update(cx, |this, _| {
+                if generation != this.watch_generation {
+                    return false; // superseded while registering
+                }
+                this._watch_guard = Some(guard);
+                true
+            });
+            if !stored.unwrap_or(false) {
+                return;
+            }
+            while let Some(batch) = stream.next().await {
+                // Generation-check *before* any I/O: nothing to stat for a
+                // directory we have left.
+                match this.read_with(cx, |this, _| this.watch_generation == generation) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => return, // pane dropped
+                }
+                // Every stat runs on the background executor (§5).
+                let resolved = cx
+                    .background_spawn(resolve_watch_batch(vfs.clone(), path.clone(), batch))
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    this.apply_watch_batch(generation, resolved, cx);
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Fold one resolved batch into the pane: invalidate stale child listings,
+    /// then either reload (`Rescan`) or patch the snapshot in place, keeping
+    /// the path-keyed selection and the cursor correct.
+    fn apply_watch_batch(
+        &mut self,
+        generation: u64,
+        resolved: ResolvedBatch,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.watch_generation {
+            return; // the pane navigated away while the batch was resolving
+        }
+        // Cached child listings must not survive an external change to the
+        // folder they came from: the details view's injected expansion
+        // children here, the sidebar tree's own cache via the workspace.
+        if !resolved.changed_dirs.is_empty() {
+            let dirs = resolved.changed_dirs.clone();
+            self.dir_view
+                .update(cx, |dir_view, cx| dir_view.invalidate_children(&dirs, cx));
+            cx.emit(PaneEvent::DirsChanged(resolved.changed_dirs));
+        }
+        if resolved.reload {
+            // Events were dropped: the incremental path is untrustworthy (§6).
+            self.refresh(cx);
+            return;
+        }
+        if resolved.patches.is_empty() {
+            return;
+        }
+        // Patch only a snapshot of the watched directory: during navigation
+        // the visible snapshot can still be the previous directory's paint.
+        let Some(snapshot) = self.snapshot.clone() else {
+            return; // nothing painted yet — the in-flight load carries the change
+        };
+        if Some(&*snapshot.dir) != self.path.as_deref() {
+            return;
+        }
+        let patched = Arc::new(patch_listing(&snapshot, resolved.patches));
+        // §6: patched snapshots are written back, so re-entering a watched
+        // directory is exact, not just close. `snapshot_is_stale` is left
+        // alone — a stale paint stays stale until its fresh load lands.
+        self.cache.insert(patched.clone());
+        self.snapshot = Some(patched);
+        // A patch is **not** a navigation, so it does not run the NavEntry
+        // restore: `retain_selection_in_listing` already prunes vanished paths
+        // and clears a dangling cursor, and re-applying `scroll_top` would
+        // yank the list back to wherever the last navigation left it (nothing
+        // updates that field while the user scrolls) on every external change.
+        self.prune_view_state(cx);
+        cx.notify();
+    }
+
+    /// Everything the view must forget when rows leave the listing: selected
+    /// paths that vanished, and an inline editor whose row went with them.
+    /// Reads only the pane's own snapshot, so it is safe to call mid-update.
+    fn prune_view_state(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.snapshot.clone();
+        self.dir_view.update(cx, |dir_view, cx| {
+            dir_view.retain_selection_in_listing(snapshot.as_deref(), cx);
+            // §4c: an editor whose target the filesystem removed under it would
+            // otherwise keep the `renaming` key context — and with it every
+            // dead `DirView && !renaming` binding — forever.
+            dir_view.cancel_rename_if_target_vanished(snapshot.as_deref(), cx);
+        });
+    }
+
     /// Apply a [`NavEntry`]'s cursor + scroll against the current snapshot
     /// (restore semantics). Either way, selected paths that vanished from the
     /// listing are pruned (path-keyed survival, §2); a restore re-places the
     /// cursor **without** collapsing a wider selection, so multi-selections
     /// survive refresh/re-sort. The selection lives in the [`DirView`].
     fn apply_restore(&mut self, restore: Option<NavEntry>, cx: &mut Context<Self>) {
-        let snapshot = self.snapshot.clone();
-        match restore {
-            Some(entry) => {
-                let cursor = entry.cursor.filter(|id| self.listing_contains(id, cx));
-                self.scroll_top = entry.scroll_top;
-                let scroll_top = entry.scroll_top;
-                self.dir_view.update(cx, |dir_view, cx| {
-                    dir_view.retain_selection_in_listing(snapshot.as_deref(), cx);
-                    dir_view.restore_cursor(cursor, cx);
-                    dir_view.apply_scroll_top(scroll_top);
-                });
-            }
-            None => {
-                self.dir_view.update(cx, |dir_view, cx| {
-                    dir_view.retain_selection_in_listing(snapshot.as_deref(), cx);
-                });
-            }
+        self.prune_view_state(cx);
+        if let Some(entry) = restore {
+            let cursor = entry.cursor.filter(|id| self.listing_contains(id, cx));
+            self.scroll_top = entry.scroll_top;
+            let scroll_top = entry.scroll_top;
+            self.dir_view.update(cx, |dir_view, cx| {
+                dir_view.restore_cursor(cursor, cx);
+                dir_view.apply_scroll_top(scroll_top);
+            });
         }
     }
 
     /// Whether a path is visible in the listing: in the snapshot, or injected
     /// by the DirView's in-place expansion (M2) — so a cursor sitting on an
-    /// expanded folder's child survives fresh loads and refreshes.
+    /// expanded folder's child survives fresh loads and refreshes. The rule
+    /// itself lives in the [`DirView`], which owns the expansion state; the
+    /// pane supplies the snapshot it is restoring against.
     fn listing_contains(&self, id: &EntryId, cx: &App) -> bool {
-        self.snapshot
-            .as_ref()
-            .is_some_and(|snap| snap.entries.iter().any(|entry| entry.id() == *id))
-            || self.dir_view.read(cx).injected_contains(id)
+        self.dir_view
+            .read(cx)
+            .listing_contains(self.snapshot.as_deref(), id)
     }
 
     fn current_nav_entry(&self, cx: &App) -> Option<NavEntry> {
@@ -574,6 +790,8 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+impl EventEmitter<PaneEvent> for Pane {}
+
 impl Focusable for Pane {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -676,9 +894,10 @@ impl Render for Pane {
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, action: &SortBy, _, cx| this.sort_by(action.key, cx)))
             // §0 New folder/file (M3): the pane owns the destination
-            // directory; the ops queue does the creation.
-            .on_action(cx.listener(|this, _: &NewFolder, _, cx| this.new_folder(cx)))
-            .on_action(cx.listener(|this, _: &NewFile, _, cx| this.new_file(cx)))
+            // directory and the placeholder name; the details view's inline
+            // editor names it and submits the op (§4c).
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| this.new_folder(window, cx)))
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| this.new_file(window, cx)))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| this.go_back(cx)),
@@ -765,6 +984,34 @@ mod tests {
         assert!(history.can_go_back());
     }
 
+    // The placeholder a `New ▸` editor opens on. It has to be free *before*
+    // the editor opens, because the phantom row is keyed on that path and a
+    // collision with a real row would swap the editor into the wrong row.
+    #[test]
+    fn next_available_name_skips_what_is_already_there() {
+        let existing: std::collections::BTreeSet<String> = ["New Folder", "New Folder 2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            next_available_name("New Folder", "", &Default::default()),
+            "New Folder"
+        );
+        assert_eq!(
+            next_available_name("New Folder", "", &existing),
+            "New Folder 3"
+        );
+        // The extension rides along, and the counter goes before it.
+        let taken: std::collections::BTreeSet<String> = ["New Text File.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            next_available_name("New Text File", ".txt", &taken),
+            "New Text File 2.txt"
+        );
+    }
+
     #[test]
     fn format_bytes_humanizes() {
         assert_eq!(format_bytes(0), "0 B");
@@ -792,6 +1039,13 @@ mod tests {
                 }),
             );
             vfs.insert_tree("/other", json!({ "b.txt": "b" }));
+            // A listing taller than the viewport, so scroll assertions have
+            // somewhere to scroll to.
+            let mut tall = serde_json::Map::new();
+            for i in 0..60 {
+                tall.insert(format!("f{i:03}.txt"), json!("x"));
+            }
+            vfs.insert_tree("/tall", serde_json::Value::Object(tall));
             vfs.set_free_space(2048);
             crate::keymap::init(cx);
             crate::app_state::install(
@@ -1034,6 +1288,279 @@ mod tests {
             let error = pane.load_error().expect("error recorded");
             assert!(error.contains("disk on fire"));
             assert!(pane.snapshot().is_none());
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // The watcher keeps the open directory live (§4a): external changes
+    // appear with no explicit Refresh, and a batch for a directory we have
+    // left can never apply.
+    // ------------------------------------------------------------------
+
+    fn names(pane: &Pane) -> Vec<String> {
+        pane.snapshot()
+            .map(|snap| snap.entries.iter().map(|e| e.name.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Let the debounce window elapse and the pump run: the fake clock is the
+    /// only thing standing between an injected event and its batch.
+    fn settle_watch(cx: &mut VisualTestContext) {
+        cx.executor().advance_clock(WATCH_LATENCY);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn external_changes_patch_the_listing_without_a_refresh(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(names(pane), ["sub", "file2.txt", "file10.txt"]);
+        });
+
+        vfs.insert_file("/root/added.txt", 4);
+        vfs.remove_path("/root/file2.txt");
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                names(pane),
+                ["sub", "file2.txt", "file10.txt"],
+                "events are debounced — nothing applies before the window elapses"
+            );
+        });
+
+        settle_watch(cx);
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                names(pane),
+                ["sub", "added.txt", "file10.txt"],
+                "one batch inserted the new file in sort position and dropped the removed one"
+            );
+            assert!(!pane.snapshot_is_stale());
+            assert_eq!(pane.item_count(), 3);
+        });
+
+        // An external rename is a Removed + Created pair in the same batch.
+        vfs.remove_path("/root/added.txt");
+        vfs.insert_file("/root/renamed.txt", 4);
+        settle_watch(cx);
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(names(pane), ["sub", "file10.txt", "renamed.txt"]);
+        });
+    }
+
+    #[gpui::test]
+    fn watcher_patch_keeps_selection_and_cursor(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.select_paths(
+                &[Path::new("/root/file2.txt"), Path::new("/root/file10.txt")],
+                cx,
+            );
+        });
+        pane.update(cx, |pane, _| pane.set_scroll_top(12.0));
+
+        // A patch that touches neither selected row leaves the selection and
+        // the cursor exactly as they were.
+        vfs.insert_file("/root/added.txt", 1);
+        settle_watch(cx);
+        dir_view.read_with(cx, |dir_view, _| {
+            assert_eq!(
+                dir_view.selection().selected_paths(),
+                vec![
+                    PathBuf::from("/root/file10.txt"),
+                    PathBuf::from("/root/file2.txt")
+                ]
+            );
+            assert_eq!(dir_view.cursor(), Some(&entry_id("/root/file10.txt")));
+        });
+        pane.read_with(cx, |pane, _| assert_eq!(pane.scroll_top(), 12.0));
+
+        // A patch that removes the cursor's row prunes it (path-keyed
+        // survival) without disturbing the rest of the selection.
+        vfs.remove_path("/root/file10.txt");
+        settle_watch(cx);
+        dir_view.read_with(cx, |dir_view, _| {
+            assert_eq!(
+                dir_view.selection().selected_paths(),
+                vec![PathBuf::from("/root/file2.txt")],
+                "the vanished row left the selection"
+            );
+            assert_eq!(dir_view.cursor(), None, "dangling cursor cleared");
+        });
+    }
+
+    // Finding: `Vfs::watch` is a blocking, disk-touching call (on macOS it
+    // stats and canonicalizes the path and stops/starts an FSEvents run-loop
+    // thread), so it may not run on the UI thread. The observable form of
+    // "off the UI thread" is that no registration exists until the executor
+    // has been allowed to run.
+    #[gpui::test]
+    fn registering_the_watch_never_happens_on_the_ui_thread(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        assert_eq!(
+            vfs.watcher_count(),
+            0,
+            "navigate_to must not register the watch inline — that is disk I/O \
+             on the render thread"
+        );
+        cx.run_until_parked();
+        assert_eq!(vfs.watcher_count(), 1, "the background task registered it");
+
+        // And it really is live.
+        vfs.insert_file("/root/added.txt", 1);
+        settle_watch(cx);
+        pane.read_with(cx, |pane, _| {
+            assert!(names(pane).iter().any(|name| name == "added.txt"));
+        });
+    }
+
+    // An in-place reload (sort flip, hidden toggle, refresh) watches the same
+    // directory, so it must reuse the live registration: each stop/restart
+    // cycle is expensive *and* loses every change that happens in the gap.
+    #[gpui::test]
+    fn an_in_place_reload_reuses_the_live_watch(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        assert_eq!(vfs.watch_registrations(), 1);
+
+        pane.update(cx, |pane, cx| pane.sort_by(SortKey::Name, cx));
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| pane.sort_by(SortKey::Size, cx));
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| pane.set_show_hidden(true, cx));
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| pane.refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            vfs.watch_registrations(),
+            1,
+            "four in-place reloads must not re-register the watch"
+        );
+        assert_eq!(vfs.watcher_count(), 1);
+
+        // The one live watch still feeds the pane after all of that.
+        vfs.insert_file("/root/late.txt", 1);
+        settle_watch(cx);
+        pane.read_with(cx, |pane, _| {
+            assert!(names(pane).iter().any(|name| name == "late.txt"));
+        });
+
+        // Actually leaving the directory *does* re-register (once).
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+        assert_eq!(vfs.watch_registrations(), 2);
+        assert_eq!(
+            vfs.watcher_count(),
+            1,
+            "and the directory we left is unwatched again"
+        );
+    }
+
+    // A patch is not a navigation: `NavEntry.scroll_top` is pane bookkeeping
+    // that nothing updates while the user scrolls, so re-applying it on every
+    // external change would snap the list back to the top.
+    #[gpui::test]
+    fn a_watcher_patch_leaves_the_scroll_alone(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/tall"), cx));
+        cx.run_until_parked();
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, _| dir_view.apply_scroll_top(240.0));
+        cx.run_until_parked();
+        let scrolled = dir_view.read_with(cx, |view, _| crate::marquee::scroll_y(view));
+        assert!(
+            scrolled < 0.0,
+            "the list really is scrolled down (offset {scrolled})"
+        );
+
+        vfs.insert_file("/tall/zzz.txt", 1);
+        settle_watch(cx);
+        pane.read_with(cx, |pane, _| assert_eq!(pane.item_count(), 61));
+        assert_eq!(
+            dir_view.read_with(cx, |view, _| crate::marquee::scroll_y(view)),
+            scrolled,
+            "an external change must not yank the list back to the top"
+        );
+    }
+
+    #[gpui::test]
+    fn watch_batch_for_a_left_directory_is_ignored(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        // The change happens while /root is still open, but the pane navigates
+        // away before the debounce window closes: the batch belongs to a
+        // directory (and generation) we have left.
+        vfs.insert_file("/root/added.txt", 1);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+        settle_watch(cx);
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/other")));
+            assert_eq!(
+                names(pane),
+                ["b.txt"],
+                "a stale batch must never patch the new directory's listing"
+            );
+        });
+        assert_eq!(
+            vfs.watcher_count(),
+            1,
+            "navigating away unregistered the old watch"
+        );
+
+        // The new directory is watched instead.
+        vfs.insert_file("/other/fresh.txt", 1);
+        settle_watch(cx);
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(names(pane), ["b.txt", "fresh.txt"]);
+        });
+    }
+
+    #[gpui::test]
+    fn rescan_event_reloads_the_directory_in_full(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        // Events were dropped: the tree changed with no usable event trail.
+        vfs.insert_tree("/root/late", json!({}));
+        vfs.emit_event(fs_core::PathEvent {
+            path: Arc::from(Path::new("/root")),
+            kind: fs_core::PathEventKind::Rescan,
+        });
+        settle_watch(cx);
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                names(pane),
+                ["late", "sub", "file2.txt", "file10.txt"],
+                "Rescan falls back to a full reload"
+            );
         });
     }
 

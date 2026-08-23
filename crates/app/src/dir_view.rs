@@ -28,7 +28,9 @@
 //! re-project. Child listings are cached raw (hidden entries included) and
 //! sorted/filtered at projection time with the snapshot's current
 //! `SortSpec`/hidden flag, so sort flips and the hidden toggle stay
-//! consistent without reloading children.
+//! consistent without reloading children. Those caches are **invalidated by
+//! the pane's watcher** (`DirView::invalidate_children`): a cached child
+//! listing must not survive an external change to the folder it came from.
 //!
 //! **Inline rename (M3, §4c):** the view owns the rename state machine as a
 //! field (`rename: Option<RenameState>`, see [`crate::rename`]) — never its
@@ -37,6 +39,28 @@
 //! `renaming` token, which every `DirView && !renaming` binding is guarded
 //! by. `Duplicate` (`cmd-d`) submits `FileOp::Duplicate` for the selection
 //! (keep-both names planned by ops).
+//!
+//! **Rubber-band marquee (M3, §8):** the same field-not-an-entity shape —
+//! `marquee: Option<MarqueeState>` (see [`crate::marquee`]). The list's
+//! background surface (built by `marquee::list_surface`, which also parents
+//! the row list) carries the gpui drag that owns the gesture, and every hit
+//! test is arithmetic against the uniform row band, so rows `uniform_list`
+//! virtualized away still get selected.
+//!
+//! **Drag & drop (M3, §8):** the third field-shaped machine —
+//! `drop: Option<DropState>` (see [`crate::drag`]). Rows start the drag
+//! (`details_list` builds the `DraggedEntries` payload at render time); the
+//! same background surface the marquee uses carries the drop side, so a press
+//! on a row is a file drag and a press on empty space is a marquee.
+//!
+//! **Context menus (M3, §8):** the fourth — `menu: Option<ContextMenuState>`
+//! (see [`crate::context_menu`]). The same surface carries the right-click
+//! trigger, hit-tested with the same row arithmetic; while a menu is up the
+//! root key context gains a `menu` token, which binds `escape` to `Cancel`
+//! for the menu alone. Menu rows dispatch the boxed [`crate::actions`] the
+//! keymap dispatches — including `NewFolder`/`NewFile`, whose editor this
+//! view opens on a **phantom row** (§4c) that the projection appends until
+//! the entry is really created.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -50,12 +74,16 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::actions::Cancel;
 use crate::actions::{
     CollapseSelected, Copy, Cut, DeleteToTrash, Duplicate, ExpandSelected, ExtendSelectionNext,
     ExtendSelectionPrev, OpenSelected, PageDown, PageUp, Paste, RenameSelected, SelectAll,
     SelectFirst, SelectLast, SelectNext, SelectPrev,
 };
 use crate::app_state::FsContext;
+use crate::context_menu::{self, ContextMenuState};
+use crate::drag::{self, DropState};
+use crate::marquee::{self, MarqueeState};
 use crate::pane::Pane;
 use crate::rename::RenameState;
 use crate::selection::SelectionModel;
@@ -129,6 +157,23 @@ pub struct DirView {
     rename_armed: Option<EntryId>,
     /// Dropping this cancels a pending arm.
     _rename_arm: Option<Task<()>>,
+    /// The in-flight rubber-band gesture (§8), if any — a field, not an
+    /// entity. `pub(crate)` because [`crate::marquee`] drives the machine and
+    /// renders the band.
+    pub(crate) marquee: Option<MarqueeState>,
+    /// The root-most selected paths as of this frame, shared by every row's
+    /// drag payload (§8). Rebuilt in `render` beside `flat`, because a payload
+    /// is constructed for every drag-capable row that paints and re-deriving
+    /// it per row would be quadratic in a large selection.
+    drag_selection: Arc<[Arc<Path>]>,
+    /// §8's single `Option<DropTarget>` per pane, plus what the drop would do
+    /// and its spring-load timer (see [`crate::drag`]) — the third state
+    /// machine to live as a *field* of this view rather than as an entity.
+    pub(crate) drop: Option<DropState>,
+    /// The open context menu (§8), if any — the fourth field-shaped machine
+    /// (see [`crate::context_menu`]). Holds the invocation point and the
+    /// boxed actions its rows dispatch.
+    pub(crate) menu: Option<ContextMenuState>,
 }
 
 impl DirView {
@@ -148,6 +193,10 @@ impl DirView {
             rename: None,
             rename_armed: None,
             _rename_arm: None,
+            marquee: None,
+            drag_selection: Arc::from(Vec::new()),
+            drop: None,
+            menu: None,
         }
     }
 
@@ -172,6 +221,13 @@ impl DirView {
 
     pub fn selection(&self) -> &SelectionModel {
         &self.selection
+    }
+
+    /// Mutable access for a sibling selection gesture that owns its own
+    /// mutation rule — currently only the rubber-band marquee
+    /// ([`crate::marquee`]). Callers notify themselves.
+    pub(crate) fn selection_mut(&mut self) -> &mut SelectionModel {
+        &mut self.selection
     }
 
     /// Multi-select driver for tests and visual scenarios: the selection
@@ -223,16 +279,48 @@ impl DirView {
         snapshot: Option<&ListingSnapshot>,
         cx: &mut Context<Self>,
     ) {
+        let keep = self.listing_ids(snapshot);
+        self.selection.retain(|id| keep.contains(id));
+        cx.notify();
+    }
+
+    /// Every id the projection would render over `snapshot`: its rows, plus
+    /// the loaded children of expanded folders **whose own row is still
+    /// there**. That qualifier is the whole point: when the watcher removes an
+    /// expanded folder, its children stop being projected, and a selection
+    /// (or cursor) that kept pointing at them would keep acting on rows that
+    /// no longer render — or exist.
+    ///
+    /// Reads only this view's own state plus the snapshot handed in, so the
+    /// pane may call it mid-update (unlike [`Self::projected_rows`], which
+    /// reads the pane back).
+    fn listing_ids(&self, snapshot: Option<&ListingSnapshot>) -> BTreeSet<EntryId> {
         let mut keep: BTreeSet<EntryId> = snapshot
             .map(|snap| snap.entries.iter().map(FileEntry::id).collect())
             .unwrap_or_default();
+        // `expanded` is ordered by path, and path order is component-wise, so
+        // a folder always precedes its own descendants: dropping one whose row
+        // has gone drops everything nested inside it too.
         for dir in &self.expanded {
+            if !keep.contains(&EntryId(dir.clone())) {
+                continue;
+            }
             if let Some(kids) = self.children.get(dir) {
                 keep.extend(kids.iter().map(FileEntry::id));
             }
         }
-        self.selection.retain(|id| keep.contains(id));
-        cx.notify();
+        keep
+    }
+
+    /// Whether `id` is a row of the projection over `snapshot` — the pane's
+    /// question when restoring a cursor (a cursor on an expanded folder's
+    /// child must survive fresh loads and refreshes).
+    pub(crate) fn listing_contains(
+        &self,
+        snapshot: Option<&ListingSnapshot>,
+        id: &EntryId,
+    ) -> bool {
+        self.listing_ids(snapshot).contains(id)
     }
 
     /// NavEntry restore (pane back/forward/refresh): re-place the cursor
@@ -316,6 +404,33 @@ impl DirView {
             .submit(FileOp::TrashOp { paths });
     }
 
+    /// The directory this view is showing — the pane owns it (§4a). Used by
+    /// paste and by [`crate::drag`]'s background drop target.
+    pub(crate) fn current_dir(&self, cx: &App) -> Option<Arc<Path>> {
+        self.pane
+            .upgrade()
+            .and_then(|pane| pane.read(cx).path().map(Arc::from))
+    }
+
+    /// The owning pane's id, carried in the drag payload so a drop can tell
+    /// which pane a dragged selection came from (§8; cross-pane drags at M4).
+    pub(crate) fn pane_id(&self) -> gpui::EntityId {
+        self.pane.entity_id()
+    }
+
+    /// The owning pane, for the handful of pane-owned facts a view-side
+    /// widget needs to read (sort column, hidden-file toggle) — see
+    /// [`crate::context_menu`]. Views never *mutate* the pane through this:
+    /// commands go up as actions or events (§2).
+    pub(crate) fn pane_entity(&self) -> Option<gpui::Entity<Pane>> {
+        self.pane.upgrade()
+    }
+
+    /// The frame's shared root-most selection, for [`crate::drag`] payloads.
+    pub(crate) fn drag_selection(&self) -> &Arc<[Arc<Path>]> {
+        &self.drag_selection
+    }
+
     /// The pane's current snapshot — the DirView renders the pane's listing
     /// (ARCHITECTURE.md §4a); it holds no copy of its own.
     fn snapshot(&self, cx: &App) -> Option<Arc<ListingSnapshot>> {
@@ -332,14 +447,36 @@ impl DirView {
     /// folder's cached children spliced beneath it with `depth + 1`, sorted
     /// and hidden-filtered by the snapshot's current settings.
     pub fn projected_rows(&self, cx: &App) -> Vec<ProjectedRow> {
-        let Some(snapshot) = self.snapshot(cx) else {
-            return Vec::new();
-        };
         let mut flat = Vec::new();
-        for entry in snapshot.entries.iter() {
-            self.project_into(&mut flat, entry, 0, snapshot.sort, snapshot.show_hidden);
+        if let Some(snapshot) = self.snapshot(cx) {
+            for entry in snapshot.entries.iter() {
+                self.project_into(&mut flat, entry, 0, snapshot.sort, snapshot.show_hidden);
+            }
+        }
+        // §4c `New ▸`: the phantom row of an entry being named but not yet
+        // created. Appended last — it has no place in the sort order until it
+        // exists on disk, and the real (sorted) row replaces it on completion.
+        if let Some(entry) = self.new_entry_row() {
+            flat.push(ProjectedRow {
+                entry: entry.clone(),
+                depth: 0,
+                expanded: false,
+            });
         }
         flat
+    }
+
+    /// The phantom row of an in-flight `New ▸ Folder`/`Text file…` (§4c), if
+    /// any: a `FileEntry` for a path that does not exist yet.
+    pub(crate) fn new_entry_row(&self) -> Option<&FileEntry> {
+        self.rename.as_ref().and_then(RenameState::new_entry_row)
+    }
+
+    /// Whether `row` is that phantom. Gestures that mean "act on a real
+    /// entry" (drop targets, context-menu targets) skip it.
+    pub(crate) fn is_new_entry_row(&self, row: &ProjectedRow) -> bool {
+        self.new_entry_row()
+            .is_some_and(|entry| entry.path == row.entry.path)
     }
 
     fn project_into(
@@ -372,18 +509,6 @@ impl DirView {
     /// observability).
     pub fn flat_rows(&self) -> &[ProjectedRow] {
         &self.flat
-    }
-
-    /// Whether this path is present among the loaded children of expanded
-    /// folders — the pane consults this (in addition to its own snapshot) so
-    /// a cursor on an injected row survives fresh loads. Reads only this
-    /// view's own state, so the pane may call it mid-update.
-    pub(crate) fn injected_contains(&self, id: &EntryId) -> bool {
-        self.expanded.iter().any(|dir| {
-            self.children
-                .get(dir)
-                .is_some_and(|kids| kids.iter().any(|kid| kid.id() == *id))
-        })
     }
 
     // ------------------------------------------------------------------
@@ -460,6 +585,27 @@ impl DirView {
         cx.notify();
     }
 
+    /// An external change (watcher batch, via the pane) landed in folders we
+    /// hold cached child listings for: those listings are stale and must not
+    /// be shown again. A **collapsed** folder simply loses its cache, so the
+    /// next expansion re-lists it; an **expanded** one keeps the stale rows
+    /// painted (and the selection inside them alive) while a fresh listing
+    /// loads over the top.
+    pub(crate) fn invalidate_children(&mut self, dirs: &[Arc<Path>], cx: &mut Context<Self>) {
+        for dir in dirs {
+            // An in-flight load would otherwise satisfy `load_children`'s
+            // staleness check and never re-run.
+            let was_loading = self._child_loads.remove(dir).is_some();
+            if self.expanded.contains(dir) {
+                if was_loading || self.children.contains_key(dir) {
+                    self.start_child_load(dir.clone(), cx);
+                }
+            } else if self.children.remove(dir).is_some() {
+                cx.notify();
+            }
+        }
+    }
+
     /// Background-list an expanded folder's children (raw: hidden entries
     /// included, default sort — projection re-sorts/filters with the live
     /// settings). Results are cached; collapsing keeps them so re-expanding
@@ -468,6 +614,12 @@ impl DirView {
         if self.children.contains_key(&path) || self._child_loads.contains_key(&path) {
             return;
         }
+        self.start_child_load(path, cx);
+    }
+
+    /// Unconditional (re)list of a folder's children — the invalidation path,
+    /// where a cached listing exists but is known stale.
+    fn start_child_load(&mut self, path: Arc<Path>, cx: &mut Context<Self>) {
         let vfs = FsContext::global(cx).vfs.clone();
         let load_path = path.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -487,6 +639,11 @@ impl DirView {
                     Err(_) => Vec::new(),
                 };
                 this.children.insert(load_path, entries);
+                // A re-list can drop rows an external change deleted: a
+                // path-keyed selection must not keep acting on rows that left
+                // the projection.
+                let snapshot = this.snapshot(cx);
+                this.retain_selection_in_listing(snapshot.as_deref(), cx);
                 cx.notify();
             })
             .ok();
@@ -579,13 +736,40 @@ impl DirView {
     // Open (§0 "Open item": Enter / double-click)
     // ------------------------------------------------------------------
 
+    /// `enter` / double-click / the row menu's **Open**: open *everything*
+    /// selected, which is what Explorer does (and what a menu row acting on a
+    /// multi-selection has to mean). Root-most only, so opening a folder and
+    /// something inside it does not open the child twice; the cursor row is
+    /// the fallback when nothing is selected.
+    ///
+    /// One pane can only *show* one directory, so at most one folder is
+    /// entered (Explorer opens a window per folder — dual panes are M4);
+    /// every selected file is handed to the opener.
     fn open_selected(&mut self, cx: &mut Context<Self>) {
         let rows = self.projected_rows(cx);
-        let Some(ix) = self.cursor_ix(&rows) else {
-            return;
+        let selected = self.selection.selected_rootmost();
+        let targets: Vec<FileEntry> = if selected.is_empty() {
+            self.cursor_ix(&rows)
+                .map(|ix| rows[ix].entry.clone())
+                .into_iter()
+                .collect()
+        } else {
+            let wanted: BTreeSet<&Path> = selected.iter().map(Arc::as_ref).collect();
+            rows.iter()
+                .filter(|row| wanted.contains(row.entry.path.as_ref()))
+                .map(|row| row.entry.clone())
+                .collect()
         };
-        let entry = rows[ix].entry.clone();
-        self.open_entry(&entry, cx);
+        let mut entered_folder = false;
+        for entry in targets {
+            if entry.is_dir_like() {
+                if entered_folder {
+                    continue;
+                }
+                entered_folder = true;
+            }
+            self.open_entry(&entry, cx);
+        }
     }
 
     /// Folder → navigation event to the pane; file → the opener stub.
@@ -735,6 +919,20 @@ impl DirView {
             .set_offset(point(px(0.0), px(-scroll_top)));
     }
 
+    /// The painted height of one details row (`uniform_list`'s fixed row
+    /// height). Public so the visual scenarios in `bin/visual_test_runner.rs`
+    /// can aim real mouse input at a real row instead of re-deriving the
+    /// layout.
+    pub const ROW_HEIGHT: f32 = details_list::ROW_HEIGHT;
+
+    /// The details list's viewport in window space as of the last paint — the
+    /// origin row coordinates are measured from. Public for the same reason as
+    /// [`Self::ROW_HEIGHT`]; inside the crate this is
+    /// [`crate::marquee::list_viewport`], which every gesture's hit test uses.
+    pub fn list_viewport(&self) -> gpui::Bounds<gpui::Pixels> {
+        marquee::list_viewport(self)
+    }
+
     pub(crate) fn theme(&self) -> &Theme {
         &self.theme
     }
@@ -757,7 +955,7 @@ impl Focusable for DirView {
 }
 
 impl Render for DirView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
         let pane = self.pane.upgrade();
         let sort = pane.as_ref().map(|p| p.read(cx).sort()).unwrap_or_default();
@@ -768,6 +966,9 @@ impl Render for DirView {
         // Rebuild the flat projection this frame; the uniform_list row
         // processor reads it back by index.
         self.flat = self.projected_rows(cx);
+        // ...and, once, the drag payload's selection (§8), which every
+        // drag-capable row shares by cloning the Arc.
+        self.drag_selection = Arc::from(self.selection.selected_rootmost());
 
         let body: gpui::AnyElement = if let Some(error) = load_error {
             div()
@@ -799,10 +1000,13 @@ impl Render for DirView {
             // which every `DirView && !renaming` binding is guarded by — the
             // rename row's own `TextInput` context still resolves, because it
             // sits *below* this node in the dispatch chain.
-            .key_context(if self.rename.is_some() {
-                "DirView renaming"
-            } else {
-                "DirView"
+            // ...and while a context menu is up it gains `menu`, which is
+            // what binds `escape` to `Cancel` for the menu only (§8
+            // "dismiss-on-click-away"; escape is the keyboard half).
+            .key_context(match (self.rename.is_some(), self.menu.is_some()) {
+                (true, _) => "DirView renaming",
+                (false, true) => "DirView menu",
+                (false, false) => "DirView",
             })
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| this.open_selected(cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step_cursor(1, cx)))
@@ -849,13 +1053,32 @@ impl Render for DirView {
             )
             // §0 toolbar row (M3): duplicate with keep-both names.
             .on_action(cx.listener(|this, _: &Duplicate, _, cx| this.duplicate_selection(cx)))
+            // §8 context menu: `escape` dismisses it. Only reachable while the
+            // `menu` token is on this node, so it never shadows the rename
+            // editor's own `Cancel` (that row's `TextInput` node is deeper).
+            .on_action(
+                cx.listener(|this, _: &Cancel, window, cx| this.close_context_menu(window, cx)),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
             .child(details_list::render_header(&theme, sort, cx))
-            .child(body)
+            // The rows live inside the marquee's background surface (§8): it
+            // is the element gpui's drag hangs off, and the positioning
+            // context for the band it paints. The same element carries the
+            // drop side of drag & drop (`drag::with_drop_handlers`) — one
+            // element, so neither gesture adds a layout node.
+            // ...and the right-click trigger plus the deferred menu overlay
+            // (`context_menu::with_context_menu`), for the same reason: one
+            // element, one geometry, no extra layout node.
+            .child(context_menu::with_context_menu(
+                drag::with_drop_handlers(marquee::list_surface(self, body, cx), self, cx),
+                self,
+                window,
+                cx,
+            ))
     }
 }
 
@@ -936,6 +1159,95 @@ mod tests {
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
         cx.run_until_parked();
         (pane, cx)
+    }
+
+    /// `/root` open with a [`RecordingOpener`] installed, so a test can assert
+    /// exactly which entries a command opened.
+    #[allow(clippy::type_complexity)] // one test's setup tuple, not an API
+    fn open_root_recording(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        Entity<Pane>,
+        &mut VisualTestContext,
+    ) {
+        let log: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
+        cx.update(|cx| {
+            let spawner: Arc<dyn Spawner> =
+                Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
+            let vfs = FakeVfs::new(spawner.clone());
+            vfs.insert_tree(
+                "/root",
+                json!({ "sub": {}, "a.txt": "a", "b.txt": "b", "c.txt": "c" }),
+            );
+            crate::keymap::init(cx);
+            crate::app_state::install(
+                cx,
+                vfs,
+                spawner,
+                Arc::new(crate::app_state::RecordingOpener(log.clone())),
+                Arc::new(fs_core::StubPlatform::new()),
+            );
+        });
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        (log, pane, cx)
+    }
+
+    // §0 "Open item" acts on the **selection**, not on the cursor row alone —
+    // Explorer opens every selected item, and the row context menu's `Open`
+    // (enabled for any non-empty selection) dispatches this same action, so
+    // opening only the cursor row silently ignored the rest.
+    #[gpui::test]
+    fn open_selected_opens_every_selected_entry(cx: &mut TestAppContext) {
+        let (opened, pane, cx) = open_root_recording(cx);
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.select_paths(
+                &[
+                    Path::new("/root/a.txt"),
+                    Path::new("/root/b.txt"),
+                    Path::new("/root/c.txt"),
+                ],
+                cx,
+            )
+        });
+        cx.update(|window, cx| {
+            let handle = dir_view.read(cx).focus_handle_ref().clone();
+            window.focus(&handle, cx);
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            opened.lock().unwrap().clone(),
+            vec![
+                PathBuf::from("/root/a.txt"),
+                PathBuf::from("/root/b.txt"),
+                PathBuf::from("/root/c.txt"),
+            ],
+            "every selected file is opened, in projection order"
+        );
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")), "no folder involved");
+        });
+
+        // A folder in the selection is entered — once, because one pane can
+        // only show one directory — and the files still open.
+        opened.lock().unwrap().clear();
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.select_paths(&[Path::new("/root/sub"), Path::new("/root/a.txt")], cx)
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            opened.lock().unwrap().clone(),
+            vec![PathBuf::from("/root/a.txt")]
+        );
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root/sub")));
+        });
     }
 
     #[gpui::test]
@@ -1148,6 +1460,172 @@ mod tests {
             ]),
             "hidden children appear without reloading (name-sorted, folders first)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Watcher invalidation of the injected expansion children (§6): a cached
+    // child listing must not survive an external change to its folder.
+    // ------------------------------------------------------------------
+
+    /// Let the pane's watch debounce window elapse and its pump run.
+    fn settle_watch(cx: &mut VisualTestContext) {
+        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn external_change_reloads_expanded_children_in_place(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/sub"), cx);
+        });
+        cx.run_until_parked();
+
+        // The change is *inside* the expanded folder, not the watched
+        // directory: nothing to patch, but the cached child listing is stale.
+        vfs.insert_file("/root/sub/added.txt", 2);
+        vfs.remove_path("/root/sub/inner.txt");
+        settle_watch(cx);
+
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[
+                ("/root/sub", 0),
+                ("/root/sub/deep", 1),
+                ("/root/sub/added.txt", 1),
+                ("/root/zeta", 0),
+                ("/root/a.txt", 0),
+            ]),
+            "an expanded folder re-lists in place when its contents change"
+        );
+    }
+
+    #[gpui::test]
+    fn expanding_after_an_external_change_shows_the_new_children(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        // Expand then collapse: the child listing is now cached but hidden.
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/sub"), cx);
+        });
+        cx.run_until_parked();
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/sub"), cx);
+        });
+        cx.run_until_parked();
+
+        vfs.insert_file("/root/sub/added.txt", 2);
+        settle_watch(cx);
+
+        // Re-expanding must not paint the stale cache.
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/sub"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[
+                ("/root/sub", 0),
+                ("/root/sub/deep", 1),
+                ("/root/sub/added.txt", 1),
+                ("/root/sub/inner.txt", 1),
+                ("/root/zeta", 0),
+                ("/root/a.txt", 0),
+            ]),
+            "the invalidated folder re-lists on the next expansion"
+        );
+    }
+
+    #[gpui::test]
+    fn external_change_in_the_watched_dir_patches_the_projection(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        // A patch of the pane's snapshot re-projects with expansion intact.
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/sub"), cx);
+        });
+        cx.run_until_parked();
+
+        vfs.insert_file("/root/b.txt", 1);
+        settle_watch(cx);
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[
+                ("/root/sub", 0),
+                ("/root/sub/deep", 1),
+                ("/root/sub/inner.txt", 1),
+                ("/root/zeta", 0),
+                ("/root/a.txt", 0),
+                ("/root/b.txt", 0),
+            ]),
+            "the watched directory's new row appears without collapsing the subtree"
+        );
+    }
+
+    // The watcher removing an **expanded folder** takes its injected children
+    // out of the projection with it, so a path-keyed selection must let go of
+    // them: keeping them alive left the selection (and the cursor) pointing at
+    // invisible, nonexistent rows that the next cut/paste, Duplicate or Delete
+    // would happily act on.
+    #[gpui::test]
+    fn removing_an_expanded_folder_drops_its_children_from_the_selection(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |dir_view, cx| {
+            dir_view.toggle_expanded(Path::new("/root/sub"), cx)
+        });
+        cx.run_until_parked();
+        dir_view.update(cx, |dir_view, cx| {
+            // Toggled last, so the cursor lands on the injected child row.
+            dir_view.select_paths(
+                &[Path::new("/root/a.txt"), Path::new("/root/sub/inner.txt")],
+                cx,
+            );
+        });
+        dir_view.read_with(cx, |dir_view, _| {
+            assert_eq!(dir_view.cursor(), Some(&entry_id("/root/sub/inner.txt")));
+        });
+
+        // The whole folder disappears from under the expansion. Its own removal
+        // is an event in `/root`, the watched directory — the children are
+        // never mentioned.
+        vfs.remove_path("/root/sub");
+        settle_watch(cx);
+
+        assert_eq!(
+            rows(&pane, cx),
+            expect(&[("/root/zeta", 0), ("/root/a.txt", 0)]),
+            "the folder and its injected children left the projection"
+        );
+        dir_view.read_with(cx, |dir_view, _| {
+            assert_eq!(
+                dir_view.selection().selected_paths(),
+                vec![PathBuf::from("/root/a.txt")],
+                "the child of the vanished folder is no longer selected"
+            );
+            assert_eq!(
+                dir_view.cursor(),
+                None,
+                "and the cursor is not left on a row that does not exist"
+            );
+        });
     }
 
     // ------------------------------------------------------------------

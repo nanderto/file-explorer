@@ -41,6 +41,20 @@ impl Opener for LoggingOpener {
     }
 }
 
+/// An [`Opener`] that records what it was asked to open, for tests that assert
+/// *which* entries a command handed over (e.g. `OpenSelected` over a
+/// multi-selection). The log is shared, so the test keeps its own handle.
+#[cfg(test)]
+#[derive(Default)]
+pub struct RecordingOpener(pub Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>);
+
+#[cfg(test)]
+impl Opener for RecordingOpener {
+    fn open(&self, path: &Path) {
+        self.0.lock().unwrap().push(path.to_path_buf());
+    }
+}
+
 /// Global filesystem context. M1 carries the Vfs, Spawner, and the opener
 /// stub; M2 adds the [`Platform`] handle (volumes + eject); M3 adds the
 /// [`JobQueue`], the shared [`UndoStack`], and the [`JobsModel`] handle
