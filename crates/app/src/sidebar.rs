@@ -28,11 +28,12 @@ use std::time::Duration;
 use fs_core::{FileEntry, SortSpec, VolumeId, VolumeInfo, WatchGuard, list_dir, watch_volumes};
 use futures::StreamExt as _;
 use gpui::{
-    Context, EventEmitter, IntoElement, Render, SharedString, Subscription, Task, WeakEntity,
-    Window, div, prelude::*, px, uniform_list,
+    Context, EventEmitter, ExternalPaths, IntoElement, Render, SharedString, Subscription, Task,
+    WeakEntity, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::app_state::FsContext;
+use crate::drag::{self, DraggedEntries, DraggedFavorite};
 use crate::pane::format_bytes;
 use crate::settings::AppSettings;
 use crate::theme::Theme;
@@ -44,6 +45,8 @@ pub const VOLUME_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Fixed tree row height (uniform_list requirement).
 const TREE_ROW_HEIGHT: f32 = 22.0;
+/// Favorites reorder drop-target tint (the "insert before this row" cue).
+const FAVORITE_REORDER_ALPHA: f32 = 0.35;
 /// Horizontal indent per tree depth level.
 const TREE_INDENT: f32 = 12.0;
 
@@ -87,6 +90,13 @@ pub struct Sidebar {
     flat: Vec<TreeRow>,
     /// In-flight child loads, held so dropping the sidebar cancels them.
     _child_loads: HashMap<Arc<Path>, Task<()>>,
+    /// Paths dropped on Favorites that still need their "is this a folder?"
+    /// probe. A **queue**, because a second drop must not cancel the first:
+    /// while it is non-empty the task below is alive and will drain it.
+    pending_favorite_drops: Vec<PathBuf>,
+    /// The in-flight probe behind Favorites drag-to-add; a field, never
+    /// detached (§5).
+    _favorite_drop: Option<Task<()>>,
     /// The volume-watch pump; held so it dies with the view (§5).
     _volumes_pump: Task<()>,
     /// Dropping this stops the volume poller.
@@ -123,6 +133,8 @@ impl Sidebar {
             children: HashMap::new(),
             flat: Vec::new(),
             _child_loads: HashMap::new(),
+            pending_favorite_drops: Vec::new(),
+            _favorite_drop: None,
             _volumes_pump: pump,
             _volumes_guard: guard,
             _settings_observer: settings_observer,
@@ -184,6 +196,84 @@ impl Sidebar {
         }
     }
 
+    /// Drag-to-add (§8 drag & drop; the gap M2 deferred): folders dragged from
+    /// a pane — or in from Finder — become favorites. **Only folders**: each
+    /// dropped path is stat'ed on the background executor first (the UI thread
+    /// never touches the disk), then the survivors are appended and persisted
+    /// in one write.
+    pub fn add_favorites_from_drop(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        // A single `Option<Task>` slot would make the *second* drop cancel the
+        // first mid-probe — a folder dropped from a slow mount would silently
+        // never get pinned. So drops queue, and only one task drains them.
+        // A non-empty queue is exactly "a task is alive": it is drained in the
+        // same update that applies the results, with no await in between.
+        let was_idle = self.pending_favorite_drops.is_empty();
+        self.pending_favorite_drops.extend(paths);
+        if !was_idle {
+            return;
+        }
+        let vfs = FsContext::global(cx).vfs.clone();
+        // Held in a field (§5), so dropping the sidebar cancels the probe.
+        self._favorite_drop = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(batch) = this.read_with(cx, |this, _| this.pending_favorite_drops.clone())
+                else {
+                    return; // sidebar dropped
+                };
+                if batch.is_empty() {
+                    return;
+                }
+                let mut folders = Vec::new();
+                for path in &batch {
+                    let vfs = vfs.clone();
+                    let probe = path.clone();
+                    let meta = cx
+                        .background_spawn(async move { vfs.metadata(&probe).await })
+                        .await;
+                    if let Ok(Some(meta)) = meta
+                        && meta.kind.is_dir_like()
+                    {
+                        folders.push(path.clone());
+                    }
+                }
+                let applied = this.update(cx, |this, cx| {
+                    this.pending_favorite_drops.drain(..batch.len());
+                    let changed = cx.update_global::<AppSettings, bool>(|settings, _| {
+                        // Every folder is added (no short-circuit: a duplicate
+                        // in the middle of the drag must not drop the rest).
+                        let mut changed = false;
+                        for path in folders {
+                            changed |= settings.add_favorite(path);
+                        }
+                        changed
+                    });
+                    if changed {
+                        AppSettings::global(cx).save(cx);
+                        cx.notify();
+                    }
+                });
+                if applied.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Drag-to-reorder (§8; the other half of the M2-deferred gap): move a
+    /// favorite immediately before `before`, or to the end when a favorite is
+    /// dropped on the section rather than on a row. Persists immediately.
+    pub fn reorder_favorite(&mut self, path: &Path, before: Option<&Path>, cx: &mut Context<Self>) {
+        let changed = cx
+            .update_global::<AppSettings, bool>(|settings, _| settings.move_favorite(path, before));
+        if changed {
+            AppSettings::global(cx).save(cx);
+            cx.notify();
+        }
+    }
+
     /// Unpin a favorite (the per-row `✕` button). Persists immediately.
     pub fn remove_favorite(&mut self, path: &Path, cx: &mut Context<Self>) {
         let changed =
@@ -237,12 +327,38 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// An external change (a pane's watcher batch, forwarded by the
+    /// workspace) landed in folders the tree caches child listings for: those
+    /// listings are stale. A collapsed node just loses its cache (re-listed on
+    /// the next expansion); an expanded one keeps its rows painted while a
+    /// fresh listing loads over the top.
+    pub fn invalidate_children(&mut self, dirs: &[Arc<Path>], cx: &mut Context<Self>) {
+        for dir in dirs {
+            // An in-flight load would otherwise satisfy `load_children`'s
+            // staleness check and never re-run.
+            let was_loading = self._child_loads.remove(dir).is_some();
+            if self.expanded.contains(dir) {
+                if was_loading || self.children.contains_key(dir) {
+                    self.start_child_load(dir.clone(), cx);
+                }
+            } else {
+                self.children.remove(dir);
+            }
+        }
+    }
+
     /// Background-list a node's children (dirs only, default sort). Results
     /// are cached; collapsing keeps them so re-expanding paints instantly.
     fn load_children(&mut self, path: Arc<Path>, cx: &mut Context<Self>) {
         if self.children.contains_key(&path) || self._child_loads.contains_key(&path) {
             return;
         }
+        self.start_child_load(path, cx);
+    }
+
+    /// Unconditional (re)list of a node's children — the invalidation path,
+    /// where a cached listing exists but is known stale.
+    fn start_child_load(&mut self, path: Arc<Path>, cx: &mut Context<Self>) {
         let vfs = FsContext::global(cx).vfs.clone();
         let load_path = path.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -430,6 +546,60 @@ impl Sidebar {
         div().flex().flex_col().children(rows)
     }
 
+    /// The whole Favorites section (header + rows) as one drop zone (§8): a
+    /// folder dragged in from a pane or from Finder is pinned, and a favorite
+    /// dropped on the section — rather than on a row — moves to the end.
+    ///
+    /// A `div`'s hitbox is its content, so the zone gets a **minimum height**:
+    /// with nothing pinned (the default on first run) or the section collapsed
+    /// the content is the 32px header alone, and a drop one pixel below it —
+    /// inside the sidebar, in what reads as the Favorites area — would land on
+    /// nothing at all. Every payload the section accepts also tints on hover,
+    /// so the boundary is visible rather than guessed at.
+    fn favorites_section(
+        &self,
+        favorites: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let external_theme = theme.clone();
+        let favorite_theme = theme.clone();
+        let mut section = div()
+            .id("sidebar-favorites-drop-zone")
+            .debug_selector(|| "sidebar-favorites-drop-zone".into())
+            .flex()
+            .flex_col()
+            .min_h(px(TREE_ROW_HEIGHT * 3.0))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.bg(external_theme.accent.opacity(drag::FAVORITES_DROP_ALPHA))
+            })
+            .drag_over::<DraggedFavorite>(move |style, _, _, _| {
+                style.bg(favorite_theme.accent.opacity(drag::FAVORITES_DROP_ALPHA))
+            })
+            .on_drop(cx.listener(|this, dragged: &DraggedEntries, _, cx| {
+                let paths = dragged
+                    .paths()
+                    .iter()
+                    .map(|path| path.to_path_buf())
+                    .collect();
+                this.add_favorites_from_drop(paths, cx);
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.add_favorites_from_drop(paths.paths().to_vec(), cx);
+            }))
+            .on_drop(cx.listener(|this, dragged: &DraggedFavorite, _, cx| {
+                this.reorder_favorite(&dragged.path, None, cx);
+            }))
+            .drag_over::<DraggedEntries>(move |style, _, _, _| {
+                style.bg(theme.accent.opacity(drag::FAVORITES_DROP_ALPHA))
+            })
+            .child(self.section_header(Section::Favorites, "Favorites", true, cx));
+        if !self.collapsed_favorites {
+            section = section.child(self.render_favorites(favorites, cx));
+        }
+        section
+    }
+
     fn render_favorites(
         &self,
         favorites: &[PathBuf],
@@ -446,8 +616,17 @@ impl Sidebar {
                     .unwrap_or_else(|| path.display().to_string());
                 let navigate_path = path.clone();
                 let remove_path = path.clone();
+                let drag_path = path.clone();
+                let insert_before = path.clone();
+                let ghost_theme = theme.clone();
+                let ghost_label = SharedString::from(name.clone());
                 div()
-                    .id(("sidebar-favorite", ix))
+                    // Path-keyed, not index-keyed: this row is a drag source,
+                    // and gpui persists a stateful element's pending press by
+                    // element id across frames — an index would let a press on
+                    // one favorite start a drag carrying whichever favorite the
+                    // list has since shuffled into that slot (invariant #2).
+                    .id(gpui::ElementId::Path(Arc::from(path.as_path())))
                     .debug_selector(|| format!("sidebar-favorite-{ix}"))
                     .flex()
                     .items_center()
@@ -456,13 +635,30 @@ impl Sidebar {
                     .py(px(2.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.accent.opacity(0.15)))
+                    // §8 reordering: a row is both a drag source and the
+                    // "insert before me" target. Highlighted as a background
+                    // tint rather than an insertion rule, so arming a target
+                    // never nudges the rows below it.
+                    .on_drag(DraggedFavorite { path: drag_path }, move |_, _, _, cx| {
+                        drag::ghost(ghost_label.clone(), ghost_theme.clone(), cx)
+                    })
+                    .drag_over::<DraggedFavorite>({
+                        let theme = theme.clone();
+                        move |style, _, _, _| style.bg(theme.accent.opacity(FAVORITE_REORDER_ALPHA))
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedFavorite, _, cx| {
+                        this.reorder_favorite(&dragged.path, Some(&insert_before), cx);
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
                     .child(div().flex_1().truncate().child(SharedString::from(name)))
                     .child(
                         div()
-                            .id(("sidebar-favorite-remove", ix))
+                            .id(gpui::ElementId::NamedChild(
+                                Arc::new(gpui::ElementId::Path(Arc::from(remove_path.as_path()))),
+                                SharedString::new_static("unpin"),
+                            ))
                             .debug_selector(|| format!("sidebar-favorite-remove-{ix}"))
                             .px(px(4.0))
                             .rounded(px(3.0))
@@ -552,10 +748,7 @@ impl Render for Sidebar {
         if !self.collapsed_devices {
             root = root.child(self.render_devices(cx));
         }
-        root = root.child(self.section_header(Section::Favorites, "Favorites", true, cx));
-        if !self.collapsed_favorites {
-            root = root.child(self.render_favorites(&favorites, cx));
-        }
+        root = root.child(self.favorites_section(&favorites, cx));
         root = root.child(self.section_header(Section::Tree, "Folders", false, cx));
         if !self.collapsed_tree {
             root = root.child(self.render_tree(cx));
@@ -707,6 +900,274 @@ mod tests {
         assert!(content.favorites.is_empty(), "removal persisted");
     }
 
+    /// The persisted favorites, read back off the settings file — the only
+    /// proof that a change survives a restart.
+    fn persisted_favorites(vfs: &Arc<FakeVfs>) -> Vec<PathBuf> {
+        let bytes = futures::executor::block_on(vfs.load(Path::new(SETTINGS_PATH)))
+            .expect("settings file written");
+        serde_json::from_slice::<SettingsContent>(&bytes)
+            .unwrap()
+            .favorites
+    }
+
+    /// Press on `from`, cross gpui's 2px drag threshold, settle on `to`, and
+    /// release — the real gesture, dispatched at real painted coordinates.
+    fn drag_and_drop(
+        cx: &mut VisualTestContext,
+        from: gpui::Point<gpui::Pixels>,
+        to: gpui::Point<gpui::Pixels>,
+    ) {
+        use gpui::{Modifiers, MouseButton};
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            from + gpui::point(px(6.0), px(6.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bounds<gpui::Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("nothing painted for {selector:?}"))
+    }
+
+    fn set_favorites(cx: &mut VisualTestContext, paths: &[&str]) {
+        cx.update(|_, cx| {
+            cx.update_global::<AppSettings, ()>(|settings, _| {
+                for path in paths {
+                    settings.add_favorite(PathBuf::from(path));
+                }
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    // The gesture, not the method: press a real favorite row, drop it on
+    // another row's painted centre, and assert the persisted order. A payload
+    // mix-up or a mis-captured `insert_before` at either drop site would leave
+    // the method-level tests green while drag-to-reorder silently stopped
+    // working — and this is one of the two behaviors the step exists to
+    // deliver. Sidebar rows carry `debug_selector`s, so no arithmetic is
+    // needed: `debug_bounds` gives the pixels the pointer would land on.
+    #[gpui::test]
+    fn dragging_a_favorite_row_onto_another_reorders_it(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        set_favorites(cx, &["/root", "/other", "/root/sub"]);
+
+        // Row 2 (`/root/sub`) onto row 1 (`/other`): insert *before* it.
+        let from = bounds(cx, "sidebar-favorite-2").center();
+        let onto = bounds(cx, "sidebar-favorite-1").center();
+        drag_and_drop(cx, from, onto);
+
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [
+                PathBuf::from("/root"),
+                PathBuf::from("/root/sub"),
+                PathBuf::from("/other"),
+            ],
+            "dropping a favorite on a row inserts it before that row"
+        );
+
+        // Dropped on the section rather than on a row (here its header, the
+        // one part of the zone that is never a row): to the end.
+        let from = bounds(cx, "sidebar-favorite-0").center();
+        let header = bounds(cx, "sidebar-section-Favorites");
+        let onto = gpui::point(header.left() + px(20.0), header.center().y);
+        drag_and_drop(cx, from, onto);
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [
+                PathBuf::from("/root/sub"),
+                PathBuf::from("/other"),
+                PathBuf::from("/root"),
+            ],
+            "dropping on the section moves the favorite to the end"
+        );
+        let _ = workspace;
+    }
+
+    // Drag-to-add through the real wiring: a *pane* row (a `DraggedEntries`
+    // payload built by `details_list`) dropped on the Favorites section.
+    #[gpui::test]
+    fn dragging_a_pane_folder_row_onto_favorites_pins_it(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        // With nothing pinned the section's content is its 32px header alone,
+        // so the drop zone's own minimum height is the only thing making the
+        // Favorites area a target at all. Drop *below* the header to prove it.
+        let header = bounds(cx, "sidebar-section-Favorites");
+        let zone = bounds(cx, "sidebar-favorites-drop-zone");
+        assert!(
+            zone.bottom() > header.bottom() + px(TREE_ROW_HEIGHT),
+            "an empty Favorites list must still present a real drop target \
+             (zone {zone:?}, header {header:?})"
+        );
+        let from = bounds(cx, "dir-row-0").center(); // /root/sub, a folder
+        let onto = gpui::point(zone.center().x, header.bottom() + px(4.0));
+        drag_and_drop(cx, from, onto);
+
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [PathBuf::from("/root/sub")],
+            "a folder dragged from the pane and dropped under the header is pinned"
+        );
+    }
+
+    #[gpui::test]
+    fn favorites_reorder_persists(cx: &mut TestAppContext) {
+        // §8 drag & drop closes the M2-deferred favorites-reordering gap: a
+        // favorite dropped on a row lands immediately before it, one dropped
+        // on the section lands at the end, and both persist at once. The
+        // gesture itself is covered above; this pins the *rule* (including the
+        // restart) without depending on painted geometry.
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.update(|_, cx| {
+            cx.update_global::<AppSettings, ()>(|settings, _| {
+                for path in ["/root", "/other", "/root/sub"] {
+                    settings.add_favorite(PathBuf::from(path));
+                }
+            });
+        });
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.reorder_favorite(Path::new("/root/sub"), Some(Path::new("/other")), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).favorites(),
+                [
+                    PathBuf::from("/root"),
+                    PathBuf::from("/root/sub"),
+                    PathBuf::from("/other"),
+                ]
+            );
+        });
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [
+                PathBuf::from("/root"),
+                PathBuf::from("/root/sub"),
+                PathBuf::from("/other"),
+            ],
+            "the new order is on disk immediately"
+        );
+
+        // Dropped on the section rather than a row: to the end.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.reorder_favorite(Path::new("/root"), None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [
+                PathBuf::from("/root/sub"),
+                PathBuf::from("/other"),
+                PathBuf::from("/root"),
+            ]
+        );
+
+        // A restart reads the reordered list back.
+        cx.update(|_, cx| crate::settings::init_with_path(cx, PathBuf::from(SETTINGS_PATH)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).favorites(),
+                [
+                    PathBuf::from("/root/sub"),
+                    PathBuf::from("/other"),
+                    PathBuf::from("/root"),
+                ],
+                "order survives a restart"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_folders_onto_favorites_pins_only_the_folders(cx: &mut TestAppContext) {
+        // Drag-to-add (the other half of the M2-deferred gap): only folders
+        // can be pinned, so each dropped path is stat'ed off the UI thread
+        // first — a dragged *file* is silently refused.
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.add_favorites_from_drop(
+                vec![
+                    PathBuf::from("/root/sub"),
+                    PathBuf::from("/root/file.txt"),
+                    PathBuf::from("/other"),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).favorites(),
+                [PathBuf::from("/root/sub"), PathBuf::from("/other")],
+                "folders pinned in drop order; the file was refused"
+            );
+        });
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [PathBuf::from("/root/sub"), PathBuf::from("/other")],
+            "one write, already on disk"
+        );
+
+        // Re-dropping a pinned folder changes (and persists) nothing.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.add_favorites_from_drop(vec![PathBuf::from("/other")], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(persisted_favorites(&vfs).len(), 2);
+    }
+
+    // A second drop arriving while the first is still stat'ing must not cancel
+    // it: the probes are queued behind one task rather than replacing a single
+    // `Option<Task>` slot, so both folders get pinned.
+    #[gpui::test]
+    fn a_second_drop_does_not_cancel_an_in_flight_one(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+
+        // Both drops land before the executor is ever allowed to run, which is
+        // exactly the "first probe still awaiting" window.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.add_favorites_from_drop(vec![PathBuf::from("/root/sub")], cx)
+        });
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.add_favorites_from_drop(vec![PathBuf::from("/other")], cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            persisted_favorites(&vfs),
+            [PathBuf::from("/root/sub"), PathBuf::from("/other")],
+            "neither drop was swallowed"
+        );
+
+        // ...and the queue is empty again, so a later drop starts a fresh task.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.add_favorites_from_drop(vec![PathBuf::from("/root/sub/deeper")], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(persisted_favorites(&vfs).len(), 3);
+    }
+
     #[gpui::test]
     fn tree_expand_reflattens_and_collapse_restores(cx: &mut TestAppContext) {
         let _vfs = init_test(cx);
@@ -804,6 +1265,75 @@ mod tests {
                 ("/Volumes/External SSD", 0),
                 ("/Volumes/Camera", 0),
             ])
+        );
+    }
+
+    // §6 invalidation: the tree caches child listings, and the only news it
+    // gets about external changes is the active pane's watcher batch
+    // (Pane → PaneEvent::DirsChanged → Workspace → Sidebar).
+    #[gpui::test]
+    fn external_change_invalidates_the_cached_tree_children(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+
+        // The pane's watch is what observes /root.
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        // "/root" is only a visible row once its parent volume is expanded.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.toggle_expanded(Path::new("/"), cx)
+        });
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.toggle_expanded(Path::new("/root"), cx)
+        });
+        cx.run_until_parked();
+        // The rows *inside* /root (depth 2 under the expanded volume root).
+        let child_rows = |cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar
+                    .flat_rows()
+                    .iter()
+                    .filter(|row| row.path.parent() == Some(Path::new("/root")))
+                    .map(|row| row.path.to_path_buf())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(child_rows(cx), vec![PathBuf::from("/root/sub")]);
+
+        // A folder appears in /root behind the app's back.
+        vfs.insert_dir("/root/newdir");
+        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
+        cx.run_until_parked();
+
+        assert_eq!(
+            child_rows(cx),
+            vec![PathBuf::from("/root/newdir"), PathBuf::from("/root/sub")],
+            "the expanded node re-listed instead of keeping its stale children"
+        );
+
+        // A collapsed node's cache is dropped too: re-expanding re-lists.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.toggle_expanded(Path::new("/root"), cx)
+        });
+        cx.run_until_parked();
+        vfs.insert_dir("/root/later");
+        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.toggle_expanded(Path::new("/root"), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            child_rows(cx),
+            vec![
+                PathBuf::from("/root/later"),
+                PathBuf::from("/root/newdir"),
+                PathBuf::from("/root/sub")
+            ],
         );
     }
 

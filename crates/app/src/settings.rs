@@ -80,6 +80,34 @@ impl AppSettings {
         true
     }
 
+    /// Reorder the favorites (M3 drag-to-reorder, the gap M2 deferred): move
+    /// `path` so it sits immediately **before** `before`, or to the end when
+    /// `before` is `None`. Path-keyed on both sides like every other identity
+    /// in the app (invariant #2) — a caller never passes an index, so a list
+    /// that changed under the gesture can't silently reorder the wrong row.
+    /// Returns whether the order actually changed.
+    pub fn move_favorite(&mut self, path: &Path, before: Option<&Path>) -> bool {
+        let Some(from) = self.content.favorites.iter().position(|p| p == path) else {
+            return false;
+        };
+        let target = match before {
+            Some(before) if before == path => return false, // onto itself
+            Some(before) => match self.content.favorites.iter().position(|p| p == before) {
+                Some(ix) => ix,
+                None => return false,
+            },
+            None => self.content.favorites.len(),
+        };
+        // Removing `from` first shifts everything after it down one.
+        let insert_at = if target > from { target - 1 } else { target };
+        if insert_at == from {
+            return false;
+        }
+        let moved = self.content.favorites.remove(from);
+        self.content.favorites.insert(insert_at, moved);
+        true
+    }
+
     /// Remove a favorite. Returns whether anything changed.
     pub fn remove_favorite(&mut self, path: &Path) -> bool {
         let before = self.content.favorites.len();
@@ -177,6 +205,43 @@ mod tests {
         block_on(loaded.save_future(vfs.clone())).unwrap();
         let reloaded = block_on(AppSettings::load(vfs, path));
         assert_eq!(reloaded.favorites(), [PathBuf::from("/home/me/Downloads")]);
+    }
+
+    #[test]
+    fn move_favorite_inserts_before_the_target_or_at_the_end() {
+        let mut settings = AppSettings::new(PathBuf::from("/config/settings.json"));
+        for name in ["a", "b", "c"] {
+            settings.add_favorite(PathBuf::from(format!("/{name}")));
+        }
+        let names = |settings: &AppSettings| {
+            settings
+                .favorites()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Dropping "a" on "c" puts it immediately before "c".
+        assert!(settings.move_favorite(Path::new("/a"), Some(Path::new("/c"))));
+        assert_eq!(names(&settings), ["/b", "/a", "/c"]);
+
+        // Dropping "c" on the first row moves it to the front.
+        assert!(settings.move_favorite(Path::new("/c"), Some(Path::new("/b"))));
+        assert_eq!(names(&settings), ["/c", "/b", "/a"]);
+
+        // Dropping on the section (no row) sends it to the end.
+        assert!(settings.move_favorite(Path::new("/c"), None));
+        assert_eq!(names(&settings), ["/b", "/a", "/c"]);
+
+        // No-ops report no change, so nothing is persisted for nothing:
+        // onto itself, onto the row it already precedes, already last, and
+        // paths that are not favorites at all.
+        assert!(!settings.move_favorite(Path::new("/b"), Some(Path::new("/b"))));
+        assert!(!settings.move_favorite(Path::new("/b"), Some(Path::new("/a"))));
+        assert!(!settings.move_favorite(Path::new("/c"), None));
+        assert!(!settings.move_favorite(Path::new("/nope"), None));
+        assert!(!settings.move_favorite(Path::new("/b"), Some(Path::new("/nope"))));
+        assert_eq!(names(&settings), ["/b", "/a", "/c"], "unchanged throughout");
     }
 
     #[test]

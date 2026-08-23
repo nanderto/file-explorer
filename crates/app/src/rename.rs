@@ -15,17 +15,55 @@
 //! and navigating away (`DirView::cancel_rename_for_navigation`, called by
 //! the pane when it loads a different directory) all tear the editor down
 //! cleanly, restoring the pre-rename focus.
+//!
+//! **Naming a new entry** (§4c's `is_new_entry: true`, reached from
+//! `cmd-shift-n` and from the context menu's `New ▸ Folder / Text file…`):
+//! the *same* machine, opened by `DirView::begin_new_entry` on a **phantom
+//! row** — a `FileEntry` for a path that does not exist yet, which
+//! `DirView::projected_rows` appends so the row swap has somewhere to render.
+//! `Confirm` submits `CreateDir`/`CreateFile` instead of `Rename`; everything
+//! else (validation, the processing state, an inline collision error, escape,
+//! blur, navigation) is shared code. Nothing reaches the disk until the name
+//! is committed, so `Escape` leaves the directory exactly as it was.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
-use fs_core::{EntryId, FileOp, JobId, split_name};
-use gpui::{Context, Entity, FocusHandle, SharedString, Subscription, Window, prelude::*};
+use fs_core::{EntryId, EntryKind, FileEntry, FileOp, JobId, split_name};
+use gpui::{
+    Context, Entity, FocusHandle, ScrollStrategy, SharedString, Subscription, Window, prelude::*,
+};
 
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 use crate::input::InputState;
 use crate::jobs_model::JobsEvent;
+
+/// What a `New ▸` command is naming (ARCHITECTURE.md §4c `is_new_entry`).
+/// The editor for these runs the **identical** machine a rename does; only the
+/// op `Confirm` submits differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewEntryKind {
+    Folder,
+    File,
+}
+
+impl NewEntryKind {
+    fn entry_kind(self) -> EntryKind {
+        match self {
+            NewEntryKind::Folder => EntryKind::Dir,
+            NewEntryKind::File => EntryKind::File,
+        }
+    }
+
+    fn op(self, path: PathBuf) -> FileOp {
+        match self {
+            NewEntryKind::Folder => FileOp::CreateDir { path },
+            NewEntryKind::File => FileOp::CreateFile { path },
+        }
+    }
+}
 
 /// One in-flight rename edit. Lives at `DirView.rename`; dropping it (on any
 /// teardown path) cancels its subscriptions.
@@ -33,6 +71,11 @@ pub(crate) struct RenameState {
     /// The entry being renamed, path-keyed so identity survives listing
     /// patches that don't touch it.
     target: EntryId,
+    /// §4c `is_new_entry`: set when this editor is naming something that does
+    /// **not exist yet**. Carries what `Confirm` will create and the phantom
+    /// row the projection injects so the editor has somewhere to render.
+    /// `None` for an ordinary rename.
+    new_entry: Option<(NewEntryKind, FileEntry)>,
     /// The row editor — one per `DirView`, swapped into place.
     input: Entity<InputState>,
     /// Set once `Confirm` submits the op: the row shows this pending name
@@ -48,6 +91,12 @@ pub(crate) struct RenameState {
     job: Option<JobId>,
     /// Focus to restore on teardown (Escape / blur / navigating away).
     prev_focus: Option<FocusHandle>,
+    /// The window this editor was opened in. Every *user-driven* teardown has
+    /// a `Window` to hand, but the one the watcher drives does not (it arrives
+    /// through the pane's async batch pump), and focus is sitting on the
+    /// editor's about-to-be-unpainted handle — so that path defers a focus
+    /// restore through this handle rather than leaving the keyboard nowhere.
+    window: gpui::AnyWindowHandle,
     /// Fires when the editor's focus handle loses focus while still editing
     /// (§4c "blur … tears the editor down cleanly").
     _blur_subscription: Subscription,
@@ -69,6 +118,18 @@ impl RenameState {
 
     pub(crate) fn error(&self) -> Option<&SharedString> {
         self.error.as_ref()
+    }
+
+    /// The phantom row this editor is sitting on, for an entry that does not
+    /// exist yet (§4c). `None` for an ordinary rename.
+    pub(crate) fn new_entry_row(&self) -> Option<&FileEntry> {
+        self.new_entry.as_ref().map(|(_, row)| row)
+    }
+
+    /// True while this editor is naming a not-yet-created entry — the details
+    /// row blanks its Size/Date cells, which have nothing to report yet.
+    pub(crate) fn is_new_entry(&self) -> bool {
+        self.new_entry.is_some()
     }
 }
 
@@ -115,9 +176,63 @@ impl DirView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_editor(entry.clone(), None, window, cx);
+    }
+
+    /// §0 `NewFolder` / `NewFile`, handed down by the pane (§0's handler
+    /// column is literally "Pane → DirView"): open the **same** editor on a
+    /// phantom row for `dir/name`, with the name preselected. Nothing is
+    /// created until `Confirm`; `Escape` leaves the directory untouched.
+    ///
+    /// `name` is the pane's already-deconflicted placeholder ("New Folder",
+    /// "New Folder 2", …), so the phantom's path cannot collide with a real
+    /// row — which matters, because the row swap is keyed on that path.
+    pub(crate) fn begin_new_entry(
+        &mut self,
+        kind: NewEntryKind,
+        dir: &Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = FileEntry {
+            path: Arc::from(dir.join(name).as_path()),
+            name: Arc::from(name),
+            kind: kind.entry_kind(),
+            size: 0,
+            // Never a wall-clock value: the phantom row renders no date at
+            // all (`details_list`), so captured frames stay deterministic.
+            modified: SystemTime::UNIX_EPOCH,
+            created: None,
+            hidden: false,
+        };
+        self.open_editor(entry, Some(kind), window, cx);
+        // The phantom is appended last, so on a long listing it is off-screen
+        // until the list scrolls to it. Its index is the length of the *last
+        // painted* projection — read from this view's own state, never by
+        // re-projecting, because the pane calls this from inside its own
+        // `update` and reading it back would panic.
+        if self.rename.is_some() {
+            let last = self.flat_rows().len();
+            self.scroll_handle()
+                .scroll_to_item(last, ScrollStrategy::Nearest);
+        }
+    }
+
+    /// The one editor-opening path, shared by rename and new-entry naming
+    /// (§4c: "the identical machine with `is_new_entry: true`").
+    fn open_editor(
+        &mut self,
+        entry: FileEntry,
+        new_entry: Option<NewEntryKind>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.rename.is_some() {
             return;
         }
+        // A menu must not outlive the gesture that opened the editor.
+        self.close_context_menu(window, cx);
         let prev_focus = window.focused(cx);
         let theme = self.theme().clone();
         let name = entry.name.to_string();
@@ -139,12 +254,14 @@ impl DirView {
         let blur_subscription = cx.on_blur(&focus_handle, window, Self::on_rename_blur);
         self.rename = Some(RenameState {
             target: entry.id(),
+            new_entry: new_entry.map(|kind| (kind, entry)),
             input,
             processing: None,
             pending_to: None,
             error: None,
             job: None,
             prev_focus,
+            window: window.window_handle(),
             _blur_subscription: blur_subscription,
             _job_subscription: None,
         });
@@ -162,6 +279,7 @@ impl DirView {
         }
         let typed = rename.input.read(cx).content().to_string();
         let target = rename.target.clone();
+        let new_entry = rename.new_entry.as_ref().map(|(kind, _)| *kind);
 
         let new_name = match validate_new_name(&typed) {
             Ok(name) => name,
@@ -178,17 +296,26 @@ impl DirView {
             return;
         };
         let to = parent.join(&new_name);
-        if to.as_path() == &*target.0 {
-            // Unchanged name: nothing to submit, just close cleanly.
+        // Unchanged name: nothing to submit, just close cleanly — but only for
+        // a real rename. Accepting a *new* entry's placeholder name unchanged
+        // still has to create it.
+        if new_entry.is_none() && to.as_path() == &*target.0 {
             self.cancel_rename(window, cx);
             return;
         }
 
-        let from = target.0.to_path_buf();
-        let job = FsContext::global(cx).queue.submit(FileOp::Rename {
-            from,
-            to: to.clone(),
-        });
+        // §4c: the identical machine, differing only in the op it submits — so
+        // a name collision comes back from the op as an inline error in the
+        // still-open editor either way (`CreateDir`/`CreateFile` both fail on
+        // an existing path).
+        let op = match new_entry {
+            Some(kind) => kind.op(to.clone()),
+            None => FileOp::Rename {
+                from: target.0.to_path_buf(),
+                to: to.clone(),
+            },
+        };
+        let job = FsContext::global(cx).queue.submit(op);
         let jobs = FsContext::global(cx).jobs.clone();
         let subscription = cx.subscribe_in(&jobs, window, move |this, _jobs, event, window, cx| {
             this.on_rename_job_event(job, event, window, cx);
@@ -223,6 +350,59 @@ impl DirView {
         if self.rename.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// The row under the editor left the listing (an external delete, or a
+    /// job of our own finishing on it, arriving as a watcher patch): drop the
+    /// editor, because there is nothing left to rename.
+    ///
+    /// Without this the state machine deadlocks the whole view: the projection
+    /// stops yielding the target row, so `details_list` never paints the editor
+    /// (and its unpainted `TextInput` node leaves the dispatch tree, taking
+    /// `escape` with it), while the root key context stays pinned to
+    /// `DirView renaming` — killing every `DirView && !renaming` binding — and
+    /// the marquee, the context menu and the row drags all bail on
+    /// `rename.is_some()`. Only leaving the directory used to clear it.
+    ///
+    /// Called by the pane after any snapshot swap, with the snapshot it swapped
+    /// in (so this never reads the pane back mid-update).
+    pub(crate) fn cancel_rename_if_target_vanished(
+        &mut self,
+        snapshot: Option<&fs_core::ListingSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rename) = self.rename.as_ref() else {
+            return;
+        };
+        // A §4c new-entry phantom is injected unconditionally by the
+        // projection and is never in the snapshot: its row cannot vanish.
+        if rename.new_entry.is_some() {
+            return;
+        }
+        // Once the op is in flight the row is *expected* to leave the listing
+        // (that is the rename landing); the job's terminal event owns teardown.
+        if rename.processing.is_some() {
+            return;
+        }
+        let target = rename.target.clone();
+        if self.listing_contains(snapshot, &target) {
+            return;
+        }
+        let window = rename.window;
+        let focus = rename
+            .prev_focus
+            .clone()
+            .unwrap_or_else(|| self.focus_handle_ref().clone());
+        self.cancel_rename_for_navigation(cx);
+        // The editor still holds keyboard focus on a handle that is about to
+        // stop being painted, and this teardown has no `Window` of its own
+        // (the watcher batch arrives on the pane's async pump). Without this
+        // the keyboard would land nowhere until the user clicked a row.
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| window.focus(&focus, cx))
+                .ok();
+        });
     }
 
     /// A blur while still editing (focus moved elsewhere) tears the editor
@@ -535,6 +715,101 @@ mod tests {
         cx.run_until_parked();
         dir_view.read_with(cx, |dir_view, _| {
             assert!(dir_view.rename.is_none(), "leaving the directory closes it");
+        });
+    }
+
+    // The row under the editor being deleted externally (or by one of our own
+    // jobs finishing on it) used to leave `rename = Some(..)` forever: the
+    // projection stops yielding the row, so no editor paints and its unpainted
+    // `TextInput` node leaves the dispatch tree with `escape` inside it, while
+    // the root context stays `DirView renaming` — killing every
+    // `DirView && !renaming` binding — and the marquee, context menu and row
+    // drags all keep bailing on `rename.is_some()`. Only navigating away
+    // cleared it. The watcher makes that reachable with no user action at all.
+    #[gpui::test]
+    fn a_watcher_patch_that_removes_the_target_closes_the_editor(cx: &mut TestAppContext) {
+        let (vfs, _pane, dir_view, cx) = open_root(cx);
+
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        dir_view.read_with(cx, |dir_view, _| assert!(dir_view.rename.is_some()));
+
+        // Deleted outside the app; the pane's watch fires a beat later.
+        vfs.remove_path("/root/report.pdf");
+        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
+        cx.run_until_parked();
+
+        dir_view.read_with(cx, |dir_view, _| {
+            assert!(
+                dir_view.rename.is_none(),
+                "an editor whose row vanished must not survive the patch"
+            );
+            assert!(
+                dir_view
+                    .flat_rows()
+                    .iter()
+                    .all(|row| !row.entry.path.ends_with("report.pdf")),
+                "and the row really is gone"
+            );
+        });
+
+        // Focus came back to the list rather than staying on the editor's
+        // unpainted handle — otherwise the keyboard would land nowhere.
+        cx.update(|window, cx| {
+            let view_handle = dir_view.read(cx).focus_handle_ref().clone();
+            assert_eq!(
+                window.focused(cx).as_ref(),
+                Some(&view_handle),
+                "the teardown handed keyboard focus back to the list"
+            );
+        });
+        // The view is usable again: `cmd-a` is a `DirView && !renaming`
+        // binding, so it only resolves once the `renaming` token is gone.
+        cx.simulate_keystrokes("cmd-a");
+        cx.run_until_parked();
+        dir_view.read_with(cx, |dir_view, _| {
+            assert_eq!(
+                dir_view.selection().len(),
+                dir_view.flat_rows().len(),
+                "keyboard bindings live again"
+            );
+            assert!(!dir_view.selection().is_empty());
+        });
+    }
+
+    // ...but a row leaving the listing because *this* rename landed is the
+    // normal case, and the job's own terminal event owns that teardown (it is
+    // what moves the selection onto the new name).
+    #[gpui::test]
+    fn the_pending_editor_survives_its_own_rename_leaving_the_listing(cx: &mut TestAppContext) {
+        let (vfs, _pane, dir_view, cx) = open_root(cx);
+
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        type_name(&dir_view, "renamed.pdf", cx);
+
+        // Submit, then let the watcher patch land before the job's completion
+        // event is delivered: the old row is gone from the listing, but the
+        // editor is `processing` and must be left to its own job event.
+        cx.update(|window, cx| {
+            dir_view.update(cx, |dir_view, cx| dir_view.confirm_rename(window, cx))
+        });
+        dir_view.read_with(cx, |dir_view, _| {
+            let rename = dir_view.rename.as_ref().expect("still up while processing");
+            assert!(rename.processing.is_some());
+        });
+        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
+        cx.run_until_parked();
+
+        assert!(exists(&vfs, "/root/renamed.pdf"));
+        dir_view.read_with(cx, |dir_view, _| {
+            assert!(dir_view.rename.is_none(), "the job event tore it down");
+            assert_eq!(
+                dir_view.cursor(),
+                Some(&entry_id("/root/renamed.pdf")),
+                "and the selection followed the new name, which is what the \
+                 job event exists to do"
+            );
         });
     }
 

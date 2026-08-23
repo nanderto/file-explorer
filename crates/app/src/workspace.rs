@@ -13,12 +13,12 @@ use gpui::{
     SharedString, Subscription, Window, deferred, div, prelude::*, px,
 };
 
-use crate::actions::{FocusAddressBar, Redo, ToggleHiddenFiles, Undo};
+use crate::actions::{DeletePermanently, FocusAddressBar, Redo, ToggleHiddenFiles, Undo};
 use crate::app_state::FsContext;
 use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
 use crate::jobs_model::{JobsEvent, JobsModel};
 use crate::jobs_ui::{JobsIndicator, ToastLayer};
-use crate::pane::Pane;
+use crate::pane::{Pane, PaneEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::Theme;
 
@@ -107,6 +107,9 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pane = cx.new(|cx| Pane::new(theme.clone(), window, cx));
+        // Events up (§2): a pane's watcher batches are the only news the
+        // sidebar tree gets about external changes.
+        let pane_subscription = cx.subscribe(&pane, Self::handle_pane_event);
         let workspace = cx.weak_entity();
         let sidebar = cx.new(|cx| Sidebar::new(theme.clone(), workspace, cx));
         // Events up, method calls down (§2): the sidebar reports navigation
@@ -133,7 +136,25 @@ impl Workspace {
             jobs_indicator,
             toast_layer,
             modal: None,
-            _subscriptions: vec![sidebar_subscription, jobs_subscription],
+            _subscriptions: vec![sidebar_subscription, pane_subscription, jobs_subscription],
+        }
+    }
+
+    /// The sidebar tree caches child listings of its own, so an external
+    /// change a pane's watcher reported has to reach it too (§6: cached child
+    /// listings must not survive a change to the folder they came from).
+    fn handle_pane_event(
+        &mut self,
+        _pane: Entity<Pane>,
+        event: &PaneEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PaneEvent::DirsChanged(dirs) => {
+                let dirs = dirs.clone();
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.invalidate_children(&dirs, cx));
+            }
         }
     }
 
@@ -504,6 +525,51 @@ impl Workspace {
             .update(cx, |pane, cx| pane.focus_address_bar(window, cx));
     }
 
+    /// §0 `DeletePermanently` ("Bypass trash (confirm dialog first)"), bound
+    /// in the `DirView` context so `!renaming` guards it but handled here,
+    /// because the workspace owns the modal. Reached by `shift-delete` and by
+    /// the row context menu's **Delete Permanently** — one handler for both.
+    fn handle_delete_permanently(
+        &mut self,
+        _: &DeletePermanently,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Root-most paths only: deleting a folder already takes its contents.
+        let paths = self
+            .active_pane()
+            .read(cx)
+            .dir_view()
+            .read(cx)
+            .selection()
+            .selected_paths_rootmost();
+        if paths.is_empty() {
+            return;
+        }
+        let message = match paths.as_slice() {
+            [only] => format!(
+                "\u{201c}{}\u{201d} will be deleted immediately. This can't be undone.",
+                only.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| only.display().to_string())
+            ),
+            many => format!(
+                "{} items will be deleted immediately. This can't be undone.",
+                many.len()
+            ),
+        };
+        self.show_confirm(
+            ConfirmRequest {
+                title: "Delete Permanently".into(),
+                message: message.into(),
+                confirm_label: "Delete".into(),
+                op: FileOp::Delete { paths },
+            },
+            window,
+            cx,
+        );
+    }
+
     fn handle_toggle_hidden_files(
         &mut self,
         _: &ToggleHiddenFiles,
@@ -533,6 +599,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .on_action(cx.listener(Self::handle_focus_address_bar))
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
+            .on_action(cx.listener(Self::handle_delete_permanently))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
             .flex()
@@ -1039,6 +1106,66 @@ mod tests {
         cx.run_until_parked();
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.item_count(), 1, "toggled back off");
+        });
+    }
+
+    // §0 `DeletePermanently` end to end: bound in the `DirView` context (so
+    // `!renaming` guards it) and handled here, behind the ConfirmDialog. Both
+    // `shift-delete` and the row context menu's "Delete Permanently" arrive as
+    // this one action, so this is the whole path for both.
+    #[gpui::test]
+    fn shift_delete_confirms_first_then_deletes(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/a.txt")], cx);
+        });
+        cx.update(|window, cx| {
+            let handle = dir_view.read(cx).focus_handle_ref().clone();
+            window.focus(&handle, cx);
+        });
+
+        cx.simulate_keystrokes("shift-delete");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                matches!(workspace.active_modal(), Some(Modal::Confirm { .. })),
+                "delete-permanently must ask first — it is not undoable"
+            );
+        });
+        assert!(exists(&vfs, "/root/a.txt"), "nothing submitted yet");
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none());
+        });
+        assert!(!exists(&vfs, "/root/a.txt"), "confirmed, so it is gone");
+    }
+
+    #[gpui::test]
+    fn delete_permanently_with_nothing_selected_opens_no_dialog(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        cx.update(|window, cx| {
+            let handle = dir_view.read(cx).focus_handle_ref().clone();
+            window.focus(&handle, cx);
+        });
+
+        cx.simulate_keystrokes("shift-delete");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none());
         });
     }
 }

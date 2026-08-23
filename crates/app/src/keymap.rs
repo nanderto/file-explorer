@@ -73,6 +73,11 @@ pub fn init(cx: &mut App) {
         ),
         // §0 New folder (M3); New ▸ Text file… is context-menu only (no key)
         KeyBinding::new("cmd-shift-n", NewFolder, Some("Pane")),
+        // §0 Context menu (M3): escape dismisses it. The `menu` token is on
+        // the DirView node only while a menu is open (the same dynamic-token
+        // shape as `renaming`), so this row is dead the rest of the time and
+        // never shadows the rename editor's own `TextInput` escape.
+        KeyBinding::new("escape", Cancel, Some("DirView && menu")),
         // §0 Hidden files (M1)
         KeyBinding::new("cmd-shift-.", ToggleHiddenFiles, Some("Workspace")),
         // §0 Refresh (M1)
@@ -267,6 +272,26 @@ mod tests {
         assert!(
             fired.borrow().is_empty(),
             "`!renaming` guard must block DirView bindings while renaming, got {:?}",
+            fired.borrow()
+        );
+    }
+
+    // §9 dispatch guard for the §8 context-menu row: `escape` reaches
+    // `Cancel` only while the `menu` token is on the DirView node.
+    #[gpui::test]
+    fn menu_token_binds_escape_to_cancel(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "DirView menu");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(*fired.borrow(), vec!["Cancel"]);
+    }
+
+    #[gpui::test]
+    fn escape_is_dead_in_the_dir_view_without_an_open_menu(cx: &mut TestAppContext) {
+        let (fired, cx) = probe(cx, "DirView");
+        cx.simulate_keystrokes("escape");
+        assert!(
+            fired.borrow().is_empty(),
+            "escape must not dispatch Cancel with no menu open, got {:?}",
             fired.borrow()
         );
     }

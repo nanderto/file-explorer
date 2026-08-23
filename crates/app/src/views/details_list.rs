@@ -20,6 +20,7 @@ use gpui::{
 use crate::actions::{Cancel, Confirm, SortBy};
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
+use crate::drag;
 use crate::input::text_input as ti;
 use crate::pane::format_bytes;
 use crate::theme::Theme;
@@ -162,7 +163,13 @@ fn render_row(
     let disclosure: gpui::AnyElement = if entry.is_dir_like() {
         let toggle_path = entry.path.clone();
         div()
-            .id(("dir-row-disclosure", ix))
+            // Path-keyed like the row itself: a click's press is persisted per
+            // element id too, so an index here could toggle a folder the user
+            // never pressed on after a mid-gesture re-projection.
+            .id(gpui::ElementId::NamedChild(
+                std::sync::Arc::new(gpui::ElementId::Path(entry.path.clone())),
+                SharedString::new_static("disclosure"),
+            ))
             .debug_selector(|| format!("dir-row-disclosure-{ix}"))
             .w(px(DISCLOSURE_WIDTH))
             .flex_none()
@@ -184,7 +191,18 @@ fn render_row(
     };
 
     let mut styled_row = div()
-        .id(ix)
+        // **Path-keyed, not index-keyed** (invariant #2). gpui persists a
+        // stateful element's `pending_mouse_down` across frames by its
+        // `GlobalElementId`, and a drag started by a later mouse-move reads
+        // that persisted press through *this* frame's drag listener without
+        // re-hit-testing. With index ids, a watcher patch (or any
+        // re-projection) landing between the press and the move would hand the
+        // press on row `n` to whatever entry now sits at index `n` — and this
+        // row's `on_drag` payload turns that into a filesystem move of a file
+        // the user never touched. The path never moves between entries.
+        .id(gpui::ElementId::Path(entry.path.clone()))
+        // The *selector* stays index-based: it names a position on screen,
+        // which is what a test clicking "the third row" means.
         .debug_selector(|| format!("dir-row-{ix}"))
         .flex()
         .items_center()
@@ -236,8 +254,39 @@ fn render_row(
     if selected {
         styled_row = styled_row.bg(selection_color(&theme));
     }
+    // §8 drag & drop: this row is the armed folder drop target. Painted after
+    // the selection tint (a target that is also selected reads as the target)
+    // and as a background only — arming a highlight must never move a row.
+    if drag::row_is_drop_target(this, &entry.path, cx) {
+        styled_row = styled_row.bg(drag::drop_row_color(&theme));
+    }
     if cut_pending {
         styled_row = styled_row.opacity(CUT_DIM_OPACITY);
+    }
+    // §8 "every `on_drag` pairs with `external_drag_payload`": the row starts
+    // the file drag. The payload is built *here*, at render time, from the
+    // selection as last painted — which is exactly the Explorer rule, because
+    // a press does not change the selection (a click does, on release): a
+    // grabbed row that was selected drags the whole selection, one that was
+    // not drags itself. Not while the inline editor is up.
+    if this.rename.is_none() {
+        let dragged = this.drag_payload(entry.path.clone());
+        let ghost_label = dragged.label();
+        let ghost_theme = theme.clone();
+        // The outbound (us → Finder) dir flags are resolved from this view
+        // only if the drag actually leaves the window — never per frame, and
+        // never by stat'ing the disk on the UI thread.
+        let view = cx.weak_entity();
+        styled_row = styled_row
+            .on_drag(dragged, move |_, _, _, cx| {
+                drag::ghost(ghost_label.clone(), ghost_theme.clone(), cx)
+            })
+            .external_drag_payload(move |dragged: &drag::DraggedEntries, _, cx| {
+                let entries = view
+                    .read_with(cx, |view, _| view.external_drag_entries(dragged))
+                    .ok()?;
+                drag::external_payload(&entries)
+            });
     }
     styled_row
 }
@@ -274,9 +323,17 @@ fn render_rename_row(
     let error = rename.error().cloned();
     let depth = row.depth;
     // Explorer keeps the Size / Date columns filled while a row is being
-    // renamed — only the name cell becomes the editor.
-    let size = size_cell(&row.entry);
-    let modified: SharedString = SharedString::new(format_modified(row.entry.modified));
+    // renamed — only the name cell becomes the editor. A §4c *new-entry*
+    // phantom row has nothing to report in either column (and no real mtime),
+    // so both stay blank until the entry exists.
+    let (size, modified): (SharedString, SharedString) = if rename.is_new_entry() {
+        (SharedString::default(), SharedString::default())
+    } else {
+        (
+            size_cell(&row.entry),
+            SharedString::new(format_modified(row.entry.modified)),
+        )
+    };
 
     let name_area: gpui::AnyElement = if let Some(pending) = processing {
         div()
@@ -294,7 +351,9 @@ fn render_rename_row(
     // `.child(input)` without it leaves `Confirm`/`Cancel` unreachable).
     let input_focus = input.read(cx).focus_handle(cx);
     let mut styled_row = div()
-        .id(("dir-row-rename", ix))
+        // Path-keyed for the same reason as the normal row above; only one of
+        // the two ever paints for a given path in a frame.
+        .id(gpui::ElementId::Path(row.entry.path.clone()))
         .debug_selector(|| format!("dir-row-{ix}"))
         .track_focus(&input_focus)
         .key_context("TextInput")

@@ -680,6 +680,16 @@ mod fake {
             self.state.lock().unwrap().watchers.len()
         }
 
+        /// How many watches have *ever* been registered — ids are handed out
+        /// monotonically, so this counts registrations rather than live ones.
+        /// Lets a caller prove it does **not** tear a watch down and build it
+        /// back up (each cycle on a real backend costs a run-loop stop, a
+        /// thread join and a blocking re-stat, and loses any change in
+        /// between), which `watcher_count` alone cannot show.
+        pub fn watch_registrations(&self) -> u64 {
+            self.state.lock().unwrap().next_watch_id
+        }
+
         /// Full tree snapshot for equality assertions (undo round-trip tests):
         /// path → `None` for directories, `Some(contents)` for files.
         pub fn snapshot(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
