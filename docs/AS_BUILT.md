@@ -41,7 +41,7 @@ the change log for what they found. 355 tests green (113 fs-core unit +
 | M1 read-only browsing | ✅ merged (#4) |
 | M2 sidebar + in-place expansion | ✅ merged (#5) |
 | M3 file operations | ✅ engine + job spine + keyboard ops + inline rename/duplicate + marquee + drag & drop + context menus + review fixes; all baselines committed |
-| M4 icon view + dual pane | 🔄 complete in code, reviewed and fixed — fs-core thumbnails, icon view + view-mode switcher, dual pane, grid thumbnails (visible+margin, cancel-on-scroll-away) and the auto-hide scrollbar. **Every** visual baseline needs regenerating on the macOS runner, not only the two new scenarios — see Known gaps |
+| M4 icon view + dual pane | ✅ complete — fs-core thumbnails, icon view + view-mode switcher, dual pane, grid thumbnails (visible+margin, cancel-on-scroll-away), the auto-hide scrollbar, and the narrow-pane column fit. All 14 visual baselines regenerated on the macOS runner (the titlebar's split-pane button changed every existing scenario) |
 | M5 → M8 ship | not started |
 
 ## Components
