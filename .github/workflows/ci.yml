@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Lets the update-visual-baselines workflow start CI on its own commit.
+  # Baselines are pushed with GITHUB_TOKEN, which GitHub excludes from
+  # triggering workflows, so `pull_request` never fires for them and the
+  # required CI check would otherwise never run on that HEAD.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -92,7 +97,10 @@ jobs:
   docs-and-tests-updated:
     name: Docs & tests accompany code
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Runs for workflow_dispatch too. The aggregate `ci` job below treats a
+    # skipped job as acceptable, so letting this one skip on dispatch would let
+    # a baseline-triggered CI pass without the docs/tests check ever running.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,7 +108,8 @@ jobs:
 
       - name: Check AS_BUILT.md and tests were updated with code
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-checks') }}
-        run: bash scripts/gate.sh ci-diff "origin/${{ github.base_ref }}"
+        # base_ref is empty outside a pull_request, so fall back to main.
+        run: bash scripts/gate.sh ci-diff "origin/${{ github.base_ref || 'main' }}"
 
   # Aggregate check — the ONLY required status check in branch protection.
   # Requiring this single "CI" context means adding/renaming jobs above never

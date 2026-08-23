@@ -8,7 +8,7 @@ Build the file-explorer application described in `docs/file-explorer-plan.md`, u
 
 1. `CLAUDE.md` — quality gates and working conventions. These are non-negotiable and enforced by hooks, CI, and branch protection.
 2. `docs/file-explorer-plan.md` — product goals, the Explorer-not-Finder behavior spec (§3, the product's identity), UI blueprint, tech stack, milestones M0–M8.
-3. `docs/AS_BUILT.md` — what already exists. Do not redo it: the cargo workspace, M0 window skeleton (`WorkspaceView`, dark/light `Theme`), and the visual regression infrastructure (runner binary, baselines, CI jobs, `update-visual-baselines.yml`) are built and merged.
+3. `docs/AS_BUILT.md` — what already exists (the index: status, known gaps, deviations, change log; per-crate detail in `docs/as-built/`). Do not redo it: the cargo workspace, M0 window skeleton (`WorkspaceView`, dark/light `Theme`), and the visual regression infrastructure (runner binary, baselines, CI jobs, `update-visual-baselines.yml`) are built and merged.
 4. `docs/requirements/Basic window.png` — the target layout.
 
 ## Phase A — Architecture (one orchestrated workflow, then a PR)
