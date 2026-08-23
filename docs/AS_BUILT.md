@@ -1021,6 +1021,12 @@ unit + 3 integration + 187 app).
 Each entry names the milestone expected to resolve it. Mechanics live in the
 component sections; this list is the scannable index.
 
+- **The info panel always reads "No selection"** — it is still the M0 chrome
+  placeholder and ignores the selection entirely, which the M3 baselines now
+  pin: `cut_dimmed`, `marquee_active` and `details_rename_editing` all show
+  selected rows beside a panel claiming nothing is selected. Cosmetic, but it
+  makes four committed baselines look wrong to a reviewer. *M5 (info panel).*
+
 - **The three M3 visual scenarios are declared but have no baselines yet.**
   `cut_dimmed`, `context_menu_open` and `marquee_active` are in `scenarios()`
   (all three driven by real simulated mouse input at real painted pixels, via
