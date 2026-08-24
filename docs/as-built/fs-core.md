@@ -181,6 +181,64 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   visual scenarios have something stable to paint. `DefaultHasher` was
   deliberately avoided (its output is explicitly unstable across releases and
   these pixels end up in committed baselines).
+- `attrs.rs` (M5) + `platform/` (M5 addition): the info panel's data.
+  **Pure, clock-free, filesystem-free** — safe to call from the UI thread and
+  exact-assertable on every platform:
+  - `UnixPerms` keeps the low 12 bits of `st_mode` (the nine rwx bits plus
+    setuid/setgid/sticky — never the file-type bits, which are already
+    `EntryKind`). `octal()` is three digits normally and four when a special
+    bit is set (a leading zero would read as C source, not as a mode);
+    `symbolic()` is the nine `ls -l` characters with the special bits folded
+    into the class they modify (`s`/`S`, `t`/`T`); `allows(class, bit)` is what
+    the panel's checkbox grid reads.
+  - `FileAttrs { perms, owner, group, locked, added, extension_hidden,
+    type_description }`, every field independently optional so a platform that
+    cannot answer one lookup degrades that field instead of failing the call.
+  - `SelectionSummary { files, dirs, total_size }` + `summarize(entries)` for
+    the §2 multi-selection summary. `total_size` sums **files only**: a
+    directory's `size` is its own inode size, not its contents', and recursive
+    folder sizing is a separate cancellable job.
+  - `is_previewable(path, size)` — an extension allowlist (images, PDF, plain
+    text/markup/source, audio, video, office/iWork, camera raw and
+    `psd`/`ai`/`eps`) plus an inclusive 64 MiB ceiling
+    (`PREVIEW_SIZE_CEILING`), so nothing asks QuickLook about every `.o` in
+    `/usr/lib` or starts decoding a multi-gigabyte disk image. An allowlist
+    rather than a denylist because the long tail of file types is
+    overwhelmingly *not* previewable and each question costs an XPC round
+    trip. `is_previewable_entry(&FileEntry)` is the companion that also
+    excludes directories — the pinned `(path, size)` form cannot tell a folder
+    named `Album.png` from a file without a `stat`, and the UI thread may not
+    stat. Only the info panel's preview goes through the gate so far — the icon
+    grid's `thumbnails.rs` still asks for every tile, so the two can disagree
+    about a format the allowlist has not heard of (see Known gaps).
+  - `Platform::file_attrs(path) -> Result<FileAttrs>` is the OS half. macOS
+    does it inside **one** `SpawnerExt::unblock`: an `lstat` via
+    `std::os::macos::fs::MetadataExt` for mode/uid/gid and `UF_IMMUTABLE`
+    (0x2) for "Locked", `NSFileManager attributesOfItemAtPath:` for the owner
+    and group *names*, and one `NSURL resourceValuesForKeys:` for
+    `AddedToDirectoryDate`, `HasHiddenExtension` and
+    `LocalizedTypeDescription`. No `libc` dependency was added; the only new
+    Cargo change is the `NSDate` feature on the macOS-only `objc2-foundation`
+    dep. `lstat`, not `stat`, deliberately: the panel describes the *selected
+    item*, so a symlink reports its own mode. A path whose bytes are not valid
+    UTF-8 (network and FAT-family volumes carry them; APFS rejects them)
+    returns the lstat-only fields and nothing Foundation-derived: `NSString`
+    can only carry UTF-8, and a lossily converted path would ask about a
+    *different* file. The call is deliberately **unbounded** — unlike the
+    QuickLook path, which is a cancellable completion-handler API — so a hung
+    mount parks its pool thread; recorded as a Known gap. `stub.rs` derives
+    every field from the path by the same FNV-1a hash the thumbnails use, so
+    the info panel renders identically on every platform and in every baseline
+    — and because `locked` and `extension_hidden` are *path*-derived, no test
+    may assert a value for them over a path it did not fix (a `tempfile`
+    suffix is random; the portable `tests/attrs.rs` asserted `!locked` over
+    exactly such paths and failed on roughly half of all off-macOS runs).
+  - **Deviation from ARCHITECTURE.md §6**, which sketches
+    `perms: Option<UnixPerms>` as a `FileEntry` field: attributes are fetched
+    per selection through `file_attrs` instead, which is what §9's M5 line
+    actually describes. A lazily-empty field on every listing row would have
+    forced a `FileEntry` churn across all of M1–M4 for data only one panel
+    reads.
 - `thumbnail.rs` (M4): the pixel type and the cache.
   **`Thumbnail`** carries `width`/`height` plus `Arc<[u8]>` of tightly packed,
   non-premultiplied, top-down RGBA8, constructed through a checked

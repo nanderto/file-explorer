@@ -22,10 +22,32 @@ Keep it truthful — these files are only useful if they match the code.
 
 ## Status
 
-**M4 complete in code** — on top of M1–M3 (read-only browsing, the sidebar
-and in-place expansion, and the full file-operations engine: job spine, undo,
-keyboard operations, inline rename, marquee, drag & drop and context menus),
-M4 adds the second view and the second pane:
+**M5 complete in code** — on top of M1–M4 (read-only browsing, the sidebar
+and in-place expansion, the full file-operations engine: job spine, undo,
+keyboard operations, inline rename, marquee, drag & drop and context menus,
+and then the icon view and the second pane), M5 adds the right-hand column of
+`docs/requirements/Basic window.png`:
+
+* **Attributes in fs-core** — `attrs.rs` (`UnixPerms`, `FileAttrs`,
+  `SelectionSummary`/`summarize`, the `is_previewable` allowlist + 64 MiB
+  ceiling) and `Platform::file_attrs`, macOS-native behind the trait with a
+  deterministic path-derived stub.
+* **The info panel** — `info_panel.rs`, one `Subject` at a time (selected
+  entry / open folder / multi-selection summary / nothing), a **single** load
+  task carrying the debounce, the stat, the attribute lookup and the preview,
+  so a retarget cancels all four and none of it touches the UI thread.
+* **Whose selection** — the panel is workspace-level but follows the *active*
+  pane, through one `cx.observe` per pane's `DirView` filtered by an O(1)
+  witness.
+* **`ToggleInfoPanel`** — `cmd-shift-i` and the titlebar `ⓘ`; a hidden panel
+  stats nothing.
+
+Permissions, owner and group are **read-only** at M5 (editing them is a
+`chmod`/`chown` `FileOp` — M6). Three new visual scenarios pin the panel:
+`info_panel_jpeg` (§8's named M5 row and the milestone's acceptance
+criterion), `info_panel_selection` and `info_panel_multi_selection`.
+
+M4 remains as built below — the second view and the second pane:
 
 * **Thumbnails in fs-core** — `Platform::thumbnail` (QuickLook on macOS behind
   the `Platform` trait, with a deterministic stub elsewhere) feeding an
@@ -42,9 +64,12 @@ M4 adds the second view and the second pane:
 * **Auto-hide scrollbar** — an overlay, not a layout node, faded on a
   `Spawner` timer so no captured baseline depends on wall-clock time.
 
-Four adversarial reviews of the M4 lanes have been applied; see the M4 rows of
-the change log for what they found. 355 tests green (113 fs-core unit +
-3 integration + 239 app).
+Three adversarial reviews of the M5 lanes have been applied; see the M5 rows
+of the change log for what they found (a coin-flip test failure off macOS, an
+O(listing) projection built on every idle notify, a panel that blanked itself
+while the open folder was busy, and two baselines that would have captured the
+panel mid-load). 398 tests green (132 fs-core unit + 4 integration + 262 app),
+and 17 visual scenarios.
 
 | Milestone | State |
 |---|---|
@@ -54,7 +79,8 @@ the change log for what they found. 355 tests green (113 fs-core unit +
 | M2 sidebar + in-place expansion | ✅ merged (#5) |
 | M3 file operations | ✅ engine + job spine + keyboard ops + inline rename/duplicate + marquee + drag & drop + context menus + review fixes; all baselines committed |
 | M4 icon view + dual pane | ✅ complete — fs-core thumbnails, icon view + view-mode switcher, dual pane, grid thumbnails (visible+margin, cancel-on-scroll-away), the auto-hide scrollbar, and the narrow-pane column fit. All 14 visual baselines regenerated on the macOS runner (the titlebar's split-pane button changed every existing scenario) |
-| M5 → M8 ship | not started |
+| M5 info panel | ✅ code complete — `fs-core::attrs` (`UnixPerms`, `FileAttrs`, `SelectionSummary`, `is_previewable`) + `Platform::file_attrs`; `crates/app/src/info_panel.rs` with the debounced single-slot load, the preview, the General and Permissions sections and the multi-selection summary; `ToggleInfoPanel` (`cmd-shift-i` + titlebar button); three new visual scenarios (`info_panel_jpeg`, `info_panel_selection`, `info_panel_multi_selection`). **All 17 visual baselines need regenerating** — see Known gaps |
+| M6 → M8 ship | not started |
 
 ## Components
 
@@ -94,26 +120,33 @@ cache, the `Platform` trait with its macOS and stub impls.
 Each entry names the milestone expected to resolve it. Mechanics live in the
 component sections; this list is the scannable index.
 
-- **The info panel always reads "No selection"** — it is still the M0 chrome
-  placeholder and ignores the selection entirely, which the M3 baselines now
-  pin: `cut_dimmed`, `marquee_active` and `details_rename_editing` all show
-  selected rows beside a panel claiming nothing is selected. Cosmetic, but it
-  makes four committed baselines look wrong to a reviewer. *M5 (info panel).*
-
-- **Every committed visual baseline needs regenerating for M4, not just the two
-  new scenarios.** `icon_grid` and `split_panes` are declared in `scenarios()`
-  and have no baseline at all, and a scenario with no committed baseline
-  **hard-fails** the macOS visual job. But the M4 chrome changes the other
-  twelve too: `Workspace::render_split_toggle` adds a button to the titlebar,
-  which is painted in every baseline, and the per-pane view-mode switcher adds
-  controls to every pane chrome row. So
-  `gh workflow run update-visual-baselines.yml --ref m4-icon-view-dual-pane`
-  rewrites all fourteen PNGs, and the required aggregate `CI` check (which
-  `needs: visual-tests`) is red until it has run. The M3 scenarios
-  (`cut_dimmed`, `context_menu_open`, `marquee_active`) *do* now have committed
-  baselines — that gap is closed. Note also that the code ships the scenario
-  as `split_panes`; ARCHITECTURE.md §8 was amended to match, rather than the
-  scenario renamed. *This PR, from the orchestrating session.*
+- **Every committed visual baseline needs regenerating for M5, not just the
+  three new info-panel scenarios.** The fourteen committed baselines are all
+  stale, and `info_panel_jpeg`, `info_panel_selection` and
+  `info_panel_multi_selection` have no baseline at all — a scenario with no
+  committed baseline **hard-fails** the macOS visual job, so the run is
+  all-or-nothing. The info panel is painted in every
+  scenario, and M5 replaced its "No selection" placeholder with the real
+  entity; the titlebar also gained the `ⓘ` toggle beside the split button. The
+  visual runner additionally advances the deterministic clock past
+  `info_panel::LOAD_DEBOUNCE` after each navigation **and again after each
+  scenario's own gesture** (every scenario but `MarqueeActive`, whose held drag
+  would autoscroll), so the panel's values are part of the baseline instead of
+  a race — that advance is shorter than the scrollbar's 900 ms fade and the
+  drop target's 500 ms spring-load, so it cannot fire either, but it is a
+  change every baseline sees. `run_scenario` now *asserts*
+  `InfoPanel::is_settled()` before it captures, so a future scenario cannot
+  quietly bake a half-loaded panel into a baseline again. Run
+  `gh workflow run update-visual-baselines.yml --ref m5-info-panel`, then
+  **open the seventeen PNGs and look at them** (definition of done item 7) —
+  in particular the three info-panel ones, where a mid-load capture would show
+  em dashes where the size, dates and permissions belong.
+  *This PR.*
+- **Every committed visual baseline needed regenerating for M4** — done: all
+  fourteen were regenerated on the macOS runner, `icon_grid` and `split_panes`
+  included, so every declared M4 scenario has a committed baseline. (The code
+  ships the scenario as `split_panes`; ARCHITECTURE.md §8 was amended to match,
+  rather than the scenario renamed.) *Closed (M4).*
 - **Thumbnails are requested for every non-folder in the window, one at a
   time.** The only filter in `thumbnails.rs::pending_thumbnails` is
   `!is_dir_like()` — no extension/UTI allowlist and no size ceiling — so an
@@ -124,7 +157,12 @@ component sections; this list is the scannable index.
   `image`-crate fallback attempt, leaving the tiles after it on their type
   glyphs. Bounded and correct, just slower than it should be: the fix is a
   previewable-type allowlist plus a size ceiling before requesting, and a small
-  amount of concurrency. Related and deliberate: a cancelled request is *not*
+  amount of concurrency. **Half closed at M5**: `fs_core::is_previewable` (the
+  extension allowlist + 64 MiB ceiling) exists and the info panel's preview
+  goes through it, but `thumbnails.rs::pending_thumbnails` has *not* been
+  changed to use it — doing so would change what every icon-grid tile paints
+  and so every icon-grid baseline, which M5 deliberately kept out of its own
+  baseline churn. *M6.* Related and deliberate: a cancelled request is *not*
   interrupted — `Spawner::unblock` polls the blocking closure exactly once, so
   a QuickLook wait already handed to the background queue runs to completion and
   has its result discarded (one orphan per cancellation; documented on
@@ -246,6 +284,73 @@ component sections; this list is the scannable index.
   place" here). Explorer moves into nav-pane folders; wiring the tree rows to
   the same `plan_drop` is a small follow-up. *Still open after M4's cross-pane
   drag, which needed no sidebar work.*
+- **The info panel's permission grid, octal field, owner and group are
+  read-only.** They render as disabled controls (no click handlers at all, so
+  nothing looks live and silently does nothing), because making them editable
+  is a `chmod`/`chown` surface on the `Platform` trait plus an undoable
+  `FileOp`, not a rendering change. *M6.*
+- **The info panel does not show a folder's recursive size.** A folder subject
+  shows its own inode size, which on macOS is a few kilobytes and on `FakeVfs`
+  is zero, and a multi-selection's total sums the **files** only
+  (`fs_core::summarize` documents this). Recursive sizing is a cancellable job,
+  not a stat. *M6/M7 polish.*
+- **The info panel shows no tags and no "Open with".** The blueprint
+  screenshot's three titlebar glyphs above the panel (info / history /
+  warnings) are also not built — the panel has one mode. *M6 (tags) / M7
+  (chrome).*
+- **The panel is taller than the window, so the bottom of the Permissions
+  section is off every baseline.** Verified by opening the regenerated runner
+  PNGs (the earlier wording here was written from local renders and understated
+  it): at the fixed 1200×760 capture size a fully expanded single-entry panel
+  runs past the bottom edge, and the last row that renders is **"Others"** —
+  `info_panel_jpeg` and `details_rename_editing` cut off the **octal field, the
+  owner and group dropdowns and the "Locked" row entirely**, and `split_panes`
+  cuts off one row earlier still (it ends at "Group", because its breadcrumb row
+  is taller). So four of the panel's Permissions fields — including the two the
+  M5 review reshaped into dropdowns — are pinned by **no** baseline at all, and
+  a regression in them would pass CI. The column is `overflow_y_scroll`, so all
+  of it is reachable in the app; this is a coverage hole, not a broken panel.
+  Nor does any baseline pin the panel with its sections *collapsed*, hidden, or
+  in the light theme (`workspace_light` has no folder open, so it only shows the
+  empty state). The cheap fix is a scenario that captures the panel scrolled to
+  its bottom, or one with `General` collapsed so `Permissions` fits.
+  *M6, which makes exactly those fields editable and must pin them.*
+- **The info panel has no preview cache: re-selecting a file re-runs
+  QuickLook.** `spawn_load` asks `Platform::thumbnail` on every retarget and
+  keeps the result only in the live `preview` slot, so clicking A, B, A, B costs
+  four generations at 400 px — where the icon grid goes through fs-core's
+  byte-budgeted `ThumbnailCache`. Routing the panel through the same cache (its
+  key already carries the entry stamp, so a rewritten file still misses) or
+  keeping a one-entry path+stamp slot would fix it. *M6.*
+- **A file being written *while it is selected* stops refreshing until the
+  churn stops.** A watcher patch arrives every `pane::WATCH_LATENCY` (100 ms),
+  which is shorter than `info_panel::LOAD_DEBOUNCE` (130 ms), so the debounce is
+  restarted before it can fire. The panel keeps the values it already has
+  painted (it no longer blanks itself — see the M5 review row in the change
+  log) and refreshes the moment the folder goes quiet, but a live download's
+  size does not tick up in the panel. Coalescing — re-reading only when the
+  selected entry's own size/mtime moved — needs the witness to carry that
+  stamp. *M6.*
+- **A re-listed *child* of an in-place-expanded folder does not re-read the
+  panel.** The `Witness` sees the pane's own snapshot `Arc` and
+  `expansion_state_sizes()`; `DirView::reload_children` replaces a child `Vec`
+  in place, changing neither. So a selected row *inside* an expanded subfolder
+  keeps its old size, mode and preview after that subfolder is re-listed. The
+  fix is a monotonic child-listing generation in the witness. *M6.*
+- **`MacPlatform::file_attrs` has no timeout**, unlike the QuickLook path
+  beside it: `symlink_metadata`, `NSFileManager attributesOfItemAtPath:` and
+  `NSURL resourceValuesForKeys:` all block unbounded, so arrowing down a
+  listing on a hung network mount parks one background-pool thread per row.
+  QuickLook can be bounded because it is a completion-handler API that can be
+  cancelled; bounding a `stat` means leaking a thread per stalled call instead
+  of parking one, which is a deliberate M5 non-choice, documented on
+  `file_attrs_blocking`. *M6/M7.*
+- **The previewable allowlist and the icon grid still disagree.**
+  `fs_core::is_previewable` covers images, PDF, text/source, media, office,
+  iWork, camera raw and `psd`/`ai`/`eps`; anything else (`.sketch`, `.pxd`, a
+  new format QuickLook learns about) previews as a tile in the icon grid — which
+  filters nothing — and shows the placeholder glyph in the panel. One list, used
+  by both, is the fix. *M6, with the `pending_thumbnails` change below.*
 - **Dual pane has no keyboard way to switch panes and no pane-swap.** The
   active pane follows *focus*, so it changes by clicking (or by the split
   itself); there is no `tab`/`ctrl-tab` "focus the other pane" binding and no
@@ -255,9 +360,11 @@ component sections; this list is the scannable index.
   `first_pane_width`, `sidebar_width` and `info_panel_width` are plain
   `Workspace` fields, so every launch starts single-pane at the default widths.
   `settings.rs` is the place for it. *M7 (settings).*
-- **The info panel is workspace-level, not per-pane**, so while split it still
-  shows one placeholder for the whole window rather than the active pane's
-  selection. *M5 (info panel), which owns the "whose selection" question.*
+- **The info panel is workspace-level, not per-pane** — resolved at M5 by
+  making it follow the **active** pane: the workspace observes each pane's
+  `DirView` and pushes the active one down through `InfoPanel::follow`, so
+  `PaneEvent::FocusIn` retargets the panel exactly as it retargets `cmd-z`.
+  There is deliberately no second panel and no per-pane panel. *Closed (M5).*
 - **A new entry is not created if the naming editor is abandoned** — the §4c
   design's consequence, and a deliberate divergence from Explorer, which
   creates `"New folder"` immediately and leaves it named if you press Escape.
@@ -380,6 +487,10 @@ component sections; this list is the scannable index.
 
 | Date | PR | Change |
 |---|---|---|
+| 2026-08-24 | — | M5 review fixes (three adversarial reviewers, 19 findings). **Blocker:** `crates/fs-core/tests/attrs.rs` asserted `!attrs.locked` over `tempfile`-random paths, and `StubPlatform` derives `locked` from a hash of the path — a ~40% coin-flip failure on Windows/Linux, invisible on macOS CI. Now asserts the flag is *stable per path* instead, with the hazard pinned by `stub_file_attrs_flags_are_path_derived_not_constant` and documented on `StubPlatform::file_attrs`. **Major:** `InfoPanel::follow` derived the subject *before* comparing the O(1) witness, so every idle `DirView` notify (a scroll frame, an arriving thumbnail, a 30 ms marquee tick) built the whole flat projection on the UI thread — the exact cost the witness exists to avoid; witness first now, pinned by `an_idle_follow_does_not_build_the_projection` over a thread-local `dir_view::projections_built()` probe. **Major:** every watcher patch retargeted the panel, which cleared `details` and the preview and restarted the 130 ms debounce — and patches arrive every 100 ms, so any file activity in the open folder left the panel permanently at em dashes with no preview; a re-read of the *same* subject now keeps what is painted and swaps the new values in (`repeated_relistings_keep_the_values_painted`), dropping a stale preview only if the subject stopped being previewable. **Major:** `settle_info_panel` ran only inside the runner's `navigate`, so `details_rename_editing` *and* `split_panes` captured the panel mid-load; the runner now settles after the gesture too (all setups but `MarqueeActive`, whose held drag would autoscroll) and `run_scenario` asserts `InfoPanel::is_settled()` before capturing — verified by running the runner locally for inspection with the settle disabled, which fails exactly those two. Minors fixed: a folder's General "Size" row is an em dash, matching the details list's Size column, instead of the directory's inode size; `general_rows`/`header_text`/`perm_matrix` extracted as pure functions and unit-tested (four tests) so the Path rule, the em-dash-before-load rule and the R/W/X matrix are covered by something other than a baseline; Owner and Group render as disabled dropdowns (`stub-owner ⌄`) as the blueprint shows, matching the octal field's shape; `format_size(1)` is "1 byte"; camera raw + `psd`/`ai`/`eps` added to the previewable allowlist; `MacPlatform::file_attrs` returns lstat-only attributes for a non-UTF-8 path rather than querying a lossily-converted one; the macOS `added` assertion is now bounded by the write window and `system_time_from` has its own test over both sides of the epoch and non-finite intervals; the "same gate the icon grid uses" comments corrected (the grid filters nothing). Rejected: the claim that nothing is clipped at 1200×760 — the local renders show "Locked"'s checkbox clipped, so that gap stands. Deferred as Known gaps: the preview cache, coalescing a re-read of a file being written, the child-listing generation in the witness, the unbounded macOS `stat`, and the allowlist/icon-grid disagreement. 398 tests (132 fs-core unit + 4 integration + 262 app). |
+| 2026-08-24 | — | M5 info panel, scenarios + docs lane: `info_panel_jpeg` (§8's named M5 row and the plan's acceptance criterion — a selected `.jpg`, so the "JPEG image" type description, the `jpg` extension row and a painted preview are all pinned on the file kind the blueprint shows) and `info_panel_multi_selection` (a new `Setup` variant; the summary state nothing else pinned, with a folder in the selection so Folders/Files/Total size are all non-trivial). `info_panel_jpeg` reuses the existing `Setup::InfoPanelSelection` — the driving is identical and a second variant would only have duplicated it. Both wait out `info_panel::LOAD_DEBOUNCE` before capture, so neither frame is a mid-load race. The JPEG subject is `/home/Pictures/photo.jpg`, added with `FakeVfs::insert_file` **after** `insert_tree` rather than as a fixture key: `FakeVfs` hands out mtimes from a counter in insertion order, so a new key inside the tree would have shifted the mtime of every node inserted after it, and appending shifts nothing. It lives in `Pictures` (empty until now, and listed by no scenario) so no other scenario's rows change; the size is stated outright (24,576 B → "24.0 KB") instead of being a literal body's length. Baseline impact: all 14 committed baselines are stale for M5 anyway, and these are two of the three with no baseline at all. Docs: this file's intro and status row, the info-panel component sections in `as-built/app.md` and `as-built/fs-core.md`, the M5 known gaps opened and closed, and `ARCHITECTURE.md` §8's scenario list (also repairing a hard line break that had broken the table row). No new unit tests — a visual scenario *is* the test; counts unchanged at 390. |
+| 2026-08-24 | — | M5 info panel, app lane (`crates/app/src/info_panel.rs`): the `InfoPanel` entity replaces the M0 "No selection" placeholder. One path-keyed `Subject` at a time (selected entry / open folder / `SelectionSummary` / nothing), a **single-slot** load task carrying the `Spawner::timer` debounce, the `Vfs::metadata` stat, the `Platform::file_attrs` lookup and the `Platform::thumbnail` preview — so one retarget cancels all four — with every one of them awaited on the background executor. Preview gated by `fs_core::is_previewable` and reusing `thumbnails::render_image` for the RGBA→BGRA conversion. Sections match `docs/requirements/Basic window.png`: preview, name + "&lt;type&gt; — &lt;size&gt;", collapsible **General** (path, human+exact size, modified/created/added, extension, hide-extension, hidden) and collapsible **Permissions** (R/W/X grid, symbolic + octal, owner, group, locked) — **read-only**, no click handlers. Workspace-level but follows the **active** pane, via one `cx.observe` per pane's `DirView` (there is no `SelectionChanged` event; the change is a notify) filtered by an O(1) `Witness` so a scroll or an arriving thumbnail costs nothing. `ToggleInfoPanel` (`cmd-shift-i` + titlebar `ⓘ` dispatching the same boxed action); a hidden panel is told to `clear()` and stats nothing. New `info_panel_selection` visual scenario. 390 tests (130 fs-core unit + 4 integration + 256 app); 17 of them new here — 16 in `info_panel.rs` plus the titlebar-toggle guard in `workspace.rs`. |
+| 2026-08-24 | — | M5 info panel, fs-core lane: new `crates/fs-core/src/attrs.rs` — `UnixPerms` (octal/symbolic/`allows`, `ls`-style special bits), `FileAttrs` (perms, owner, group, locked, Date Added, extension-hidden, localized type description), `SelectionSummary` + `summarize`, and the previewable-type gate `is_previewable`/`is_previewable_entry` (extension allowlist + 64 MiB ceiling). New `Platform::file_attrs`, implemented on macOS from one `lstat` (`std::os::macos::fs::MetadataExt`, `UF_IMMUTABLE`), `NSFileManager attributesOfItemAtPath:` for owner/group *names* and one `NSURL resourceValuesForKeys:` for added/extension-hidden/type-description, all inside a single `SpawnerExt::unblock`; each richer lookup degrades to `None`/`false` rather than failing the call. Deliberately `lstat`, not `stat`: the panel describes the selected item, so a symlink reports its own mode. Deterministic path-derived stub. `ARCHITECTURE.md` §6 sketches `perms` as a `FileEntry` field; attributes are instead fetched per-selection through `file_attrs`, which is what §9's M5 line describes, and which keeps `FileEntry` (and M1–M4) untouched. |
 | 2026-08-22 | #1,#2 | Bootstrap + M0: plan, CLAUDE.md, gate/hooks/CI, workspace, `WorkspaceView`, visual-test infra. |
 | 2026-08-22 | #3 | Phase A: ARCHITECTURE.md (research→draft→judge workflow); gpui-component rejected; agent pack. |
 | 2026-08-22 | #4 | M1: fs-core (listings/sort/watcher), app shell, details view, address bar, vendored TextInput. 68 tests. |

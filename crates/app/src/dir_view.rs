@@ -113,6 +113,24 @@ pub enum DirViewEvent {
     NavigateTo(PathBuf),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only probe: how many flat projections [`DirView::projected_rows`]
+    /// has built **on this thread**. Thread-local rather than a static, so
+    /// tests running in parallel cannot see each other's counts.
+    ///
+    /// It exists for the info panel, whose [`crate::info_panel::InfoPanel`]
+    /// witness is a claim about work *not* done on an idle notify — and the
+    /// only observable of "the projection was not built" is a counter.
+    static PROJECTIONS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many projections this thread has built (see `PROJECTIONS_BUILT`).
+#[cfg(test)]
+pub(crate) fn projections_built() -> usize {
+    PROJECTIONS_BUILT.with(std::cell::Cell::get)
+}
+
 /// One visible row of the flat projection (§8): a snapshot entry or an
 /// injected child of an expanded folder, with its indentation depth.
 #[derive(Clone, Debug)]
@@ -508,6 +526,7 @@ impl DirView {
     // ------------------------------------------------------------------
     // Flat projection (M2, §8)
     // ------------------------------------------------------------------
+    // (the test-only projection counter lives below the impl)
 
     /// Build the flat row projection: snapshot rows at depth 0, each expanded
     /// folder's cached children spliced beneath it with `depth + 1`, sorted
@@ -522,6 +541,8 @@ impl DirView {
     /// untouched, so `cmd-1` restores the tree exactly as it was and switching
     /// mode stays a pure re-render.
     pub fn projected_rows(&self, cx: &App) -> Vec<ProjectedRow> {
+        #[cfg(test)]
+        PROJECTIONS_BUILT.with(|count| count.set(count.get() + 1));
         let mut flat = Vec::new();
         let splice_children = self.view_mode(cx) == ViewMode::List;
         if let Some(snapshot) = self.snapshot(cx) {
@@ -1155,9 +1176,9 @@ impl DirView {
     }
 
     /// Expansion bookkeeping sizes: `(expanded folders, cached child
-    /// listings)`. Test observability for the pruning rule — nothing in the
-    /// UI depends on the counts.
-    #[cfg(test)]
+    /// listings)`. Test observability for the pruning rule, and (M5) the
+    /// cheap witness [`crate::info_panel`] uses to notice that the flat
+    /// projection has changed shape without rebuilding it.
     pub(crate) fn expansion_state_sizes(&self) -> (usize, usize) {
         (self.expanded.len(), self.children.len())
     }

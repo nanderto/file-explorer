@@ -354,7 +354,11 @@ impl DirView {
 /// (`gpui::RenderImage`: "A cached and processed image, in BGRA format" — its
 /// own loaders do the same channel swap). One allocation per thumbnail, once,
 /// off the frame that scrolls.
-fn render_image(thumbnail: &Thumbnail) -> Option<RenderImage> {
+///
+/// Shared with [`crate::info_panel`], whose preview is the same conversion at
+/// a larger `px`: the info panel keeps its own single-slot image rather than
+/// this module's viewport-shaped cache, but the pixel handling must not fork.
+pub(crate) fn render_image(thumbnail: &Thumbnail) -> Option<RenderImage> {
     #[cfg(test)]
     tests::note_render_image_call();
     let mut bgra = thumbnail.rgba().to_vec();
@@ -493,6 +497,10 @@ mod tests {
             }
             self.calls.finished.lock().unwrap().push(path.to_path_buf());
             self.inner.thumbnail(path, px).await
+        }
+
+        async fn file_attrs(&self, path: &Path) -> anyhow::Result<fs_core::FileAttrs> {
+            self.inner.file_attrs(path).await
         }
     }
 

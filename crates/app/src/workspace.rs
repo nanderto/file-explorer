@@ -16,10 +16,12 @@ use gpui::{
 };
 
 use crate::actions::{
-    DeletePermanently, FocusAddressBar, Redo, ToggleHiddenFiles, ToggleSplitPane, Undo,
+    DeletePermanently, FocusAddressBar, Redo, ToggleHiddenFiles, ToggleInfoPanel, ToggleSplitPane,
+    Undo,
 };
 use crate::app_state::FsContext;
 use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
+use crate::info_panel::InfoPanel;
 use crate::jobs_model::{JobsEvent, JobsModel};
 use crate::jobs_ui::{JobsIndicator, ToastLayer};
 use crate::pane::{Pane, PaneEvent};
@@ -127,6 +129,13 @@ pub struct Workspace {
     /// `panes[i]`, so collapsing a split drops the closed pane's subscription
     /// with the pane instead of leaving a dead one behind.
     pane_subscriptions: Vec<Subscription>,
+    /// Parallel to `panes` too: index `i` observes `panes[i]`'s `DirView`, so
+    /// any notify from it (a selection change, a watcher patch, a navigation)
+    /// re-points the info panel. `DirView` has no `SelectionChanged` event to
+    /// subscribe to — the change is a `cx.notify()` — so this is an *observe*,
+    /// and [`InfoPanel::follow`] is the cheap idempotent filter that keeps a
+    /// scroll or an arriving thumbnail from restarting its debounce.
+    dir_view_observations: Vec<Subscription>,
     active_pane_ix: usize,
     show_hidden: bool,
     sidebar_width: f32,
@@ -135,6 +144,10 @@ pub struct Workspace {
     /// panes `flex_1`), which is what a fresh split and every collapse reset
     /// to; a splitter drag pins it.
     first_pane_width: Option<f32>,
+    /// The right-hand column (M5). Workspace-level, not per-pane: it follows
+    /// whichever pane is active (see [`Self::sync_info_panel`]).
+    info_panel: Entity<InfoPanel>,
+    show_info_panel: bool,
     jobs: Entity<JobsModel>,
     jobs_indicator: Entity<JobsIndicator>,
     toast_layer: Entity<ToastLayer>,
@@ -159,25 +172,33 @@ impl Workspace {
         let jobs_subscription = cx.subscribe_in(&jobs, window, Self::handle_jobs_event);
         let jobs_indicator = cx.new(|cx| JobsIndicator::new(theme.clone(), jobs.clone(), cx));
         let toast_layer = cx.new(|cx| ToastLayer::new(theme.clone(), jobs.clone(), cx));
+        let info_panel = cx.new(|_| InfoPanel::new(theme.clone()));
+        let dir_view_observation = Self::observe_dir_view(&pane, cx);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        Self {
+        let mut workspace = Self {
             focus_handle,
             theme,
             sidebar,
             panes: vec![pane],
             pane_subscriptions: vec![pane_subscription],
+            dir_view_observations: vec![dir_view_observation],
             active_pane_ix: 0,
             show_hidden: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             info_panel_width: INFO_PANEL_DEFAULT_WIDTH,
             first_pane_width: None,
+            info_panel,
+            show_info_panel: true,
             jobs,
             jobs_indicator,
             toast_layer,
             modal: None,
             _subscriptions: vec![sidebar_subscription, jobs_subscription],
-        }
+        };
+        // The panel opens describing the pane's state, not a stale default.
+        workspace.sync_info_panel(cx);
+        workspace
     }
 
     /// The sidebar tree caches child listings of its own, so an external
@@ -195,9 +216,70 @@ impl Workspace {
             PaneEvent::FocusIn => {
                 if let Some(ix) = self.panes.iter().position(|p| p == &pane) {
                     self.active_pane_ix = ix;
+                    // "Whose selection does the info panel describe" is
+                    // answered by focus, exactly as `cmd-z`'s target is.
+                    self.sync_info_panel(cx);
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Info panel (§0 `ToggleInfoPanel`, §1 `info_panel.rs`, M5)
+    // ------------------------------------------------------------------
+
+    /// Observe a pane's `DirView` so every notify from it re-points the info
+    /// panel. Strong ref down (the pane owns the view), the subscription
+    /// stored on the subscriber (§2).
+    fn observe_dir_view(pane: &Entity<Pane>, cx: &mut Context<Self>) -> Subscription {
+        let dir_view = pane.read(cx).dir_view().clone();
+        cx.observe(&dir_view, |this, _, cx| this.sync_info_panel(cx))
+    }
+
+    /// Point the info panel at the **active** pane's selection.
+    ///
+    /// Cheap enough to call on every `DirView` notify: `InfoPanel::follow`
+    /// compares an O(1) witness first and returns without touching the
+    /// projection when nothing it describes has moved. A hidden panel is told
+    /// nothing at all, so it stats nothing.
+    fn sync_info_panel(&mut self, cx: &mut Context<Self>) {
+        let info_panel = self.info_panel.clone();
+        if !self.show_info_panel {
+            info_panel.update(cx, |panel, cx| panel.clear(cx));
+            return;
+        }
+        let dir_view = self.active_pane().read(cx).dir_view().clone();
+        info_panel.update(cx, |panel, cx| panel.follow(&dir_view, cx));
+    }
+
+    /// Whether the right-hand column is showing.
+    pub fn show_info_panel(&self) -> bool {
+        self.show_info_panel
+    }
+
+    pub fn info_panel(&self) -> &Entity<InfoPanel> {
+        &self.info_panel
+    }
+
+    fn handle_toggle_info_panel(
+        &mut self,
+        _: &ToggleInfoPanel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_info_panel(cx);
+    }
+
+    /// §0 "Info panel toggle". Hiding it leaves the pane strip alone — the
+    /// strip is `flex_1` and the panel `flex_none`, so the panes simply gain
+    /// the width, and neither the split's pinned first-pane width nor the
+    /// sidebar's is touched.
+    pub fn toggle_info_panel(&mut self, cx: &mut Context<Self>) {
+        self.show_info_panel = !self.show_info_panel;
+        // Re-describing on show is what stops a panel that was hidden through
+        // a navigation from coming back showing the folder you left.
+        self.sync_info_panel(cx);
+        cx.notify();
     }
 
     fn handle_sidebar_event(
@@ -549,8 +631,10 @@ impl Workspace {
                 new_pane.navigate_to(path, cx);
             }
         });
+        let observation = Self::observe_dir_view(&pane, cx);
         self.panes.push(pane.clone());
         self.pane_subscriptions.push(subscription);
+        self.dir_view_observations.push(observation);
         // The new pane is the one you are working in, so it takes focus — and
         // focus is what makes it active (`PaneEvent::FocusIn`); the index is
         // set here too so the state is right even without a focus round trip.
@@ -558,6 +642,9 @@ impl Workspace {
         self.first_pane_width = None;
         let handle = pane.focus_handle(cx);
         window.focus(&handle, cx);
+        // The new pane is active from this line on, so the panel follows it
+        // even before the focus round trip delivers `PaneEvent::FocusIn`.
+        self.sync_info_panel(cx);
         cx.notify();
     }
 
@@ -573,14 +660,19 @@ impl Workspace {
         }
         let survivor = self.panes[self.active_pane_ix].clone();
         let subscription = self.pane_subscriptions.remove(self.active_pane_ix);
+        let observation = self.dir_view_observations.remove(self.active_pane_ix);
         // Dropping the other handle drops the pane: its watch registration,
-        // load tasks and watch pump all die with it (§6).
+        // load tasks and watch pump all die with it (§6) — and with the
+        // observation removed alongside, so does the info panel's interest in
+        // a selection nobody can see any more.
         self.panes = vec![survivor.clone()];
         self.pane_subscriptions = vec![subscription];
+        self.dir_view_observations = vec![observation];
         self.active_pane_ix = 0;
         self.first_pane_width = None;
         let handle = survivor.focus_handle(cx);
         window.focus(&handle, cx);
+        self.sync_info_panel(cx);
         cx.notify();
     }
 
@@ -800,6 +892,56 @@ impl Workspace {
             .child(SharedString::new_static("◫"))
     }
 
+    /// The §0 toolbar affordance for `ToggleInfoPanel`, beside the split
+    /// toggle. Same shape and same rule: it dispatches the boxed action the
+    /// keymap binds, so the toggle logic exists exactly once (§0), and it does
+    /// not take focus, so the active pane the panel follows is unchanged by
+    /// the click that reveals it.
+    fn render_info_panel_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let active = self.show_info_panel;
+        div()
+            .id("info-panel-toggle")
+            .debug_selector(|| "info-panel-toggle".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.0))
+            .h(px(20.0))
+            .rounded(px(3.0))
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .when(active, |el| el.bg(theme.accent.opacity(0.30)))
+            .text_color(if active { theme.text } else { theme.muted })
+            .hover(|s| s.bg(theme.accent.opacity(0.15)))
+            .on_click(cx.listener(|_, _, window: &mut Window, cx| {
+                window.dispatch_action(Box::new(ToggleInfoPanel), cx);
+            }))
+            .child(SharedString::new_static("ⓘ"))
+    }
+
+    /// The right-hand column: the [`InfoPanel`] entity plus its splitter,
+    /// rendered only while the panel is showing.
+    fn render_info_panel(&self) -> Option<impl IntoElement + use<>> {
+        if !self.show_info_panel {
+            return None;
+        }
+        let theme = self.theme.clone();
+        Some(
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w(px(self.info_panel_width))
+                .bg(theme.panel)
+                .border_l_1()
+                .border_color(theme.border)
+                .child(self.info_panel.clone())
+                .child(self.splitter_handle(SplitterSide::InfoPanel)),
+        )
+    }
+
     fn handle_focus_address_bar(
         &mut self,
         _: &FocusAddressBar,
@@ -886,6 +1028,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::handle_focus_address_bar))
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
             .on_action(cx.listener(Self::handle_toggle_split_pane))
+            .on_action(cx.listener(Self::handle_toggle_info_panel))
             .on_action(cx.listener(Self::handle_delete_permanently))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
@@ -914,6 +1057,7 @@ impl Render for Workspace {
                             .items_center()
                             .gap(px(8.0))
                             .child(self.render_split_toggle(cx))
+                            .child(self.render_info_panel_toggle(cx))
                             .child(self.jobs_indicator.clone()),
                     ),
             )
@@ -940,24 +1084,8 @@ impl Render for Workspace {
                     )
                     // Pane strip: one pane, or two with a divider (M4)
                     .child(self.render_pane_strip(cx))
-                    // Info panel (placeholder until M5), resizable
-                    .child(
-                        div()
-                            .relative()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .w(px(self.info_panel_width))
-                            .bg(theme.panel)
-                            .border_l_1()
-                            .border_color(theme.border)
-                            .text_size(px(13.0))
-                            .text_color(theme.muted)
-                            .child("No selection")
-                            .child(self.splitter_handle(SplitterSide::InfoPanel)),
-                    ),
+                    // Info panel (M5), resizable, hidden by `cmd-shift-i`
+                    .children(self.render_info_panel()),
             )
             // Toast overlay (renders nothing while empty)
             .child(self.toast_layer.clone())
@@ -1545,6 +1673,57 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(workspace.panes().len(), 2);
         });
+    }
+
+    // §0 "Info panel toggle | cmd-shift-i, **toolbar**" (M5). Same guard as
+    // the split toggle above, and for the same reason: the button dispatches
+    // the boxed action without focusing anything, so it lives or dies by the
+    // focused element's dispatch path reaching the Workspace node. It also
+    // pins the one thing a state assertion cannot see — that hiding the panel
+    // takes its splitter's grab strip with it, rather than leaving an
+    // undraggable one behind over the pane strip.
+    #[gpui::test]
+    fn the_titlebar_info_panel_toggle_hides_and_shows_the_column(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let click_toggle = |cx: &mut VisualTestContext| {
+            let at = cx
+                .debug_bounds("info-panel-toggle")
+                .expect("the titlebar toggle paints")
+                .center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        assert!(workspace.read_with(cx, |workspace, _| workspace.show_info_panel()));
+        assert!(
+            cx.debug_bounds("info-panel").is_some(),
+            "the panel paints while it is showing"
+        );
+        assert!(cx.debug_bounds("info-panel-splitter").is_some());
+
+        focus_pane(&pane, cx);
+        click_toggle(cx);
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.show_info_panel()));
+        assert!(
+            cx.debug_bounds("info-panel").is_none(),
+            "the hidden panel paints nothing"
+        );
+        assert!(
+            cx.debug_bounds("info-panel-splitter").is_none(),
+            "and takes its grab strip with it"
+        );
+
+        // ...and with focus on the workspace root, where the action's own
+        // context lives.
+        focus_workspace(&workspace, cx);
+        click_toggle(cx);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.show_info_panel()));
+        assert!(cx.debug_bounds("info-panel").is_some());
     }
 
     #[gpui::test]

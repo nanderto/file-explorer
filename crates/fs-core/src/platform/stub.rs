@@ -6,14 +6,18 @@
 //! [`Platform::thumbnail`] is likewise synthesized: pixels derived from the path
 //! by a fixed hash, with no filesystem access and no clock, so the icon grid has
 //! something stable to paint in unit tests and visual scenarios.
+//! [`Platform::file_attrs`] (M5) follows the same rule — every field is a pure
+//! function of the path, so the info panel renders identically everywhere.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{Platform, VolumeId, VolumeInfo};
+use crate::attrs::{FileAttrs, UnixPerms};
 use crate::thumbnail::{Thumbnail, validate_px};
 
 /// Fixed fake volumes: one internal root plus two ejectable externals.
@@ -78,6 +82,31 @@ impl Platform for StubPlatform {
         Thumbnail::new(width, height, synth_pixels(path, width, height))
     }
 
+    /// Path-derived attributes — no syscalls, no clock. The path's hash picks
+    /// the mode, the locked and extension-hidden flags and the Date Added
+    /// offset; the extension picks the type description. A path that does not
+    /// exist still yields attributes, which is what makes visual scenarios and
+    /// `FakeVfs`-backed tests possible.
+    ///
+    /// Because `locked`, `extension_hidden` and the mode are path-derived, a
+    /// test must not assert a *value* for them over a path it did not fix (a
+    /// `tempfile` directory's random suffix, say) — only that the same path
+    /// always answers the same way.
+    async fn file_attrs(&self, path: &Path) -> Result<FileAttrs> {
+        let hash = path_hash(path);
+        Ok(FileAttrs {
+            perms: Some(UnixPerms::from_mode(STUB_MODES[(hash % 4) as usize])),
+            owner: Some("stub-owner".to_string()),
+            group: Some("stub-group".to_string()),
+            locked: hash.is_multiple_of(8),
+            added: Some(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(STUB_ADDED_SECS + hash % 86_400),
+            ),
+            extension_hidden: hash.is_multiple_of(3),
+            type_description: stub_type_description(path),
+        })
+    }
+
     async fn eject(&self, volume_id: &VolumeId) -> Result<()> {
         let mut volumes = self.volumes.lock().unwrap();
         let Some(ix) = volumes.iter().position(|v| &v.volume_id == volume_id) else {
@@ -89,6 +118,27 @@ impl Platform for StubPlatform {
         volumes.remove(ix);
         Ok(())
     }
+}
+
+/// The four modes the stub hands out, covering a read-only file, an executable,
+/// a private file and a group-writable one — enough shapes for the info panel's
+/// permission row to be exercised.
+const STUB_MODES: [u32; 4] = [0o644, 0o755, 0o600, 0o664];
+
+/// Fixed "Date Added" base: 2024-01-01T00:00:00Z as seconds since the unix
+/// epoch, so the stub needs no date library and never reads a clock.
+const STUB_ADDED_SECS: u64 = 1_704_067_200;
+
+/// Type description from the extension alone — the stub cannot ask the OS.
+fn stub_type_description(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "PNG image".to_string(),
+        "jpg" | "jpeg" => "JPEG image".to_string(),
+        "pdf" => "PDF document".to_string(),
+        "txt" | "md" => "Plain text document".to_string(),
+        other => format!("{} document", other.to_uppercase()),
+    })
 }
 
 /// FNV-1a over the path's bytes — a fixed, dependency-free, platform-independent

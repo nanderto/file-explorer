@@ -46,6 +46,8 @@ objc2-quick-look-thumbnailing = { version = "0.3", features = [
 image = { workspace = true, features = ["bmp", "gif", "jpeg", "tiff", "webp"] }
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
+    # NSDate: M5 reads NSURLAddedToDirectoryDateKey ("Date Added") as an NSDate.
+    "NSDate",
     "NSDictionary",
     "NSEnumerator",
     "NSError",

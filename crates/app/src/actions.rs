@@ -57,6 +57,9 @@ actions!(
         // pane strip; declared here so the whole §0 M4 row set exists in one
         // place)
         ToggleSplitPane,
+        // info panel (M5, §0 "Info panel toggle" — the workspace owns the
+        // right-hand column, so the action is handled there beside the split)
+        ToggleInfoPanel,
         // editing-mode (address bar / rename editor / dialogs)
         Confirm,
         Cancel,

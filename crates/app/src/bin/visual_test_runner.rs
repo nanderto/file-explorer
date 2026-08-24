@@ -104,6 +104,15 @@ mod macos {
         /// complementary view mode (a details list beside an icon grid, the
         /// plan §2 blueprint) together.
         SplitPanes(&'static str, &'static str),
+        /// Navigate, then select one entry so the M5 info panel paints its
+        /// preview, header, General rows and the read-only Permissions grid
+        /// (ARCHITECTURE §8's `info_panel_jpeg` row).
+        InfoPanelSelection(&'static str, &'static str),
+        /// Navigate, then select several entries so the info panel paints the
+        /// §2 multi-selection summary instead — the other half of the M5
+        /// panel, and the state that must *not* show one row's mode as if it
+        /// spoke for all of them (M5, §8).
+        InfoPanelMultiSelection(&'static str, &'static [&'static str]),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -174,6 +183,39 @@ mod macos {
                 Theme::dark(),
                 Setup::SplitPanes("/home", "/home/Documents"),
             ),
+            // M5: the info panel describing a previewable file — the right
+            // column of the plan §2 blueprint screenshot.
+            (
+                "info_panel_selection",
+                Theme::dark(),
+                Setup::InfoPanelSelection("/home/Documents", "/home/Documents/report.pdf"),
+            ),
+            // M5, §8's named row and the milestone's acceptance criterion:
+            // "the panel matches the screenshot fields for a JPEG". Same
+            // mechanics as the row above, deliberately a *different* subject —
+            // an image, in its own folder, so the type description ("JPEG
+            // image"), the extension row and the preview slot are pinned on
+            // the file kind the blueprint actually shows.
+            (
+                "info_panel_jpeg",
+                Theme::dark(),
+                Setup::InfoPanelSelection("/home/Pictures", "/home/Pictures/photo.jpg"),
+            ),
+            // M5: the multi-selection summary. Nothing else pins it, and it
+            // is the one info-panel state with no General/Permissions at all.
+            (
+                "info_panel_multi_selection",
+                Theme::dark(),
+                Setup::InfoPanelMultiSelection(
+                    "/home",
+                    &[
+                        "/home/Documents",
+                        "/home/archive.zip",
+                        "/home/big-video.mov",
+                        "/home/readme.md",
+                    ],
+                ),
+            ),
         ]
     }
 
@@ -210,6 +252,14 @@ mod macos {
                     }
                 }),
             );
+            // The info panel's JPEG subject, added *after* the tree rather
+            // than inside it: `FakeVfs` hands out mtimes from a counter in
+            // insertion order, so a new key in the fixture object would shift
+            // every entry inserted after it, and this way no existing node
+            // moves at all. The size is fixed here rather than derived from a
+            // literal body, so "24 KB" in the panel is a number this file
+            // states outright.
+            vfs.insert_file("/home/Pictures/photo.jpg", 24_576);
             let vfs: Arc<dyn Vfs> = vfs;
             file_explorer_app::app_state::install(
                 cx,
@@ -282,7 +332,13 @@ mod macos {
             cx.update_window(handle, |_, _, cx| {
                 pane.update(cx, |pane, cx| pane.navigate_to(Path::new(path), cx));
             })
-            .map_err(|e| anyhow!("navigate failed: {e:?}"))
+            .map_err(|e| anyhow!("navigate failed: {e:?}"))?;
+            // The listing has to be in before the info panel's debounce can
+            // be waited out, and the wait has to happen before any scenario
+            // starts a gesture with timers of its own.
+            cx.run_until_parked();
+            settle_info_panel(cx);
+            Ok::<(), anyhow::Error>(())
         };
 
         match setup {
@@ -432,6 +488,35 @@ mod macos {
                 })
                 .map_err(|e| anyhow!("icon grid setup failed: {e:?}"))?;
             }
+            Setup::InfoPanelSelection(path, target) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let dir_view = active_dir_view(cx, workspace);
+                cx.update_window(handle, |_, _, cx| {
+                    dir_view.update(cx, |dir_view, cx| {
+                        dir_view.select_paths(&[Path::new(target)], cx);
+                    });
+                })
+                .map_err(|e| anyhow!("info panel selection failed: {e:?}"))?;
+                settle_info_panel(cx);
+            }
+            Setup::InfoPanelMultiSelection(path, targets) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let dir_view = active_dir_view(cx, workspace);
+                cx.update_window(handle, |_, _, cx| {
+                    dir_view.update(cx, |dir_view, cx| {
+                        let paths: Vec<&Path> = targets.iter().map(|p| Path::new(*p)).collect();
+                        dir_view.select_paths(&paths, cx);
+                    });
+                })
+                .map_err(|e| anyhow!("info panel multi-selection failed: {e:?}"))?;
+                // The summary is computed from the listing the panel already
+                // holds, so there is no load to wait for — but settling anyway
+                // keeps the captured frame free of any timer the selection
+                // itself started.
+                settle_info_panel(cx);
+            }
             Setup::SplitPanes(path, second_path) => {
                 navigate(cx, path)?;
                 cx.run_until_parked();
@@ -448,7 +533,35 @@ mod macos {
                 .map_err(|e| anyhow!("second pane navigate failed: {e:?}"))?;
             }
         }
+        // Every gesture above can move the selection, replace the pane's
+        // listing snapshot or change the expansion state, and each of those
+        // retargets the info panel and arms a fresh `LOAD_DEBOUNCE`. Settling
+        // once more here — after the gesture, not only after the navigation —
+        // is what keeps a capture from pinning a half-loaded panel; before this
+        // existed, `details_rename_editing` and `split_panes` baked em dashes
+        // and a placeholder glyph into their baselines.
+        //
+        // Not for `MarqueeActive`: its drag is deliberately still held, and its
+        // 30 ms `AUTOSCROLL_TICK` would walk the list under the band. Its
+        // selection is a multi-selection, which the panel summarizes with no
+        // load at all, so there is nothing to settle there anyway — asserted
+        // for every scenario by `run_scenario`.
+        if !matches!(setup, Setup::MarqueeActive(_)) {
+            cx.run_until_parked();
+            settle_info_panel(cx);
+        }
         Ok(())
+    }
+
+    /// The info panel's attribute load is debounced
+    /// (`info_panel::LOAD_DEBOUNCE`), so without advancing the deterministic
+    /// clock past it every captured frame would pin the panel mid-load — em
+    /// dashes where the size, dates and permissions belong. Deliberately
+    /// shorter than the scrollbar's 900 ms fade and the drop target's 500 ms
+    /// spring-load, so waiting for the panel cannot fire either.
+    fn settle_info_panel(cx: &mut VisualTestAppContext) {
+        cx.advance_clock(file_explorer_app::info_panel::LOAD_DEBOUNCE * 3);
+        cx.run_until_parked();
     }
 
     fn active_dir_view(
@@ -517,6 +630,17 @@ mod macos {
         cx.run_until_parked();
         apply_setup(cx, handle, &workspace, setup)?;
         cx.run_until_parked();
+        // A frame captured while the info panel is still loading shows em
+        // dashes where the size, dates and permissions belong — a baseline that
+        // reads as fine in a code review and is wrong in every pixel that
+        // matters. `apply_setup` settles the panel; this is the guard that a
+        // future scenario cannot quietly stop doing so.
+        let settled = cx.read(|cx| workspace.read(cx).info_panel().read(cx).is_settled());
+        if !settled {
+            bail!(
+                "the info panel is still loading: capturing it would bake a mid-load frame into the baseline"
+            );
+        }
         cx.update_window(handle, |_, window, _| window.refresh())
             .map_err(|e| anyhow!("failed to refresh window: {e:?}"))?;
         cx.run_until_parked();
