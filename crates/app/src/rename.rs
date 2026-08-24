@@ -416,6 +416,7 @@ impl DirView {
     pub(crate) fn cancel_rename_if_target_vanished(
         &mut self,
         snapshot: Option<&fs_core::ListingSnapshot>,
+        search_rows: Option<&[fs_core::FileEntry]>,
         cx: &mut Context<Self>,
     ) {
         let Some(rename) = self.rename.as_ref() else {
@@ -432,7 +433,7 @@ impl DirView {
             return;
         }
         let target = rename.target.clone();
-        if self.listing_contains(snapshot, &target) {
+        if self.listing_contains(snapshot, search_rows, &target) {
             return;
         }
         let window = rename.window;

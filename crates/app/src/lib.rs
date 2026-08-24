@@ -19,6 +19,7 @@ pub mod marquee;
 pub mod pane;
 pub mod rename;
 pub mod scrollbar;
+pub mod search;
 pub mod selection;
 pub mod settings;
 pub mod sidebar;

@@ -19,6 +19,9 @@ actions!(
         GoForward,
         FocusAddressBar,
         AcceptSuggestion,
+        // search (M6a, §0 "Search field focus" — the workspace forwards it to
+        // the active pane, whose toolbar owns the field)
+        FocusSearch,
         Refresh,
         // selection & movement (DirView cursor)
         SelectAll,

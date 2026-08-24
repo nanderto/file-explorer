@@ -239,6 +239,65 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     actually describes. A lazily-empty field on every listing row would have
     forced a `FileEntry` churn across all of M1–M4 for data only one panel
     reads.
+- `search.rs` (M6a): the toolbar search's two halves, deliberately different
+  in cost.
+  - `SearchQuery::new(text) -> Option<Self>` trims and pre-lowercases the
+    needle once; blank/whitespace-only input is `None`, i.e. *no search*, so
+    the UI shows the unfiltered listing instead of "no results".
+    `matches_name` is a case-insensitive substring match on the **name** only
+    (Explorer's default — never the path or the contents). Case folding is
+    `str::to_lowercase` (Unicode simple lowercasing: `Ä`↔`ä`), with an ASCII
+    fast path that compares bytes in place, so an all-ASCII listing allocates
+    nothing per row and only a name containing non-ASCII pays for a lowercased
+    copy of itself. No Unicode normalization: a decomposed `e`+U+0301 name does
+    not match a precomposed `é` needle — normalizing every candidate would cost
+    an allocation per row on every keystroke.
+  - `filter_snapshot(&ListingSnapshot, &SearchQuery) -> Vec<EntryId>` is
+    **pure** (no I/O, no stat), returns matches in the snapshot's own sorted
+    order, and allocates only for matches — which is what lets the UI call it
+    inside a keystroke handler.
+  - `search_recursive(vfs, root, query, show_hidden) -> BoxStream<SearchEvent>`
+    is the recursive walk: **breadth-first** (shallow hits first) with at most
+    `MAX_CONCURRENT_DIR_READS` = 8 directory reads in flight — enough overlap
+    to hide per-`read_dir` latency (visibly so on network volumes) without
+    occupying the blocking pool that copies and thumbnails share. Hits stream
+    out as they are found; the only state that grows with the tree is the FIFO
+    of pending *directories*. "Breadth-first" describes that FIFO — the order
+    reads *start* — not the exact interleaving of the output: the in-flight set
+    is a `FuturesUnordered`, deliberately, because an ordered one buffers every
+    completed sibling behind whichever read happens to be at its head, so one
+    stalled network directory used to stop the whole stream **and** stop the
+    in-flight set being topped up — the exact case the concurrency bound exists
+    for. `SearchEvent::Progress { dirs_scanned }` counts directories actually
+    opened (a failed read is `Skipped`, not scanned) and is coalesced to one
+    event per `PROGRESS_EVERY_DIRS` = 16 directories plus an exact final count,
+    so a status line does not wake thousands of times a second.
+  - **Cycle policy**, three layers. Symlinked directories are reported as hits
+    by name and **never descended into** — a symlinked directory is a leaf here
+    exactly as it is in the listing view, which makes the ordinary cycle
+    impossible with no visited set and stops one file being reported twice
+    through two aliases. `looks_like_a_directory_cycle` then catches the case a
+    kind check cannot see: a **real** directory aliasing an ancestor (macOS
+    firmlinks such as `/System/Volumes/Data`, some network mounts) shows up as a
+    path whose tail repeats, so a path repeating its last `1..=MAX_CYCLE_PERIOD`
+    components `CYCLE_REPEATS` = 3 times over is `Skipped` unread. That is the
+    layer that matters for cost: depth alone bounds the *depth* of such a loop,
+    not the work, so `MAX_DEPTH` = 64 by itself meant ~21 complete re-walks of
+    the whole volume with every match re-reported under each alias path. The
+    trade is that a genuine `a/b/a/b/a/b` tree is skipped (loudly — as
+    `Skipped`); the exact fix, a device+inode visited set, needs a portable
+    identity seam and is a recorded gap. `MAX_DEPTH` remains as the last resort
+    behind both, reporting the over-deep directory as `Skipped` rather than
+    silently dropping it.
+  - **Failure and cancellation**: an unreadable directory (or a child whose
+    stat fails) yields `SearchEvent::Skipped { path, error }` and the walk
+    continues — a search never fails as a whole. The stream **spawns nothing**
+    and advances only while polled, so dropping it is exact cancellation:
+    every unstarted read is abandoned, no `Done` is emitted, and nothing is
+    left behind (search writes nowhere). `tests/search.rs` proves the policies
+    against a real temp tree (hidden dotfiles, a symlink pointing back at the
+    root, a missing directory), and a recording `Vfs` wrapper in the unit tests
+    proves the read count stops dead at the drop.
 - `thumbnail.rs` (M4): the pixel type and the cache.
   **`Thumbnail`** carries `width`/`height` plus `Arc<[u8]>` of tightly packed,
   non-premultiplied, top-down RGBA8, constructed through a checked

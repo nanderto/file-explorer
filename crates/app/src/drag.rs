@@ -820,6 +820,8 @@ mod tests {
             },
             depth,
             expanded: false,
+            disclosure: dir,
+            search_parent: None,
         }
     }
 
