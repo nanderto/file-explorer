@@ -17,6 +17,9 @@
 //! destination-volume job queue ([`ops`]), inverse-op undo with fingerprint
 //! invalidation ([`undo`]), and the cut/copy clipboard ([`clipboard`]).
 //!
+//! M6a adds [`search`]: the pure per-keystroke name filter over a loaded
+//! listing, and the breadth-first streamed recursive walk under a folder.
+//!
 //! M5 backs the info panel with [`attrs`]: unix permissions, the
 //! multi-selection summary, the previewable-type gate, and
 //! [`platform::Platform::file_attrs`] for the attributes that need an OS call.
@@ -28,6 +31,7 @@ pub mod exec;
 pub mod listing;
 pub mod ops;
 pub mod platform;
+pub mod search;
 pub mod sort;
 pub mod thumbnail;
 pub mod undo;
@@ -52,6 +56,10 @@ pub use ops::{
 #[cfg(target_os = "macos")]
 pub use platform::MacPlatform;
 pub use platform::{Platform, StubPlatform, VolumeId, VolumeInfo, watch_volumes};
+pub use search::{
+    CYCLE_REPEATS, MAX_CONCURRENT_DIR_READS, MAX_CYCLE_PERIOD, MAX_DEPTH, PROGRESS_EVERY_DIRS,
+    SearchEvent, SearchQuery, filter_snapshot, looks_like_a_directory_cycle, search_recursive,
+};
 pub use sort::{SortDirection, SortKey, SortSpec, natural_cmp};
 pub use thumbnail::{
     ContentStamp, MAX_PX, Thumbnail, ThumbnailCache, ThumbnailKey,

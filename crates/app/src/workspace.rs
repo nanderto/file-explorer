@@ -16,8 +16,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    DeletePermanently, FocusAddressBar, Redo, ToggleHiddenFiles, ToggleInfoPanel, ToggleSplitPane,
-    Undo,
+    DeletePermanently, FocusAddressBar, FocusSearch, Redo, ToggleHiddenFiles, ToggleInfoPanel,
+    ToggleSplitPane, Undo,
 };
 use crate::app_state::FsContext;
 use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
@@ -953,6 +953,20 @@ impl Workspace {
             .update(cx, |pane, cx| pane.focus_address_bar(window, cx));
     }
 
+    /// §0 `FocusSearch` (`cmd-f`, M6a). Same shape as `cmd-l`: bound in the
+    /// `Workspace` context because the field belongs to whichever pane is
+    /// active, and forwarded there.
+    fn handle_focus_search(
+        &mut self,
+        _: &FocusSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_pane()
+            .clone()
+            .update(cx, |pane, cx| pane.focus_search(window, cx));
+    }
+
     /// §0 `DeletePermanently` ("Bypass trash (confirm dialog first)"), bound
     /// in the `DirView` context so `!renaming` guards it but handled here,
     /// because the workspace owns the modal. Reached by `shift-delete` and by
@@ -1026,6 +1040,7 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .key_context("Workspace")
             .on_action(cx.listener(Self::handle_focus_address_bar))
+            .on_action(cx.listener(Self::handle_focus_search))
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
             .on_action(cx.listener(Self::handle_toggle_split_pane))
             .on_action(cx.listener(Self::handle_toggle_info_panel))
@@ -1187,6 +1202,60 @@ mod tests {
             assert_eq!(workspace.sidebar_width(), 300.0);
             assert_eq!(workspace.info_panel_width(), 200.0);
         });
+    }
+
+    // Keymap dispatch guard for the `Workspace` context (§9, M6a): cmd-f must
+    // reach handle_focus_search and land focus in the **active** pane's search
+    // field — the same tracked-focus-handle path as cmd-l below.
+    #[gpui::test]
+    fn cmd_f_focuses_the_active_panes_search_field(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+
+        cx.update(|window, cx| {
+            let handle = workspace.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+
+        let field = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .search_bar()
+                .read(cx)
+                .focus_handle(cx)
+        });
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(focused, Some(field), "cmd-f focused the search field");
+
+        // Split, then cmd-f again: the *new* active pane's field takes focus,
+        // never pane 0's.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_split_pane(window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let handle = workspace.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        let second = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .search_bar()
+                .read(cx)
+                .focus_handle(cx)
+        });
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused,
+            Some(second),
+            "the active pane's field, not pane 0's"
+        );
     }
 
     // Keymap dispatch guard for the `Workspace` context (§9): cmd-l must

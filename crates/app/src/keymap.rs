@@ -118,6 +118,11 @@ pub fn init(cx: &mut App) {
         // the split: the workspace owns the right-hand column, and the
         // titlebar button dispatches this action with focus on the root.
         KeyBinding::new("cmd-shift-i", ToggleInfoPanel, Some("Workspace")),
+        // §0 Search field focus (M6a). Workspace context like `cmd-l`: the
+        // field belongs to the *active* pane, and the binding has to work with
+        // focus anywhere in the window (including inside the other pane's
+        // list). The workspace forwards it to that pane.
+        KeyBinding::new("cmd-f", FocusSearch, Some("Workspace")),
         // §0 Undo / Redo (M3)
         KeyBinding::new("cmd-z", Undo, Some("Workspace")),
         KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),

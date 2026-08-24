@@ -33,7 +33,7 @@ mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
     use file_explorer_app::app_state::{FsContext, GpuiSpawner, LoggingOpener};
     use file_explorer_app::dir_view::DirView;
-    use file_explorer_app::pane::ViewMode;
+    use file_explorer_app::pane::{Pane, ViewMode};
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
     use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Vfs};
     use gpui::{
@@ -113,6 +113,14 @@ mod macos {
         /// panel, and the state that must *not* show one row's mode as if it
         /// spoke for all of them (M5, §8).
         InfoPanelMultiSelection(&'static str, &'static [&'static str]),
+        /// Navigate, then type a query into the toolbar search field (M6a,
+        /// §0 "Search field focus"), with the third argument turning
+        /// "Subfolders" on. One frame pins the focused field, the toggle in
+        /// the state that argument chose, the filtered/flat result rows (with
+        /// their containing-folder labels when the walk is recursive) and the
+        /// search flavor of the status line together. The walk is waited out
+        /// before the capture — see `settle_search`.
+        SearchActive(&'static str, &'static str, bool),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -215,6 +223,36 @@ mod macos {
                         "/home/readme.md",
                     ],
                 ),
+            ),
+            // M6a: the toolbar search's two states, one scenario each. Same
+            // query in both, deliberately: the only difference between the two
+            // baselines is what "Subfolders" does, so a regression in the
+            // recursive half cannot hide behind a differently-shaped frame.
+            //
+            // Folder-local — the instant filter of the open folder. Pins the
+            // focused field with text in it, the clear button, "Subfolders"
+            // **unchecked**, a listing cut down to its matches (three folders
+            // and a file, so the filter is visibly not folders-only), no
+            // containing-folder labels at all, and the non-recursive status
+            // line, which carries no folder count.
+            (
+                "search_filtered",
+                Theme::dark(),
+                Setup::SearchActive("/home", "o", false),
+            ),
+            // Recursive — the same query with the toggle lit, which is what
+            // makes this the one frame that carries **both** kinds of result
+            // row: the four local matches, unlabelled, and four deeper hits
+            // (both `notes.txt`, `report.pdf`, `photo.jpg`) each carrying its
+            // containing-folder qualifier, all in the pane's sort order rather
+            // than the walk's arrival order. Plus the *finished*
+            // "N folders searched" status line — not "scanning so far…", which
+            // is what makes the frame a state instead of a race (see
+            // `settle_search`).
+            (
+                "search_results",
+                Theme::dark(),
+                Setup::SearchActive("/home", "o", true),
             ),
         ]
     }
@@ -395,6 +433,24 @@ mod macos {
                     cx.run_until_parked();
                 }
             }
+            Setup::SearchActive(path, query, recursive) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                let bar = cx.read(|cx| pane.read(cx).search_bar().clone());
+                cx.update_window(handle, |_, window, cx| {
+                    // Driven through the field, so the captured frame shows
+                    // the real focused control and its toggle rather than a
+                    // filtered listing beside an empty-looking search box.
+                    pane.update(cx, |pane, cx| pane.focus_search(window, cx));
+                    bar.update(cx, |bar, cx| {
+                        bar.set_text(query, window, cx);
+                        bar.set_recursive(recursive, cx);
+                    });
+                })
+                .map_err(|e| anyhow!("search failed: {e:?}"))?;
+                settle_search(cx, &pane, recursive)?;
+            }
             Setup::ConflictDialogOpen(path) => {
                 navigate(cx, path)?;
                 cx.run_until_parked();
@@ -562,6 +618,94 @@ mod macos {
     fn settle_info_panel(cx: &mut VisualTestAppContext) {
         cx.advance_clock(file_explorer_app::info_panel::LOAD_DEBOUNCE * 3);
         cx.run_until_parked();
+    }
+
+    /// How many throttle windows a search scenario waits for. The fixture tree
+    /// is five directories deep-ish and the walk reads eight at a time, so a
+    /// couple of rounds is the real cost; the rest is headroom, and running out
+    /// of it is a failure rather than a capture.
+    const SEARCH_SETTLE_ROUNDS: usize = 16;
+
+    /// Wait out a search the way `settle_info_panel` waits out the panel.
+    ///
+    /// The recursive walk is polled on the background executor and its hits
+    /// reach the pane in `search::SEARCH_THROTTLE` batches, so a frame captured
+    /// mid-walk pins *whichever* prefix of the hits happened to have landed and
+    /// a status line reading "N folders scanned so far…" — a baseline that is a
+    /// race, not a state. Advance the deterministic clock a throttle window at
+    /// a time until the pane says the walk is done, then assert the two things
+    /// a plausible-looking-but-wrong capture would violate: that there is a
+    /// search at all, and that it has rows. A search scenario whose results
+    /// never arrived captures an "Empty folder" pane that reads as entirely
+    /// fine in code review (CLAUDE.md's definition of done, item 7 — the first
+    /// `search_results` capture was exactly that, a lit toggle over
+    /// "0 results"), so fail loudly instead of baking one into a baseline.
+    fn settle_search(
+        cx: &mut VisualTestAppContext,
+        pane: &Entity<Pane>,
+        recursive: bool,
+    ) -> Result<()> {
+        let mut finished = false;
+        for _ in 0..SEARCH_SETTLE_ROUNDS {
+            cx.run_until_parked();
+            cx.advance_clock(file_explorer_app::search::SEARCH_THROTTLE * 2);
+            cx.run_until_parked();
+            // `running` is cleared by the same batch that folds in `Done`, so
+            // once it is false every hit is already in `rows`.
+            if !cx.read(|cx| {
+                pane.read(cx)
+                    .search()
+                    .is_some_and(|search| search.is_running())
+            }) {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            bail!(
+                "the recursive search was still running after {SEARCH_SETTLE_ROUNDS} throttle windows: capturing it would pin a partial result list"
+            );
+        }
+        let (rows, is_recursive, out_of_folder_hits) = cx.read(|cx| {
+            let pane = pane.read(cx);
+            let root = pane.path().map(std::path::Path::to_path_buf);
+            pane.search()
+                .map(|search| {
+                    let rows = search.rows();
+                    let out_of_folder = rows
+                        .iter()
+                        .filter(|entry| entry.path.parent() != root.as_deref())
+                        .count();
+                    (rows.len(), search.recursive(), out_of_folder)
+                })
+                .ok_or_else(|| anyhow!("the search scenario left the pane with no search at all"))
+        })?;
+        if rows == 0 {
+            bail!("search scenario produced no result rows to capture");
+        }
+        // The scope, not just the row count. The field's text and its toggle
+        // reach the pane one effect flush apart, and when that ordering broke
+        // the capture was a *folder-local* result set under a lit
+        // "☑ Subfolders" — which `is_running()` and a non-empty row list both
+        // accept. Nothing else can catch it: the initial capture is the one
+        // moment there is no baseline to compare against.
+        if is_recursive != recursive {
+            bail!(
+                "search scenario asked for recursive={recursive} but the pane's search is \
+                 recursive={is_recursive}: the captured frame would contradict its own checkbox"
+            );
+        }
+        match (recursive, out_of_folder_hits) {
+            (true, 0) => bail!(
+                "a recursive search scenario captured no hit from outside the searched folder, \
+                 so its baseline would be indistinguishable from the folder-local one"
+            ),
+            (false, n) if n > 0 => {
+                bail!("a folder-local search scenario captured {n} row(s) from another folder")
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn active_dir_view(

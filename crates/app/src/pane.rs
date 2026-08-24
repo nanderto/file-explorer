@@ -42,6 +42,7 @@ use crate::address_bar::{AddressBar, AddressBarEvent};
 use crate::app_state::FsContext;
 use crate::dir_view::{DirView, DirViewEvent};
 use crate::rename::NewEntryKind;
+use crate::search::{SearchBar, SearchBarEvent, SearchState};
 use crate::theme::Theme;
 
 /// Debounce window for the open directory's watcher (ARCHITECTURE.md §4a:
@@ -215,6 +216,27 @@ pub struct Pane {
     dir_view: Entity<DirView>,
     /// The editable-path editor swapped in for the breadcrumb (§8).
     address_bar_view: Entity<AddressBar>,
+    /// The §0 toolbar search field, top-right of the chrome row (M6a). One per
+    /// pane: each pane searches its own folder independently, like every other
+    /// pane-scoped thing since M4.
+    search_bar: Entity<SearchBar>,
+    /// The live search, if any — the state machine lives in
+    /// [`crate::search`], as a *field* here in the same shape as the
+    /// DirView's rename/marquee/drop machines.
+    pub(crate) search: Option<SearchState>,
+    /// The single cancellable slot for the recursive walk: replaced on every
+    /// query change, dropped when the search is cleared or the pane navigates
+    /// (which is what cancels the walk).
+    pub(crate) _search_task: Option<Task<()>>,
+    /// Bumped with every search mutation, so a throttled batch resolved for a
+    /// superseded search can never apply.
+    pub(crate) search_generation: u64,
+    /// "Search subfolders", the **sticky** scope preference: it outlives any
+    /// one query (retyping keeps the scope you chose) and is the pane's single
+    /// source of truth for it. [`crate::search::SearchBar`] keeps a mirror of
+    /// it only to draw its own checkbox — the pane never reads that mirror,
+    /// because the field's text and its toggle reach the pane one flush apart.
+    pub(crate) search_recursive: bool,
     scroll_top: f32,
     /// Restore waiting for the fresh snapshot (cache misses).
     pending_restore: Option<NavEntry>,
@@ -283,8 +305,34 @@ impl Pane {
                 }
             },
         );
+        let search_bar = cx.new(|cx| SearchBar::new(theme.clone(), cx));
+        // §0 search: the field reports text and toggles; the pane owns the
+        // query, the results and the walk (events up, method calls down).
+        let search_subscription = cx.subscribe_in(
+            &search_bar,
+            window,
+            |this, _, event: &SearchBarEvent, window, cx| match event {
+                SearchBarEvent::Changed(text) => this.set_search_text(text, cx),
+                SearchBarEvent::RecursiveToggled(on) => this.set_search_recursive(*on, cx),
+                // Enter hands the results to the keyboard: the query stays
+                // live, the cursor keys act on the rows (Explorer's behavior).
+                SearchBarEvent::Submitted => {
+                    let dir_view = this.dir_view.read(cx).focus_handle(cx);
+                    window.focus(&dir_view, cx);
+                }
+                SearchBarEvent::Dismissed => {
+                    this.cancel_search_for_navigation(cx);
+                    window.focus(&this.focus_handle, cx);
+                }
+            },
+        );
         Self {
             address_bar_view,
+            search_bar,
+            search: None,
+            _search_task: None,
+            search_generation: 0,
+            search_recursive: false,
             focus_handle,
             theme,
             vfs,
@@ -308,7 +356,12 @@ impl Pane {
             _watch_guard: None,
             _watch_pump: None,
             watch_generation: 0,
-            _subscriptions: vec![subscription, bar_subscription, focus_subscription],
+            _subscriptions: vec![
+                subscription,
+                bar_subscription,
+                search_subscription,
+                focus_subscription,
+            ],
         }
     }
 
@@ -387,6 +440,13 @@ impl Pane {
             return;
         }
         self.show_hidden = show_hidden;
+        // `show_hidden` is an *argument* to the recursive walk, so its results
+        // are stale the moment the toggle flips: restart it. (A sort flip is
+        // not — the walk's output is sorted at projection time — so `sort_by`
+        // deliberately does not restart anything.)
+        if self.search.is_some() {
+            self.restart_search(cx);
+        }
         self.reload_in_place(cx);
     }
 
@@ -487,6 +547,12 @@ impl Pane {
         if path_changed {
             self.dir_view
                 .update(cx, |dir_view, cx| dir_view.cancel_rename_for_navigation(cx));
+            // M6a: a search is *of* a folder. Leaving it drops the query, the
+            // results and the walk under it (Explorer's rule) — and empties
+            // the field, so the toolbar cannot claim a filter that is gone.
+            // An in-place reload (refresh, sort flip, hidden toggle) keeps the
+            // search and simply re-derives its rows from the new snapshot.
+            self.cancel_search_for_navigation(cx);
         }
         self.generation += 1;
         let generation = self.generation;
@@ -699,14 +765,26 @@ impl Pane {
     /// Everything the view must forget when rows leave the listing: selected
     /// paths that vanished, and an inline editor whose row went with them.
     /// Reads only the pane's own snapshot, so it is safe to call mid-update.
-    fn prune_view_state(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn prune_view_state(&mut self, cx: &mut Context<Self>) {
+        // M6a: a live search's rows are *derived* from the snapshot, so they
+        // are re-derived first — every caller here is a snapshot swap (fresh
+        // load, refresh, sort flip, hidden toggle, watcher patch), and the
+        // pruning below has to run against the rows the next frame will
+        // actually paint. This is also what stops a watcher patch from
+        // resurrecting a row the filter excludes.
+        self.refresh_search_rows();
+        let search_rows = self.search_rows();
         let snapshot = self.snapshot.clone();
         self.dir_view.update(cx, |dir_view, cx| {
-            dir_view.retain_selection_in_listing(snapshot.as_deref(), cx);
+            dir_view.retain_selection_in_listing(snapshot.as_deref(), search_rows.as_deref(), cx);
             // §4c: an editor whose target the filesystem removed under it would
             // otherwise keep the `renaming` key context — and with it every
             // dead `DirView && !renaming` binding — forever.
-            dir_view.cancel_rename_if_target_vanished(snapshot.as_deref(), cx);
+            dir_view.cancel_rename_if_target_vanished(
+                snapshot.as_deref(),
+                search_rows.as_deref(),
+                cx,
+            );
         });
     }
 
@@ -734,9 +812,11 @@ impl Pane {
     /// itself lives in the [`DirView`], which owns the expansion state; the
     /// pane supplies the snapshot it is restoring against.
     fn listing_contains(&self, id: &EntryId, cx: &App) -> bool {
-        self.dir_view
-            .read(cx)
-            .listing_contains(self.snapshot.as_deref(), id)
+        self.dir_view.read(cx).listing_contains(
+            self.snapshot.as_deref(),
+            self.search_rows().as_deref(),
+            id,
+        )
     }
 
     fn current_nav_entry(&self, cx: &App) -> Option<NavEntry> {
@@ -777,6 +857,12 @@ impl Pane {
 
     pub fn dir_view(&self) -> &Entity<DirView> {
         &self.dir_view
+    }
+
+    /// The §0 toolbar search field (M6a). `crate::search`'s `impl Pane` block
+    /// drives it, and tests read its text.
+    pub fn search_bar(&self) -> &Entity<SearchBar> {
+        &self.search_bar
     }
 
     pub fn scroll_top(&self) -> f32 {
@@ -826,13 +912,20 @@ impl Pane {
     /// Status line per plan §3: item count, and free space once a directory
     /// is open.
     pub fn status_text(&self) -> String {
+        // A live search replaces the *counts*: the ones that matter are the
+        // results, the folders the walk has scanned and the ones it could not
+        // read (§0's status line, search flavor — `crate::search`). The free
+        // space stays either way — it is a property of the volume, not of the
+        // query, and §3 puts it on the line unconditionally.
         let count = self.item_count();
-        let items = format!("{count} item{}", if count == 1 { "" } else { "s" });
+        let counts = self
+            .search_status_text()
+            .unwrap_or_else(|| format!("{count} item{}", if count == 1 { "" } else { "s" }));
         match self.free_space {
             Some(bytes) if self.path.is_some() => {
-                format!("{items} · {} free", format_bytes(bytes))
+                format!("{counts} · {} free", format_bytes(bytes))
             }
-            _ => items,
+            _ => counts,
         }
     }
 }
@@ -887,6 +980,11 @@ impl Pane {
         let row = div()
             .flex()
             .items_start()
+            // A narrow pane (split, info panel open) cannot fit the breadcrumb,
+            // the view switcher and the search field at their natural widths.
+            // Clip rather than let the right-hand controls draw over the
+            // splitter and the neighbouring pane — the M4 narrow-split lesson.
+            .overflow_hidden()
             .min_h(px(32.0))
             .px(px(8.0))
             .py(px(4.0))
@@ -897,12 +995,22 @@ impl Pane {
         if self.address_bar == AddressBarMode::Editing {
             return row
                 .child(div().flex_1().child(self.address_bar_view.clone()))
-                .child(self.render_view_switcher(cx));
+                .child(self.render_view_switcher(cx))
+                .child(self.search_bar.clone());
         }
 
         // Breadcrumb: one clickable segment per path component; blank space
         // to the right enters editing (Explorer behavior).
-        let mut segments = div().flex().items_center().gap(px(2.0));
+        // `min_w(0)` + `overflow_hidden`: flex items default to their
+        // min-content width, so without these the breadcrumb refuses to shrink
+        // below its longest component and pushes the controls beside it out of
+        // the pane instead.
+        let mut segments = div()
+            .flex()
+            .items_center()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .gap(px(2.0));
         if let Some(path) = &self.path {
             let mut ancestor = PathBuf::new();
             let components: Vec<_> = path.components().collect();
@@ -949,6 +1057,11 @@ impl Pane {
                     })),
             )
             .child(self.render_view_switcher(cx))
+            // §0 "Search field focus": the blueprint screenshot's top-right
+            // toolbar control (M6a). Per-pane, at the right-hand end of the
+            // pane's own chrome row, so a split pane gets two independent
+            // searches rather than one that silently retargets.
+            .child(self.search_bar.clone())
     }
 
     /// The §0 "View mode switcher" toolbar control: two segmented buttons

@@ -70,8 +70,8 @@ use std::time::Duration;
 use fs_core::{ClipboardMode, EntryId, FileEntry, FileOp, ListingSnapshot, SortSpec, list_dir};
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, Modifiers,
-    Render, ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window, div, point,
-    prelude::*, px,
+    Render, ScrollStrategy, SharedString, Task, UniformListScrollHandle, WeakEntity, Window, div,
+    point, prelude::*, px,
 };
 
 use crate::actions::Cancel;
@@ -131,6 +131,10 @@ pub(crate) fn projections_built() -> usize {
     PROJECTIONS_BUILT.with(std::cell::Cell::get)
 }
 
+/// A live search's result rows plus the folder they are a search *of* — what
+/// [`DirView::projected_rows`] builds its rows from while a query is on.
+type SearchProjection = (Arc<[FileEntry]>, Option<Arc<Path>>);
+
 /// One visible row of the flat projection (§8): a snapshot entry or an
 /// injected child of an expanded folder, with its indentation depth.
 #[derive(Clone, Debug)]
@@ -140,6 +144,17 @@ pub struct ProjectedRow {
     pub depth: usize,
     /// True when this row is a folder currently expanded in place.
     pub expanded: bool,
+    /// Whether this row gets a live disclosure triangle — a folder row of the
+    /// ordinary tree projection. `false` on files, and on **every** search
+    /// result row: those are flat (see [`DirView::projected_rows`]), so a
+    /// triangle there would be a control that cannot do anything except
+    /// quietly add expansion state and a child load for a folder the user
+    /// cannot see expand.
+    pub disclosure: bool,
+    /// Search results only (M6a): the containing folder, relative to the one
+    /// being searched, for a hit that does not live in it — a recursive hit's
+    /// name alone does not say where it is. `None` on every ordinary row.
+    pub search_parent: Option<SharedString>,
 }
 
 pub struct DirView {
@@ -328,11 +343,23 @@ impl DirView {
     pub(crate) fn retain_selection_in_listing(
         &mut self,
         snapshot: Option<&ListingSnapshot>,
+        search_rows: Option<&[FileEntry]>,
         cx: &mut Context<Self>,
     ) {
-        let keep = self.listing_ids(snapshot);
+        // Expansion state is pruned against the *listing*, never against a
+        // search: the tree the search hides is still there, and must come back
+        // exactly as it was when the query is cleared.
+        let listed = self.listing_ids(snapshot);
+        self.prune_expansion_state(&listed);
+        // The selection is pruned against what is actually **projected**. A
+        // live search narrows that to its results, and a selected row the
+        // filter hides must not stay actionable — `delete` would then act on
+        // something the user cannot see.
+        let keep = match search_rows {
+            Some(rows) => rows.iter().map(FileEntry::id).collect(),
+            None => listed,
+        };
         self.selection.retain(|id| keep.contains(id));
-        self.prune_expansion_state(&keep);
         cx.notify();
     }
 
@@ -396,9 +423,15 @@ impl DirView {
     pub(crate) fn listing_contains(
         &self,
         snapshot: Option<&ListingSnapshot>,
+        search_rows: Option<&[FileEntry]>,
         id: &EntryId,
     ) -> bool {
-        self.listing_ids(snapshot).contains(id)
+        match search_rows {
+            // A restored cursor has to land on a row that is painted, and
+            // while a search is live those are its results.
+            Some(rows) => rows.iter().any(|entry| entry.id() == *id),
+            None => self.listing_ids(snapshot).contains(id),
+        }
     }
 
     /// NavEntry restore (pane back/forward/refresh): re-place the cursor
@@ -544,6 +577,33 @@ impl DirView {
         #[cfg(test)]
         PROJECTIONS_BUILT.with(|count| count.set(count.get() + 1));
         let mut flat = Vec::new();
+        // M6a: a live search *replaces* the projection. Results are a flat,
+        // unindented list with no disclosure triangles — the hits come from
+        // other directories, which have no place in this folder's expansion
+        // tree, and Explorer's search results are flat for the same reason.
+        // Everything downstream (marquee arithmetic, drop targets, the menu's
+        // row band, the grid's `cols`, thumbnail windowing, the scrollbar's
+        // content height) reads the projection, so it all keeps working with
+        // no knowledge that a search is on.
+        if let Some((rows, root)) = self.search_projection(cx) {
+            flat.extend(rows.iter().map(|entry| ProjectedRow {
+                search_parent: crate::search::search_parent_label(root.as_deref(), entry),
+                entry: entry.clone(),
+                depth: 0,
+                expanded: false,
+                disclosure: false,
+            }));
+            if let Some(entry) = self.new_entry_row() {
+                flat.push(ProjectedRow {
+                    entry: entry.clone(),
+                    depth: 0,
+                    expanded: false,
+                    disclosure: false,
+                    search_parent: None,
+                });
+            }
+            return flat;
+        }
         let splice_children = self.view_mode(cx) == ViewMode::List;
         if let Some(snapshot) = self.snapshot(cx) {
             for entry in snapshot.entries.iter() {
@@ -565,9 +625,22 @@ impl DirView {
                 entry: entry.clone(),
                 depth: 0,
                 expanded: false,
+                // It does not exist yet, so there is nothing to expand.
+                disclosure: false,
+                search_parent: None,
             });
         }
         flat
+    }
+
+    /// The pane's live search results and the folder they are a search *of*,
+    /// or `None` when no search is on. Both come from the pane, which owns the
+    /// query and the walk ([`crate::search`]).
+    fn search_projection(&self, cx: &App) -> Option<SearchProjection> {
+        let pane = self.pane.upgrade()?;
+        let pane = pane.read(cx);
+        let rows = pane.search_rows()?;
+        Some((rows, pane.path().map(Arc::from)))
     }
 
     /// The phantom row of an in-flight `New ▸ Folder`/`Text file…` (§4c), if
@@ -599,6 +672,8 @@ impl DirView {
             // The grid paints no disclosure triangle, so an "expanded" tile
             // would be an unreadable claim about rows that are not there.
             expanded: expanded && splice_children,
+            disclosure: entry.is_dir_like(),
+            search_parent: None,
         });
         if splice_children
             && expanded
@@ -628,6 +703,9 @@ impl DirView {
     /// `right` on a collapsed folder row: expand it in place (children load
     /// in the background and splice in when they land).
     fn expand_selected(&mut self, cx: &mut Context<Self>) {
+        if self.search_is_live(cx) {
+            return;
+        }
         let rows = self.projected_rows(cx);
         let Some(ix) = self.cursor_ix(&rows) else {
             return;
@@ -642,6 +720,9 @@ impl DirView {
     /// row deeper than the top level, move the cursor to its parent row
     /// (Explorer behavior).
     fn collapse_selected(&mut self, cx: &mut Context<Self>) {
+        if self.search_is_live(cx) {
+            return;
+        }
         let rows = self.projected_rows(cx);
         let Some(ix) = self.cursor_ix(&rows) else {
             return;
@@ -657,9 +738,35 @@ impl DirView {
         }
     }
 
+    /// What the body says when the projection is empty. "Empty folder" is a
+    /// claim about the *folder*, and a search that matched nothing is not one:
+    /// the folder is as full as it was, the query is just too narrow (Explorer
+    /// says the same thing).
+    pub(crate) fn empty_placeholder(&self, cx: &App) -> &'static str {
+        if self.search_is_live(cx) {
+            "No items match your search"
+        } else {
+            "Empty folder"
+        }
+    }
+
+    /// Whether the pane is showing search results (M6a). Those are flat, so
+    /// every expansion gesture is inert while one is live: `left`/`right` do
+    /// nothing, and no row paints a triangle to click. Expanding *into* the
+    /// result set would mean showing children of a folder that is only on
+    /// screen because its name matched — and the expansion state it left behind
+    /// outlived the search, so clearing the query brought folders back
+    /// pre-expanded over a stale cached listing.
+    fn search_is_live(&self, cx: &App) -> bool {
+        self.search_projection(cx).is_some()
+    }
+
     /// Disclosure-triangle click (and visual-scenario driver): expand or
     /// collapse this folder.
     pub fn toggle_expanded(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.search_is_live(cx) {
+            return;
+        }
         let key: Arc<Path> = Arc::from(path);
         if self.expanded.contains(&key) {
             self.collapse(&key, cx);
@@ -753,7 +860,8 @@ impl DirView {
                 // path-keyed selection must not keep acting on rows that left
                 // the projection.
                 let snapshot = this.snapshot(cx);
-                this.retain_selection_in_listing(snapshot.as_deref(), cx);
+                let search_rows = this.search_projection(cx).map(|(rows, _)| rows);
+                this.retain_selection_in_listing(snapshot.as_deref(), search_rows.as_deref(), cx);
                 cx.notify();
             })
             .ok();
@@ -1291,7 +1399,7 @@ impl Render for DirView {
                 .justify_center()
                 .text_size(px(13.0))
                 .text_color(theme.muted)
-                .child("Empty folder")
+                .child(self.empty_placeholder(cx))
                 .into_any_element()
         };
 

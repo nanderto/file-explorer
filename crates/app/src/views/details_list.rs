@@ -226,7 +226,10 @@ fn render_row(
     // The Name column: per-depth indent, then a disclosure-triangle slot
     // (folders only — files keep an empty slot so names stay aligned), then
     // the truncating name.
-    let disclosure: gpui::AnyElement = if entry.is_dir_like() {
+    // `row.disclosure`, not `entry.is_dir_like()`: a folder among *search
+    // results* is a flat row with nothing to expand (M6a), and painting a
+    // triangle there is painting a control that does nothing.
+    let disclosure: gpui::AnyElement = if row.disclosure {
         let toggle_path = entry.path.clone();
         div()
             // Path-keyed like the row itself: a click's press is persisted per
@@ -298,7 +301,28 @@ fn render_row(
         }))
         .child(div().w(px(row.depth as f32 * DISCLOSURE_WIDTH)).flex_none())
         .child(disclosure)
-        .child(div().flex_1().truncate().child(name))
+        .child(
+            // Name, and — for a search hit from another folder (M6a) — the
+            // folder it is in, muted and beside the name. Explorer devotes a
+            // whole "Folder" column to this; an inline qualifier keeps the
+            // column arithmetic above (and every baseline) untouched. Recorded
+            // as a gap in docs/AS_BUILT.md.
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(div().flex_1().min_w(px(0.0)).truncate().child(name))
+                .children(row.search_parent.clone().map(|parent| {
+                    div()
+                        .flex_none()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted)
+                        .child(parent)
+                })),
+        )
         .when(columns.size, |el| {
             el.child(
                 div()

@@ -404,6 +404,177 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     is inserted with `FakeVfs::insert_file` after `insert_tree`, not as a
     fixture key, because `FakeVfs` mtimes come from an insertion-order counter
     and a new key inside the tree would shift every node declared after it.
+- `search.rs` (M6a, §0 "Search field focus", §8's TextInput row "reused by
+  address bar, rename, **search**"): the toolbar search, in two halves in one
+  file — the `SearchBar` entity and a `SearchState` machine that is a *field of
+  the `Pane`* (the same field-not-an-entity shape as `rename`/`marquee`/`drop`
+  on the `DirView`), with its methods in an `impl Pane` block at the bottom of
+  the module.
+  - **Where the state lives: the `Pane`.** One search per pane, so the M4 split
+    gives two independent searches rather than one that silently retargets; and
+    the pane already owns the snapshot the instant filter reads, the sort the
+    results are presented in, and the `show_hidden` flag the walk takes as an
+    argument. The pane's fields are `search: Option<SearchState>`,
+    `_search_task: Option<Task<()>>`, `search_generation: u64` and
+    `search_recursive: bool`.
+  - **The field** is the vendored `InputState` (`⌕` glyph, placeholder
+    "Search", a `✕` clear button and a "☐/☑ Subfolders" toggle that appears
+    only once there is a query), rendered at the right-hand end of the *pane's*
+    chrome row — the blueprint screenshot's top-right control. It carries
+    `key_context("TextInput")` **and `track_focus` of the input's own handle**,
+    because the vendored `InputState::render` does not track it itself and
+    without that the node carrying the context is not on the focused element's
+    dispatch path (§9's named silent-failure mode — `escape` was dead until
+    this was added; `address_bar.rs` has the same omission and the same latent
+    bug, untested there and left alone by this PR).
+  - **Instant, folder-local filtering.** Typing runs `fs_core::filter_snapshot`
+    — pure, no stat, nothing off-thread — inside the keystroke. The matching
+    ids come back in snapshot order, so resolving them to entries is a single
+    two-cursor pass with no lookup structure; the keystroke path allocates the
+    id vector and the row vector and nothing else. A test asserts the recording
+    `Vfs`'s `read_dir` count is **zero** across a filtering keystroke, both
+    before and after the executor is allowed to run.
+  - **Recursive, streamed.** "Subfolders" starts `fs_core::search_recursive`.
+    The stream is polled inside `cx.background_spawn`; its events cross to the
+    UI thread through an unbounded channel that the foreground task drains in
+    `SEARCH_THROTTLE` (100 ms) batches: park on the first arrival, wait one
+    window on `Spawner::timer`, drain everything queued, fold it in once. So a
+    50k-hit walk repaints ~10×/s, not 50 000×. Progress is *coalesced* by
+    fs-core (one event per 16 directories plus an exact final count), so the
+    pane assigns `dirs_scanned` rather than incrementing it.
+  - **Cancellation** is one `Task` slot. Dropping it drops the foreground pump,
+    which drops the receiver *and* the background walk task held on its stack;
+    the walk stops between directory reads. `search_generation` is belt and
+    braces on top, so a batch resolved for a superseded query cannot apply. The
+    slot is replaced on every query change and dropped on clear and on
+    navigation. Proven with a `RecordingVfs` that parks on a timer before each
+    `read_dir`: a walk caught mid-flight and retargeted contributes exactly one
+    directory read and never resumes, and a walk abandoned by a navigation
+    leaves the new folder's own listing as the *only* read that follows.
+  - **A restart starts from nothing.** `restart_search` is the one funnel every
+    respawn goes through, and it clears `hits`, `dirs_scanned`, `skipped` and
+    `running` before deciding whether to spawn. All three of the walk's
+    arguments — the query, the scope, the pane's `show_hidden` — change what
+    counts as a hit, so anything the previous walk accumulated is stale by
+    definition: keeping it is how a hidden hit survived the toggle that hid
+    every other trace of it, how repeated toggles stacked duplicate hits, and
+    how "N folders searched" summed two walks. Clearing `running` there is what
+    makes "Subfolders off mid-walk" stop claiming a walk is running (the flag
+    the visual runner's `settle_search` spins on, waiting for a `Done` that can
+    no longer arrive).
+  - **The accumulated hits are capped** at `MAX_SEARCH_HITS` (10 000), with
+    "showing the first 10000 — narrow the search" on the status line. The
+    per-batch dedupe and sort of the whole result set runs on the **UI thread**,
+    so an uncapped walk over a big tree stopped the window painting — including
+    the keystroke that would have cancelled it. It runs once per batch, too:
+    `apply_search_batch` leaves the rebuild to `prune_view_state`, which has to
+    re-derive the rows anyway before pruning the selection against them. A
+    thread-local `ROWS_REBUILT` probe (the shape of `dir_view`'s
+    `PROJECTIONS_BUILT`) pins "one batch, one rebuild".
+  - **The results are the `DirView`'s projection**, not a second listing.
+    `projected_rows` returns early with the pane's search rows when a query is
+    live: flat, depth 0, no expansion splice (Explorer's search results are
+    flat, and hits from other directories have no place in this folder's tree).
+    "No disclosure triangles" is carried by `ProjectedRow::disclosure`, which
+    the search branch sets `false` and `details_list` renders from instead of
+    `is_dir_like()`, with `toggle_expanded` / `expand_selected` /
+    `collapse_selected` no-ops while a search is live. Both halves are needed:
+    the triangle used to paint on every folder row and do nothing visible while
+    inserting expansion state and starting a child `read_dir`, and the state
+    outlived the search — clearing the query brought the folder back
+    pre-expanded over a stale cached listing, which is the bug
+    `prune_expansion_state` exists to prevent. Everything downstream — marquee
+    arithmetic, drop targets, the context menu's row band, the grid's
+    `painted_cols`, thumbnail windowing, the scrollbar's content height, the
+    info panel's witness — reads the projection and needed no change.
+  - **Pruning.** `retain_selection_in_listing` now prunes the *selection*
+    against the projection (the search rows when one is live) and the
+    *expansion state* against the listing, always. A row the filter hides must
+    not stay selected — `delete` would act on something invisible — while the
+    tree the filter hides must come back untouched when the query is cleared.
+    `listing_contains` (the pane's cursor-restore question) is search-aware for
+    the same reason.
+  - **Ordering / refresh rules.** Navigating to a different directory drops the
+    query, the results, the scope and the field's text (Explorer's rule; a
+    search is *of* a folder). An **in-place** reload — refresh, sort flip,
+    hidden-files toggle — keeps the search and re-derives its rows from the new
+    snapshot; the hidden toggle additionally restarts the walk, because
+    `show_hidden` is an argument to it, while a sort flip does not, because the
+    rows are sorted at presentation time. A **watcher patch** re-derives the
+    rows too, which is what stops an externally created non-matching file from
+    appearing (and lets a matching one in).
+  - **Row provenance.** A hit outside the open folder renders its containing
+    folder, relative to the searched root, muted beside the name in the details
+    list. Explorer gives this a whole "Folder" column; the inline qualifier
+    keeps the column-fit arithmetic and every existing baseline untouched — the
+    column is a recorded gap, as is showing it on icon-grid tiles.
+  - **Status line.** A live search replaces the pane's item *count*: `"N
+    results for “needle”"`, plus `"· K folders scanned so far…/searched"` and
+    `"· J skipped"` while recursive — the `Progress` and `Skipped` events,
+    surfaced rather than swallowed. The free-space figure stays either way: it
+    is a property of the volume, not of the query, and §3 puts it on the line
+    unconditionally. `J` counts `Skipped` *events*, and fs-core emits one per
+    unstattable entry as well as one per unreadable directory — a recorded gap.
+  - **The empty state.** A query that matches nothing paints "No items match
+    your search", not "Empty folder" — the folder is as full as it was
+    (`DirView::empty_placeholder`, which the ordinary empty listing still reads
+    for its own wording).
+  - **Narrow panes.** The chrome row is `overflow_hidden`, its breadcrumb is
+    `min_w(0)` and clips, and the field shrinks from 180 px to a 90 px floor:
+    at `PANE_MIN_WIDTH`, or in a split pane with the info panel open, the
+    breadcrumb + view switcher + field do not fit, and flex items default to
+    their min-content width — so without all three the field drew over the
+    splitter and the neighbouring pane (the M4 narrow-split failure class). The
+    breadcrumb clips mid-word rather than eliding; that ellipsis is a recorded
+    gap.
+  - **The sticky scope lives on the pane, not the widget.** The field's text
+    reaches the pane one effect-flush *later* than its toggle (the text travels
+    `InputState` → `SearchBar` → `Pane`), so a toggle clicked before the text
+    lands would be dropped against a `None` search. It was: the first
+    `search_results` capture showed a lit "☑ Subfolders" and "0 results". Now
+    `Pane::search_recursive` remembers it and a new query inherits it; the
+    widget's own flag only draws the checkbox. Regression-tested, and the
+    visual runner now `bail!`s if a search scenario has no result rows to
+    capture rather than baking a plausible-looking empty pane into a baseline.
+    The other direction is `clear_search`, which resets **both** halves: the
+    pane's scope and, through `SearchBar::reset`, the field's mirror. Resetting
+    only the pane's left the *next* query with a lit "☑ Subfolders" over a
+    folder-local filter whose first click did nothing, because the pane already
+    believed the scope off.
+  - **The staged clear.** `Pane::load` is window-free and every navigation goes
+    through it, but the vendored input cannot rewrite its own text without a
+    `&mut Window`. So `SearchBar::reset` stages `pending_reset` and `render`
+    (which has a window) applies it on the next paint.
+  - **Visual scenarios.** Two, `search_filtered` and `search_results`, driven
+    by `Setup::SearchActive(path, query, recursive)` — the same query (`"o"` in
+    `/home`) with the toggle off and on, so the only difference between the two
+    baselines is what the recursive walk adds. The first pins the focused field
+    with text in it, the clear button, the unchecked toggle, a listing cut down
+    to three folders and a file, and the count-only status line. The second
+    pins the lit toggle, the finished `"5 folders searched"` line and **both**
+    kinds of result row in one frame: the four local matches unlabelled, and
+    four deeper hits (`Documents/notes.txt`, `Downloads/notes.txt`,
+    `Documents/report.pdf`, `Pictures/photo.jpg`) each carrying its
+    containing-folder qualifier, in the pane's sort order rather than the
+    walk's arrival order. Both are driven *through the field* (focus, then
+    `set_text`, then `set_recursive`) so the frame shows the real focused
+    control. `settle_search` is the search's `settle_info_panel`: it advances
+    the deterministic clock one `SEARCH_THROTTLE` window at a time until the
+    pane reports `!SearchState::is_running()` — the flag the same batch that
+    folds in `Done` clears, so once it is false every hit is already in `rows`
+    — and then asserts four things: there *is* a search, it has rows, its
+    **scope is the one the scenario asked for**, and its rows carry
+    containing-folder labels iff that scope is recursive. Every one of them
+    matters: a frame captured mid-walk would pin whichever prefix of the hits
+    had landed plus a `"scanning so far…"` status, i.e. a race rather than a
+    state; a search that found nothing captures an "Empty folder" pane that
+    reads as entirely fine in review (the first `search_results` capture was a
+    lit toggle over "0 results"); and if the text/toggle ordering ever regresses
+    again, `search_results` captures the *folder-local* frame under a lit
+    checkbox — which "there is a search with rows" happily accepts, and which
+    the pixel compare cannot catch because the initial capture is the one moment
+    there is no baseline to compare against. Running out of settle rounds is a
+    failure, never a capture.
 - `scrollbar.rs` (M4, §8 widget list "Auto-hide scrollbar"): a thin overlay,
   not a layout node — an absolutely-positioned child of the marquee's list
   surface (the same positioning context as the rubber band), so it reserves no
