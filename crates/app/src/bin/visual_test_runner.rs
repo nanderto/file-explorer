@@ -114,11 +114,12 @@ mod macos {
         /// panel, and the state that must *not* show one row's mode as if it
         /// spoke for all of them (M5, §8).
         InfoPanelMultiSelection(&'static str, &'static [&'static str]),
-        /// Navigate, select one entry and open the info panel's **octal
-        /// editor** on it (M6b): one frame pins the now-live Permissions grid
-        /// (full-strength checkboxes, editable Owner/Group boxes) together
-        /// with an open inline editor, which is the state a click on a field
-        /// leaves the panel in.
+        /// Navigate, select one entry, collapse **General** and open the info
+        /// panel's **octal editor** (M6b): one frame pins the now-live
+        /// Permissions grid (full-strength checkboxes, editable Owner/Group
+        /// boxes) together with an open inline editor, which is the state a
+        /// click on a field leaves the panel in. General is collapsed because
+        /// the whole section does not otherwise fit the capture height.
         InfoPanelPermissions(&'static str, &'static str),
         /// Navigate, then turn on the sidebar's tag filter for a seeded tag
         /// (M6b): pins the **Tags** section with an active row, the rows the
@@ -613,6 +614,13 @@ mod macos {
                 settle_info_panel(cx);
                 cx.update_window(handle, |_, window, cx| {
                     panel.update(cx, |panel, cx| {
+                        // General is collapsed *first*: the panel is one
+                        // scrolling column, and with General open the octal
+                        // field, Owner and Group sit below the window edge at
+                        // the fixed capture size — which is exactly how the
+                        // first cut of this baseline came back showing an
+                        // "open editor" scenario with no editor in it.
+                        panel.set_general_open(false, cx);
                         panel.begin_field_edit(PermField::Octal, window, cx);
                     });
                 })

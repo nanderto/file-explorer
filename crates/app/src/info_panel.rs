@@ -684,7 +684,18 @@ impl InfoPanel {
     }
 
     fn toggle_general(&mut self, cx: &mut Context<Self>) {
-        self.general_open = !self.general_open;
+        self.set_general_open(!self.general_open, cx);
+    }
+
+    /// Open or collapse the **General** section outright.
+    ///
+    /// Public for the visual test runner: the panel is one scrolling column,
+    /// and at the fixed 1200×760 capture size an open General section pushes
+    /// the bottom of the Permissions section — the octal field, Owner and
+    /// Group — past the window edge. A scenario about the permission controls
+    /// has to collapse General to have them in frame at all.
+    pub fn set_general_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.general_open = open;
         cx.notify();
     }
 
