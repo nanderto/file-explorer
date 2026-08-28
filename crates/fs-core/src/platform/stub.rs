@@ -9,6 +9,7 @@
 //! [`Platform::file_attrs`] (M5) follows the same rule — every field is a pure
 //! function of the path, so the info panel renders identically everywhere.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -18,12 +19,35 @@ use async_trait::async_trait;
 
 use super::{Platform, VolumeId, VolumeInfo};
 use crate::attrs::{FileAttrs, UnixPerms};
+use crate::tags::{Tag, standard_tags};
 use crate::thumbnail::{Thumbnail, validate_px};
 
-/// Fixed fake volumes: one internal root plus two ejectable externals.
+/// Fixed fake volumes: one internal root plus two ejectable externals, plus an
+/// in-memory Finder-tag store (M6b) so tag reads and writes round-trip off
+/// macOS.
 pub struct StubPlatform {
     volumes: Mutex<Vec<VolumeInfo>>,
+    /// Tags per path, empty until something writes. A `BTreeMap` so
+    /// [`Platform::known_tags`] can enumerate in a stable order.
+    ///
+    /// Deliberately **not** path-derived, unlike the thumbnails and attributes
+    /// above: tags are the one thing the app *writes*, so the stub has to behave
+    /// like storage or the app's write-then-read tests would be fiction. Absent
+    /// path ⇒ no tags, which is also the honest default for a fresh tree.
+    tags: Mutex<BTreeMap<PathBuf, Vec<Tag>>>,
+    /// Owner/group overrides written by [`Platform::set_ownership`], layered
+    /// over the path-derived defaults in [`Platform::file_attrs`]. Storage
+    /// rather than a hash for the same reason the tags are: ownership is
+    /// something the app *writes*, so a write-then-read test would otherwise be
+    /// fiction.
+    ownership: Mutex<BTreeMap<PathBuf, (String, String)>>,
 }
+
+/// The one account name the stub refuses to hand a file to, standing in for the
+/// `EPERM` a real unprivileged `chown` returns. Fixed rather than random so the
+/// denied path is a deterministic test on every OS — and named `root` because
+/// that is precisely the change a real run cannot make.
+pub const STUB_PRIVILEGED_OWNER: &str = "root";
 
 const GB: u64 = 1_000_000_000;
 
@@ -56,6 +80,21 @@ impl StubPlatform {
     pub fn new() -> Self {
         Self {
             volumes: Mutex::new(fixed_volumes()),
+            tags: Mutex::new(BTreeMap::new()),
+            ownership: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Pre-load tags on `path` without awaiting anything — for visual scenarios
+    /// and synchronous test setup. Equivalent to
+    /// [`Platform::write_tags`], including the "empty removes" rule.
+    pub fn seed_tags(&self, path: impl Into<PathBuf>, tags: Vec<Tag>) {
+        let mut store = self.tags.lock().unwrap();
+        let path = path.into();
+        if tags.is_empty() {
+            store.remove(&path);
+        } else {
+            store.insert(path, tags);
         }
     }
 }
@@ -94,10 +133,17 @@ impl Platform for StubPlatform {
     /// always answers the same way.
     async fn file_attrs(&self, path: &Path) -> Result<FileAttrs> {
         let hash = path_hash(path);
+        let (owner, group) = self
+            .ownership
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| ("stub-owner".to_string(), "stub-group".to_string()));
         Ok(FileAttrs {
             perms: Some(UnixPerms::from_mode(STUB_MODES[(hash % 4) as usize])),
-            owner: Some("stub-owner".to_string()),
-            group: Some("stub-group".to_string()),
+            owner: Some(owner),
+            group: Some(group),
             locked: hash.is_multiple_of(8),
             added: Some(
                 SystemTime::UNIX_EPOCH + Duration::from_secs(STUB_ADDED_SECS + hash % 86_400),
@@ -105,6 +151,76 @@ impl Platform for StubPlatform {
             extension_hidden: hash.is_multiple_of(3),
             type_description: stub_type_description(path),
         })
+    }
+
+    /// In-memory storage — whatever [`Platform::write_tags`] last stored for
+    /// this exact path, and no tags for a path never written. No filesystem
+    /// access, so it works over `FakeVfs` trees and paths that do not exist.
+    async fn read_tags(&self, path: &Path) -> Result<Vec<Tag>> {
+        Ok(self
+            .tags
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Stores the set verbatim after the codec's normalization (blank names
+    /// dropped, duplicate names collapsed), so the stub agrees with what macOS
+    /// would have persisted. An empty slice forgets the path entirely — the
+    /// portable stand-in for removing the xattr.
+    async fn write_tags(&self, path: &Path, tags: &[Tag]) -> Result<()> {
+        let normalized = crate::tags::decode_tag_strings(&crate::tags::encode_tag_strings(tags));
+        self.seed_tags(path.to_path_buf(), normalized);
+        Ok(())
+    }
+
+    /// The standard palette plus every tag name the stub has actually stored,
+    /// in `BTreeMap` order — deterministic, and enough for the sidebar's Tags
+    /// section to show user tags off macOS.
+    async fn known_tags(&self) -> Result<Vec<Tag>> {
+        let mut known = standard_tags();
+        for tag in self.tags.lock().unwrap().values().flatten() {
+            if !known.iter().any(|k| k.name == tag.name) {
+                known.push(tag.clone());
+            }
+        }
+        Ok(known)
+    }
+
+    /// Records the change so [`Platform::file_attrs`] reports it, except for
+    /// [`STUB_PRIVILEGED_OWNER`], which fails the way an unprivileged real
+    /// `chown` does — nothing is stored, so a failed call changes nothing.
+    async fn set_ownership(
+        &self,
+        path: &Path,
+        owner: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<()> {
+        if owner == Some(STUB_PRIVILEGED_OWNER) || group == Some(STUB_PRIVILEGED_OWNER) {
+            bail!(
+                "chown {}: operation not permitted (only a privileged process may \
+                 change ownership to '{STUB_PRIVILEGED_OWNER}')",
+                path.display()
+            );
+        }
+        if owner.is_none() && group.is_none() {
+            return Ok(()); // nothing asked for, nothing changed
+        }
+        let mut store = self.ownership.lock().unwrap();
+        let current = store
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| ("stub-owner".to_string(), "stub-group".to_string()));
+        store.insert(
+            path.to_path_buf(),
+            (
+                owner.map(str::to_string).unwrap_or(current.0),
+                group.map(str::to_string).unwrap_or(current.1),
+            ),
+        );
+        Ok(())
     }
 
     async fn eject(&self, volume_id: &VolumeId) -> Result<()> {

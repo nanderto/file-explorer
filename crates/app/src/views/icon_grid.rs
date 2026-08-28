@@ -288,6 +288,10 @@ fn render_tile(
     // mutably (the cache promotes on read) — and `None` simply means the
     // placeholder, so an arriving preview swaps in without reflowing.
     let thumbnail = this.thumbnail_image(entry);
+    // M6b tag dots, beside the label rather than under it: the tile's height is
+    // fixed (`TILE_HEIGHT`) and every hit test in the grid is arithmetic
+    // against that lattice, so an arriving tag set must not add a row to it.
+    let tags = crate::tags::tag_dots(this.entry_tags(&entry.path));
 
     let mut tile = tile_frame(entry, ix)
         .cursor_pointer()
@@ -314,9 +318,12 @@ fn render_tile(
             div()
                 .w(px(TILE_WIDTH - 12.0))
                 .flex_none()
-                .text_center()
-                .truncate()
-                .child(name),
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(3.0))
+                .child(div().min_w(px(0.0)).truncate().child(name))
+                .children(tags),
         );
 
     if selected {
@@ -446,11 +453,17 @@ fn render_rename_tile(
         input.clone().into_any_element()
     };
 
-    let mut tile = crate::rename::with_editor_actions(tile_frame(&row.entry, ix), &input, cx)
-        .text_size(px(11.0))
-        .text_color(theme.text)
-        .child(tile_image(&row.entry, thumbnail, &theme))
-        .child(div().w(px(TILE_WIDTH - 12.0)).flex_none().child(name_area));
+    let mut tile = crate::rename::with_editor_actions(
+        tile_frame(&row.entry, ix),
+        &input,
+        cx,
+        DirView::confirm_rename,
+        DirView::cancel_rename,
+    )
+    .text_size(px(11.0))
+    .text_color(theme.text)
+    .child(tile_image(&row.entry, thumbnail, &theme))
+    .child(div().w(px(TILE_WIDTH - 12.0)).flex_none().child(name_area));
 
     if let Some(message) = error {
         tile = tile.child(

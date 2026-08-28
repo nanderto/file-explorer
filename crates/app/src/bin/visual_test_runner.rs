@@ -33,9 +33,10 @@ mod macos {
     use anyhow::{Context as _, Result, anyhow, bail};
     use file_explorer_app::app_state::{FsContext, GpuiSpawner, LoggingOpener};
     use file_explorer_app::dir_view::DirView;
+    use file_explorer_app::info_panel::PermField;
     use file_explorer_app::pane::{Pane, ViewMode};
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
-    use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Vfs};
+    use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Tag, TagColor, Vfs};
     use gpui::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, MouseButton, Pixels,
         VisualTestAppContext, point, px, size,
@@ -113,6 +114,16 @@ mod macos {
         /// panel, and the state that must *not* show one row's mode as if it
         /// spoke for all of them (M5, §8).
         InfoPanelMultiSelection(&'static str, &'static [&'static str]),
+        /// Navigate, select one entry and open the info panel's **octal
+        /// editor** on it (M6b): one frame pins the now-live Permissions grid
+        /// (full-strength checkboxes, editable Owner/Group boxes) together
+        /// with an open inline editor, which is the state a click on a field
+        /// leaves the panel in.
+        InfoPanelPermissions(&'static str, &'static str),
+        /// Navigate, then turn on the sidebar's tag filter for a seeded tag
+        /// (M6b): pins the **Tags** section with an active row, the rows the
+        /// filter kept, and the tag dots painted after their names.
+        TagFilter(&'static str, &'static str),
         /// Navigate, then type a query into the toolbar search field (M6a,
         /// §0 "Search field focus"), with the third argument turning
         /// "Subfolders" on. One frame pins the focused field, the toggle in
@@ -254,6 +265,25 @@ mod macos {
                 Theme::dark(),
                 Setup::SearchActive("/home", "o", true),
             ),
+            // M6b: the Permissions section doing what M5 only drew. The
+            // subject is a file the fixture tags, so the panel's Tags row has
+            // content in the same frame, and the octal editor is open — the
+            // state that would otherwise exist only while a human holds the
+            // mouse still.
+            (
+                "info_panel_permissions",
+                Theme::dark(),
+                Setup::InfoPanelPermissions("/home", "/home/readme.md"),
+            ),
+            // M6b: the sidebar's Tags section with a filter *on*. The dots
+            // themselves are pinned by every /home scenario (the fixture seeds
+            // tags), so what only this frame carries is the active tag row and
+            // a listing cut down to that tag's items.
+            (
+                "tag_filter",
+                Theme::dark(),
+                Setup::TagFilter("/home", "Red"),
+            ),
         ]
     }
 
@@ -299,12 +329,22 @@ mod macos {
             // states outright.
             vfs.insert_file("/home/Pictures/photo.jpg", 24_576);
             let vfs: Arc<dyn Vfs> = vfs;
+            // M6b: two tagged entries, seeded rather than written — the dots
+            // have to render for tags Finder (or a previous session) left
+            // behind, and the sidebar's Tags section lists the palette
+            // regardless. Deterministic like everything else in the fixture.
+            let platform = fs_core::StubPlatform::new();
+            platform.seed_tags("/home/readme.md", vec![tag("Red", TagColor::Red)]);
+            platform.seed_tags(
+                "/home/Documents",
+                vec![tag("Red", TagColor::Red), tag("Work", TagColor::None)],
+            );
             file_explorer_app::app_state::install(
                 cx,
                 vfs,
                 spawner,
                 Arc::new(LoggingOpener),
-                Arc::new(fs_core::StubPlatform::new()),
+                Arc::new(platform),
             );
             file_explorer_app::settings::init_with_path(
                 cx,
@@ -556,6 +596,40 @@ mod macos {
                 .map_err(|e| anyhow!("info panel selection failed: {e:?}"))?;
                 settle_info_panel(cx);
             }
+            Setup::InfoPanelPermissions(path, target) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let dir_view = active_dir_view(cx, workspace);
+                let panel = cx.read(|cx| workspace.read(cx).info_panel().clone());
+                cx.update_window(handle, |_, _, cx| {
+                    dir_view.update(cx, |dir_view, cx| {
+                        dir_view.select_paths(&[Path::new(target)], cx);
+                    });
+                })
+                .map_err(|e| anyhow!("info panel selection failed: {e:?}"))?;
+                // The editor can only open on a value that has been read, so
+                // the load has to land *first* — settling twice is not
+                // belt-and-braces here, it is the ordering.
+                settle_info_panel(cx);
+                cx.update_window(handle, |_, window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.begin_field_edit(PermField::Octal, window, cx);
+                    });
+                })
+                .map_err(|e| anyhow!("opening the octal editor failed: {e:?}"))?;
+                settle_info_panel(cx);
+            }
+            Setup::TagFilter(path, tag_name) => {
+                navigate(cx, path)?;
+                cx.run_until_parked();
+                let pane = cx.read(|cx| workspace.read(cx).active_pane().clone());
+                let tag = tag(tag_name, TagColor::Red);
+                cx.update_window(handle, |_, _, cx| {
+                    pane.update(cx, |pane, cx| pane.set_tag_filter(tag, cx));
+                })
+                .map_err(|e| anyhow!("tag filter failed: {e:?}"))?;
+                settle_tag_filter(cx, &pane)?;
+            }
             Setup::InfoPanelMultiSelection(path, targets) => {
                 navigate(cx, path)?;
                 cx.run_until_parked();
@@ -640,6 +714,45 @@ mod macos {
     /// fine in code review (CLAUDE.md's definition of done, item 7 — the first
     /// `search_results` capture was exactly that, a lit toggle over
     /// "0 results"), so fail loudly instead of baking one into a baseline.
+    /// Wait out the tag filter's background scan, for the same reason
+    /// [`settle_search`] waits out the recursive walk: capturing while it runs
+    /// would pin a partial row list, and which partial list depends on thread
+    /// timing.
+    fn settle_tag_filter(cx: &mut VisualTestAppContext, pane: &Entity<Pane>) -> Result<()> {
+        for _ in 0..SEARCH_SETTLE_ROUNDS {
+            cx.run_until_parked();
+            cx.advance_clock(file_explorer_app::search::SEARCH_THROTTLE * 2);
+            cx.run_until_parked();
+            if !cx.read(|cx| {
+                pane.read(cx)
+                    .tag_filter()
+                    .is_some_and(|filter| filter.is_running())
+            }) {
+                let rows = cx.read(|cx| {
+                    pane.read(cx)
+                        .tag_filter()
+                        .map(|filter| filter.rows().len())
+                        .unwrap_or(0)
+                });
+                if rows == 0 {
+                    bail!("the tag filter scenario produced no rows to capture");
+                }
+                return Ok(());
+            }
+        }
+        bail!(
+            "the tag filter was still scanning after {SEARCH_SETTLE_ROUNDS} throttle windows: capturing it would pin a partial row list"
+        )
+    }
+
+    /// One tag, the way the fixture and the scenarios name them.
+    fn tag(name: &str, color: TagColor) -> Tag {
+        Tag {
+            name: name.into(),
+            color,
+        }
+    }
+
     fn settle_search(
         cx: &mut VisualTestAppContext,
         pane: &Entity<Pane>,

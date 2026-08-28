@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use fs_core::{Conflict, FileOp, JobId, UndoOutcome};
+use fs_core::{Conflict, FileOp, JobId, OpReceipt, PrevAttrs, UndoOutcome};
 use gpui::{
     AnyElement, App, Context, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, Render,
     SharedString, Subscription, Window, deferred, div, prelude::*, px,
@@ -307,12 +307,42 @@ impl Workspace {
                     }
                 }));
             }
+            // M6b: the Tags section filters the **active** pane, which is the
+            // same rule every other workspace-level command follows (§0's
+            // "whose selection" question, answered by focus).
+            SidebarEvent::FilterByTag(tag) => {
+                let pane = self.active_pane().clone();
+                match tag {
+                    Some(tag) => {
+                        let tag = tag.clone();
+                        pane.update(cx, |pane, cx| pane.set_tag_filter(tag, cx));
+                    }
+                    None => pane.update(cx, |pane, cx| pane.clear_tag_filter(cx)),
+                }
+            }
         }
     }
 
     // ------------------------------------------------------------------
     // Job spine: conflicts → modal, undo/redo, dialogs (§2, §4b, §8)
     // ------------------------------------------------------------------
+
+    /// The paths whose Finder tags a completed job changed, so the views that
+    /// paint them can drop their caches (see [`Workspace::handle_jobs_event`]).
+    ///
+    /// Read from the **receipt**, not from the submitted op: the receipt lists
+    /// only the paths that really changed (an attribute op attempts every path
+    /// and records the ones it could not do in `OpReceipt::failed`), and its
+    /// `restored_attrs` covers an *undo* of a tagging as well as the tagging
+    /// itself.
+    fn tagged_paths(receipt: &OpReceipt) -> Vec<std::path::PathBuf> {
+        receipt
+            .restored_attrs
+            .iter()
+            .filter(|(_, prev)| matches!(prev, PrevAttrs::Tags(_)))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
 
     fn handle_jobs_event(
         &mut self,
@@ -339,10 +369,43 @@ impl Workspace {
                     self.close_modal(window, cx);
                 }
             }
+            // M6b: an xattr write changes no directory entry and no mtime, so
+            // no pane's watcher can see it. Every view that paints tags has to
+            // be told, or the dots (and the info panel's Tags row) would keep
+            // showing what the file was tagged with *before* the job the user
+            // just ran. Undo and redo come back through here too, so the same
+            // one line covers them.
+            JobsEvent::Completed { receipt, .. } => {
+                let changed = Self::tagged_paths(receipt);
+                if !changed.is_empty() {
+                    for pane in self.panes.clone() {
+                        let dir_view = pane.read(cx).dir_view().clone();
+                        dir_view.update(cx, |view, cx| view.invalidate_tags(&changed, cx));
+                    }
+                    self.info_panel
+                        .update(cx, |panel, cx| panel.invalidate_tags(cx));
+                    self.sync_info_panel(cx);
+                }
+                // The same blindness, one layer out: `chmod` moves ctime and
+                // `chown` moves nothing a watcher reports, so the panel that
+                // *submitted* the change would keep painting the old mode
+                // (and the pane's snapshot would keep the old owner) until
+                // something else happened to that folder. An attribute
+                // receipt therefore re-reads the panel's subject outright —
+                // no witness, no notify chain to wait on. Undo and redo come
+                // back through here too.
+                if receipt
+                    .restored_attrs
+                    .iter()
+                    .any(|(_, prev)| !matches!(prev, PrevAttrs::Tags(_)))
+                {
+                    self.info_panel.update(cx, |panel, cx| panel.reload(cx));
+                }
+            }
             // `Failed` is consumed by whichever view submitted the job (e.g.
             // the rename editor); the workspace has nothing job-id-specific
             // to do beyond the toast `JobsModel` already pushed.
-            JobsEvent::RowsChanged | JobsEvent::Completed { .. } | JobsEvent::Failed { .. } => {}
+            JobsEvent::RowsChanged | JobsEvent::Failed { .. } => {}
         }
     }
 

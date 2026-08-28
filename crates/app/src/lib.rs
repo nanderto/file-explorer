@@ -23,6 +23,7 @@ pub mod search;
 pub mod selection;
 pub mod settings;
 pub mod sidebar;
+pub mod tags;
 pub mod theme;
 pub mod thumbnails;
 pub mod views;

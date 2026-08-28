@@ -219,6 +219,11 @@ fn render_row(
     // in the FsContext clipboard at render).
     let cut_pending = FsContext::global(cx).clipboard.is_cut(&entry.path);
     let name: SharedString = SharedString::new(entry.name.clone());
+    // M6b: the blueprint's tag dots, after the name. Read from the view's
+    // window-shaped cache — never from the disk, which `render` may not touch
+    // (§5) — so a row whose tags have not been read yet simply paints none and
+    // gains them when the lazy read lands (`crate::tags`).
+    let tags = crate::tags::tag_dots(this.entry_tags(&entry.path));
     let size = size_cell(entry);
     let modified: SharedString = SharedString::new(format_modified(entry.modified));
     let click_entry = entry.clone();
@@ -314,6 +319,7 @@ fn render_row(
                 .items_center()
                 .gap(px(6.0))
                 .child(div().flex_1().min_w(px(0.0)).truncate().child(name))
+                .children(tags)
                 .children(row.search_parent.clone().map(|parent| {
                     div()
                         .flex_none()
@@ -453,6 +459,8 @@ fn render_rename_row(
             .debug_selector(|| format!("dir-row-{ix}")),
         &input,
         cx,
+        DirView::confirm_rename,
+        DirView::cancel_rename,
     )
     .flex()
     .items_center()

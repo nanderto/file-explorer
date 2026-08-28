@@ -34,26 +34,43 @@
 //! a split retargets the panel with the same code path a selection change
 //! takes.
 //!
-//! The permission checkboxes and the octal field are **read-only in M5**:
-//! they render as disabled controls with no click handlers at all, because a
-//! control that looks live and silently does nothing is worse than one that
-//! looks inert. Editing them is M6's `chmod` work.
+//! **Editing (M6b).** The Permissions section's R/W/X grid, its octal field
+//! and the Owner/Group rows are live: a click on a checkbox flips that one
+//! bit and submits a [`fs_core::FileOp::Chmod`], a click on the octal field or
+//! on Owner/Group opens the vendored inline editor (`Enter` commits, `Escape`
+//! and blur abandon) and commits a `Chmod` / [`fs_core::FileOp::Chown`]. Every
+//! one of them goes through the **job queue**, so a permission change is
+//! undoable with `cmd-z`, reports an EPERM refusal as a toast, and never
+//! touches the disk from the UI thread — the panel writes nothing itself.
+//!
+//! The panel does **not** paint the value it hopes for: a `chmod` is not
+//! applied optimistically, because the honest failure mode of `chmod` is
+//! refusal (`EPERM` on anything the user does not own, and on a locked file).
+//! The grid keeps showing what was last read until the job completes and
+//! [`InfoPanel::reload`] — driven by the workspace, since an attribute write
+//! changes no directory entry and no mtime that a watcher could see — brings
+//! the new values back.
+//!
+//! Everything still read-only says so by being drawn disabled: Hide Extension,
+//! Hidden and Locked have no click handlers at all, because a control that
+//! looks live and silently does nothing is worse than one that looks inert.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fs_core::{
-    EntryId, EntryMeta, FileAttrs, ListingSnapshot, PermBit, PermClass, SelectionSummary,
-    is_previewable, summarize,
+    EntryId, EntryMeta, FileAttrs, FileOp, ListingSnapshot, PermBit, PermClass, SelectionSummary,
+    Tag, UnixPerms, is_previewable, summarize,
 };
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, Render, RenderImage, SharedString, Task, Window, div,
-    img, prelude::*, px,
+    AnyElement, Context, Entity, FocusHandle, IntoElement, Render, RenderImage, SharedString,
+    Subscription, Task, Window, div, img, prelude::*, px,
 };
 
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
+use crate::input::InputState;
 use crate::pane::format_bytes;
 use crate::theme::Theme;
 use crate::thumbnails::render_image;
@@ -108,6 +125,11 @@ struct Details {
     /// `None` when the path vanished between the selection and the stat.
     meta: Option<EntryMeta>,
     attrs: FileAttrs,
+    /// The subject's Finder tags (M6b), read in the same off-thread hop as the
+    /// stat and the attributes — one subject, one load, one debounce. A read
+    /// that failed is an empty set, exactly as it is for a row's dots
+    /// ([`crate::tags`]).
+    tags: Vec<Tag>,
 }
 
 /// Cheap witness of "what the panel describes might have changed".
@@ -200,11 +222,54 @@ pub struct InfoPanel {
     witness: Option<Witness>,
     general_open: bool,
     permissions_open: bool,
+    /// M6b: the one open Permissions field editor (octal, Owner or Group), or
+    /// `None` when nothing is being typed into. A single slot, like the
+    /// rename overlay's: opening a second field replaces the first, which
+    /// drops its blur subscription with it.
+    edit: Option<FieldEdit>,
     /// How many loads have actually reached the panel — the debounce's only
     /// observable (a load that was cancelled before its timer fired is
     /// invisible to every other piece of state).
     #[cfg(test)]
     loads: usize,
+}
+
+/// Which Permissions field an inline editor is open on (M6b).
+///
+/// Public so the visual test runner can pin the open-editor state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermField {
+    /// The octal box: `Enter` commits the whole mode at once.
+    Octal,
+    /// The owning user's name — a `chown` that needs privilege.
+    Owner,
+    /// The owning group's name.
+    Group,
+}
+
+impl PermField {
+    /// The element id of the field's box, and its test selector.
+    fn id(self) -> &'static str {
+        match self {
+            PermField::Octal => "info-octal",
+            PermField::Owner => "info-owner",
+            PermField::Group => "info-group",
+        }
+    }
+}
+
+/// One open field editor. Dropping it cancels the blur subscription with it,
+/// which is why the editor is a single replaceable slot rather than three
+/// independent ones.
+struct FieldEdit {
+    field: PermField,
+    input: Entity<InputState>,
+    /// What was focused before the editor opened, restored on teardown — a
+    /// dropped input would otherwise leave the window with no focused element
+    /// and the keymap's pane bindings unreachable (the rename overlay's
+    /// `prev_focus`, for the same reason).
+    prev_focus: Option<FocusHandle>,
+    _blur: Subscription,
 }
 
 impl InfoPanel {
@@ -220,6 +285,7 @@ impl InfoPanel {
             witness: None,
             general_open: true,
             permissions_open: true,
+            edit: None,
             #[cfg(test)]
             loads: 0,
         }
@@ -317,7 +383,7 @@ impl InfoPanel {
             // so this runs on fake time under `#[gpui::test]`.
             spawner.timer(LOAD_DEBOUNCE).await;
 
-            let (meta, attrs) = {
+            let (meta, attrs, tags) = {
                 let (vfs, platform, path) = (vfs.clone(), platform.clone(), path.clone());
                 cx.background_executor()
                     .spawn(async move {
@@ -326,7 +392,8 @@ impl InfoPanel {
                         // panel shows what is known rather than an error.
                         let meta = vfs.metadata(&path).await.ok().flatten();
                         let attrs = platform.file_attrs(&path).await.unwrap_or_default();
-                        (meta, attrs)
+                        let tags = platform.read_tags(&path).await.unwrap_or_default();
+                        (meta, attrs, tags)
                     })
                     .await
             };
@@ -335,7 +402,7 @@ impl InfoPanel {
                 .is_some_and(|meta| !meta.kind.is_dir_like() && is_previewable(&path, meta.size));
             if this
                 .update(cx, |this, cx| {
-                    this.details = Some(Details { meta, attrs });
+                    this.details = Some(Details { meta, attrs, tags });
                     this.preview_pending = previewable;
                     // A re-read kept the previous preview painted (see
                     // `retarget`); if the file is no longer previewable — grown
@@ -399,6 +466,221 @@ impl InfoPanel {
     #[cfg(test)]
     pub(crate) fn attrs(&self) -> Option<&FileAttrs> {
         self.details.as_ref().map(|details| &details.attrs)
+    }
+
+    /// The subject's tags as last loaded (the Tags row, and the tests).
+    pub(crate) fn tags(&self) -> &[Tag] {
+        self.details
+            .as_ref()
+            .map(|details| details.tags.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// A `SetTags` job (or its undo) changed the tags of *something*: forget the
+    /// witness so the next [`Self::follow`] re-reads this subject.
+    ///
+    /// Deliberately not path-filtered: the panel describes one subject, the
+    /// re-read is one debounced `stat` + `read_tags`, and a comparison would
+    /// cost more code than the read it saves. The re-read keeps the painted
+    /// values until the new ones land ([`Self::retarget`]'s `re_read`), so
+    /// nothing flickers.
+    pub fn invalidate_tags(&mut self, cx: &mut Context<Self>) {
+        self.witness = None;
+        cx.notify();
+    }
+
+    /// Re-read the subject's stat, attributes and tags now.
+    ///
+    /// An attribute write (`chmod`, `chown`, an xattr) changes **no directory
+    /// entry and no mtime**, so no pane watcher can see it and nothing would
+    /// otherwise retarget the panel. The workspace calls this when an
+    /// attribute job (or its undo) completes; the re-read keeps the painted
+    /// values until the new ones land ([`Self::retarget`]'s `re_read`), so
+    /// nothing flickers.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.witness = None;
+        if let Subject::One { path, .. } = &self.subject {
+            let path = path.clone();
+            self.spawn_load(path, cx);
+        }
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // M6b: editing the Permissions section
+    // ------------------------------------------------------------------
+
+    /// The path the Permissions section edits — the single subject, whether it
+    /// is the selected entry or the open folder (both have permissions, and
+    /// Finder's Get Info edits a folder's exactly like a file's).
+    fn subject_path(&self) -> Option<PathBuf> {
+        match &self.subject {
+            Subject::One { path, .. } => Some(path.to_path_buf()),
+            _ => None,
+        }
+    }
+
+    /// The subject's permission bits as last **read** — never a value the
+    /// panel is hoping for (see the module docs on optimism).
+    fn perms(&self) -> Option<UnixPerms> {
+        self.details
+            .as_ref()
+            .and_then(|details| details.attrs.perms)
+    }
+
+    /// The text a field's editor opens on, or `None` when the value is not
+    /// known yet — there is nothing to edit before the load lands, and an
+    /// editor opened on an em dash would commit that em dash.
+    fn field_text(&self, field: PermField) -> Option<String> {
+        let attrs = self.details.as_ref().map(|details| &details.attrs)?;
+        match field {
+            PermField::Octal => attrs.perms.map(|perms| perms.octal()),
+            PermField::Owner => attrs.owner.clone(),
+            PermField::Group => attrs.group.clone(),
+        }
+    }
+
+    /// Open the inline editor on `field`, preselected so typing replaces the
+    /// value (a mode is retyped, not amended).
+    pub fn begin_field_edit(
+        &mut self,
+        field: PermField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = self.field_text(field) else {
+            return;
+        };
+        if self.subject_path().is_none() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let input = cx.new(|cx| {
+            InputState::new(cx).with_colors(theme.muted, theme.accent, theme.accent.opacity(0.25))
+        });
+        let len = text.len();
+        input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.select_range(0..len, window, cx);
+        });
+        let focus_handle = input.read(cx).focus_handle(cx);
+        let prev_focus = window.focused(cx);
+        window.focus(&focus_handle, cx);
+        // As in `rename.rs`: the vendored input's own focus/blur hooks are
+        // never wired to real window focus changes, so the teardown hangs off
+        // gpui's per-handle blur listener instead.
+        let blur = cx.on_blur(&focus_handle, window, |this, window, cx| {
+            this.cancel_field_edit(window, cx)
+        });
+        self.edit = Some(FieldEdit {
+            field,
+            input,
+            prev_focus,
+            _blur: blur,
+        });
+        cx.notify();
+    }
+
+    /// Abandon the open editor, writing nothing. `Escape`, blur, and every
+    /// teardown path share it.
+    pub(crate) fn cancel_field_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.edit.take() else {
+            return;
+        };
+        Self::restore_focus(edit, window, cx);
+        cx.notify();
+    }
+
+    /// `Enter` in the open editor: parse, and submit an op **only if the value
+    /// actually changed**. A committed value that fails to parse (`"7778"`,
+    /// `"rwx"`) closes the editor without writing, exactly like `Escape` — the
+    /// grid still shows the real mode, so nothing is lost or misreported.
+    pub(crate) fn confirm_field_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.edit.take() else {
+            return;
+        };
+        let typed = edit.input.read(cx).content().trim().to_string();
+        let field = edit.field;
+        let unchanged = self
+            .field_text(field)
+            .is_some_and(|current| current == typed);
+        Self::restore_focus(edit, window, cx);
+        if !unchanged && let Some(path) = self.subject_path() {
+            match field {
+                PermField::Octal => {
+                    if let Some(mode) = parse_octal_mode(&typed) {
+                        self.submit(
+                            FileOp::Chmod {
+                                paths: vec![path],
+                                mode,
+                            },
+                            cx,
+                        );
+                    }
+                }
+                // An empty name is not "clear the owner" — there is no such
+                // thing — so it is treated as no edit at all.
+                PermField::Owner if !typed.is_empty() => self.submit(
+                    FileOp::Chown {
+                        paths: vec![path],
+                        owner: Some(typed),
+                        group: None,
+                    },
+                    cx,
+                ),
+                PermField::Group if !typed.is_empty() => self.submit(
+                    FileOp::Chown {
+                        paths: vec![path],
+                        owner: None,
+                        group: Some(typed),
+                    },
+                    cx,
+                ),
+                PermField::Owner | PermField::Group => {}
+            }
+        }
+        cx.notify();
+    }
+
+    /// Give focus back to whatever had it before the editor opened, but only
+    /// if the editor still holds it — a click straight into another control
+    /// has already moved focus, and stealing it back would fight the user.
+    fn restore_focus(edit: FieldEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let ours = edit.input.read(cx).focus_handle(cx);
+        if window.focused(cx).as_ref() == Some(&ours)
+            && let Some(previous) = edit.prev_focus.as_ref()
+        {
+            window.focus(previous, cx);
+        }
+    }
+
+    /// A click on one R/W/X box: flip that single bit and submit the whole
+    /// resulting mode. `chmod` takes a mode, not a delta, so the op carries
+    /// what the file should end up as — which is also what makes the undo
+    /// entry fs-core records exact.
+    pub(crate) fn toggle_perm_bit(
+        &mut self,
+        class: PermClass,
+        bit: PermBit,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(perms), Some(path)) = (self.perms(), self.subject_path()) else {
+            return;
+        };
+        self.submit(
+            FileOp::Chmod {
+                paths: vec![path],
+                mode: toggled_mode(perms.mode(), class, bit),
+            },
+            cx,
+        );
+    }
+
+    /// Everything the panel writes goes through the job queue — never through
+    /// the `Vfs` or the `Platform` directly — so it is undoable, cancellable
+    /// and off the UI thread like every other file operation (§7).
+    fn submit(&mut self, op: FileOp, cx: &mut Context<Self>) {
+        FsContext::global(cx).queue.submit(op);
     }
 
     fn toggle_general(&mut self, cx: &mut Context<Self>) {
@@ -586,6 +868,10 @@ impl InfoPanel {
             )
             .when(self.general_open, |el| {
                 el.child(self.rows(general))
+                    // M6b: the subject's Finder tags — dots and names, or an em
+                    // dash when it has none, so the row means the same thing
+                    // whether the read has landed or the item is untagged.
+                    .child(self.tags_row())
                     .child(self.checkbox_row(
                         "Hide Extension",
                         attrs.is_some_and(|attrs| attrs.extension_hidden),
@@ -597,7 +883,7 @@ impl InfoPanel {
                     .into_any_element(),
             )
             .when(self.permissions_open, |el| {
-                el.child(self.render_permissions(attrs))
+                el.child(self.render_permissions(attrs, cx))
             })
             .into_any_element()
     }
@@ -732,6 +1018,41 @@ impl InfoPanel {
             }))
     }
 
+    /// The Tags row: the palette dots followed by the names, right-aligned like
+    /// every other value in the section. The dots are the one non-theme colour
+    /// in the app crate (macOS's palette — see [`crate::tags`]).
+    fn tags_row(&self) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let tags = self.tags();
+        let names = crate::tags::tag_names(tags);
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(3.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.muted)
+                    .child(SharedString::new_static("Tags")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(5.0))
+                    .children(crate::tags::tag_dots(tags))
+                    .child(div().truncate().child(match names {
+                        Some(names) => names,
+                        None => SharedString::new_static("—"),
+                    })),
+            )
+    }
+
     /// A label with a **read-only** checkbox on the right (Hide Extension,
     /// Hidden, Locked).
     fn checkbox_row(&self, label: &'static str, checked: bool) -> impl IntoElement + use<> {
@@ -747,14 +1068,81 @@ impl InfoPanel {
                     .text_color(theme.muted)
                     .child(SharedString::new_static(label)),
             )
-            .child(checkbox(&theme, checked))
+            .child(checkbox(&theme, checked, false))
     }
 
-    /// A label with a **read-only** dropdown on the right (Owner, Group): the
-    /// value in a bordered box with a disclosure chevron, drawn at
-    /// [`DISABLED_ALPHA`] and with no click handler, exactly like the octal
-    /// field beside it.
-    fn dropdown_row(&self, label: &'static str, value: SharedString) -> impl IntoElement + use<> {
+    /// One editable Permissions field: the value in a bordered box that opens
+    /// the inline editor when clicked, or the editor itself while it is open.
+    ///
+    /// Drawn disabled — no border highlight, no pointer, no click handler —
+    /// when the value is not known yet, which is the same rule the whole panel
+    /// follows: a control is live exactly when there is something behind it.
+    fn field_box(&self, field: PermField, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme.clone();
+        let known = self.field_text(field);
+        let boxed = div()
+            .id(field.id())
+            .debug_selector(move || field.id().to_string())
+            .flex()
+            .items_center()
+            .min_w(px(52.0))
+            .px(px(5.0))
+            .rounded(px(3.0))
+            .border_1();
+
+        if let Some(edit) = self.edit.as_ref().filter(|edit| edit.field == field) {
+            // The editor's dispatch node — focus, the `TextInput` key context
+            // and `Confirm`/`Cancel` — is the *same* helper the rename
+            // overlay's row uses; only the two callbacks differ.
+            return crate::rename::with_editor_actions(
+                boxed,
+                &edit.input,
+                cx,
+                Self::confirm_field_edit,
+                Self::cancel_field_edit,
+            )
+            .border_color(theme.accent)
+            .bg(theme.surface)
+            .child(edit.input.clone())
+            .into_any_element();
+        }
+
+        match known {
+            Some(value) => {
+                boxed
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.accent))
+                    .child(SharedString::new(value))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.begin_field_edit(field, window, cx)
+                    }))
+                    .into_any_element()
+            }
+            None => boxed
+                .border_color(theme.border)
+                .bg(theme.surface.opacity(DISABLED_ALPHA))
+                .child(SharedString::new_static("—"))
+                .into_any_element(),
+        }
+    }
+
+    /// A label with an editable field on the right (Owner, Group).
+    ///
+    /// **Deviation from the blueprint screenshot**, which draws these as
+    /// dropdowns: listing the machine's accounts needs a directory-service
+    /// enumeration that [`fs_core::Platform`] does not have (it can *set* an
+    /// owner by name — `set_ownership` — but not list candidates), and a
+    /// dropdown whose only row is the current owner would be a control that
+    /// cannot change anything. A name field can, so the chevron is gone rather
+    /// than decorative. Recorded in AS_BUILT.
+    fn field_row(
+        &self,
+        label: &'static str,
+        field: PermField,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = self.theme.clone();
         div()
             .flex()
@@ -769,31 +1157,20 @@ impl InfoPanel {
                     .text_color(theme.muted)
                     .child(SharedString::new_static(label)),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .px(px(5.0))
-                    .rounded(px(3.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface.opacity(DISABLED_ALPHA))
-                    .child(value)
-                    .child(
-                        div()
-                            .text_color(theme.muted.opacity(DISABLED_ALPHA))
-                            .child(SharedString::new_static("⌄")),
-                    ),
-            )
+            .child(self.field_box(field, cx))
+            .into_any_element()
     }
 
     /// The R/W/X grid, the octal field, owner, group and Locked — the
-    /// screenshot's Permissions section, read-only for M5.
-    fn render_permissions(&self, attrs: Option<&FileAttrs>) -> impl IntoElement + use<> {
+    /// screenshot's Permissions section. Live since M6b: every control here
+    /// except Locked writes through the job queue (module docs).
+    fn render_permissions(&self, attrs: Option<&FileAttrs>, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme.clone();
         let perms = attrs.and_then(|attrs| attrs.perms);
         let matrix = perm_matrix(perms);
+        // Nothing is clickable until the load has landed: a click on a grid
+        // built from em dashes would submit a mode nobody chose.
+        let live = perms.is_some() && self.subject_path().is_some();
         let column = |label: &'static str| {
             div()
                 .flex()
@@ -814,7 +1191,7 @@ impl InfoPanel {
             .child(column("W"))
             .child(column("X"));
 
-        let class_row = |label: &'static str, class: PermClass| {
+        let class_row = |label: &'static str, class: PermClass, cx: &mut Context<Self>| {
             let mut row = div().flex().items_center().px(px(12.0)).py(px(3.0)).child(
                 div()
                     .flex_1()
@@ -822,29 +1199,43 @@ impl InfoPanel {
                     .child(SharedString::new_static(label)),
             );
             for bit in [PermBit::Read, PermBit::Write, PermBit::Exec] {
-                row = row.child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .w(px(24.0))
-                        .items_center()
-                        .justify_center()
-                        .child(checkbox(&theme, matrix[class_ix(class)][bit_ix(bit)])),
-                );
+                let cell = div()
+                    .id(cell_id(class, bit))
+                    .debug_selector(move || cell_id(class, bit).to_string())
+                    .flex()
+                    .flex_none()
+                    .w(px(24.0))
+                    .items_center()
+                    .justify_center()
+                    .child(checkbox(&theme, matrix[class_ix(class)][bit_ix(bit)], live));
+                row = row.child(if live {
+                    cell.cursor_pointer()
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.toggle_perm_bit(class, bit, cx)),
+                        )
+                        .into_any_element()
+                } else {
+                    cell.into_any_element()
+                });
             }
             row
         };
+
+        let owner = class_row("Owner", PermClass::Owner, cx);
+        let group = class_row("Group", PermClass::Group, cx);
+        let others = class_row("Others", PermClass::Others, cx);
 
         div()
             .flex()
             .flex_col()
             .child(header)
-            .child(class_row("Owner", PermClass::Owner))
-            .child(class_row("Group", PermClass::Group))
-            .child(class_row("Others", PermClass::Others))
-            // Octal: the symbolic form beside the boxed mode, as in the
-            // screenshot. A field-looking box, but with no `TextInput` behind
-            // it until M6 makes it editable.
+            .child(owner)
+            .child(group)
+            .child(others)
+            // Octal: the symbolic form beside the editable mode, as in the
+            // screenshot. Typing a mode here is the one way to reach the
+            // setuid/setgid/sticky bits, which the nine-box grid has no room
+            // for and which `toggled_mode` therefore only preserves.
             .child(
                 div()
                     .flex()
@@ -871,32 +1262,28 @@ impl InfoPanel {
                                         perms.map(|perms| perms.symbolic()),
                                     ))),
                             )
-                            .child(
-                                div()
-                                    .px(px(5.0))
-                                    .rounded(px(3.0))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(theme.surface.opacity(DISABLED_ALPHA))
-                                    .child(SharedString::new(text_of(
-                                        perms.map(|perms| perms.octal()),
-                                    ))),
-                            ),
+                            .child(self.field_box(PermField::Octal, cx)),
                     ),
             )
-            // Owner and group are *dropdowns* in the blueprint screenshot
-            // ("johnappleseed ⌄", "staff ⌄"), so they get the same disabled
-            // shape the octal field has: a control M6's `chown` can fill in,
-            // not static text that would have to be rebuilt as one.
-            .child(self.dropdown_row(
-                "Owner",
-                SharedString::new(text_of(attrs.and_then(|attrs| attrs.owner.clone()))),
-            ))
-            .child(self.dropdown_row(
-                "Group",
-                SharedString::new(text_of(attrs.and_then(|attrs| attrs.group.clone()))),
-            ))
+            .child(self.field_row("Owner", PermField::Owner, cx))
+            .child(self.field_row("Group", PermField::Group, cx))
             .child(self.checkbox_row("Locked", attrs.is_some_and(|attrs| attrs.locked)))
+            .into_any_element()
+    }
+}
+
+/// The element id (and test selector) of one box in the R/W/X grid.
+fn cell_id(class: PermClass, bit: PermBit) -> &'static str {
+    match (class, bit) {
+        (PermClass::Owner, PermBit::Read) => "perm-owner-r",
+        (PermClass::Owner, PermBit::Write) => "perm-owner-w",
+        (PermClass::Owner, PermBit::Exec) => "perm-owner-x",
+        (PermClass::Group, PermBit::Read) => "perm-group-r",
+        (PermClass::Group, PermBit::Write) => "perm-group-w",
+        (PermClass::Group, PermBit::Exec) => "perm-group-x",
+        (PermClass::Others, PermBit::Read) => "perm-others-r",
+        (PermClass::Others, PermBit::Write) => "perm-others-w",
+        (PermClass::Others, PermBit::Exec) => "perm-others-x",
     }
 }
 
@@ -1022,6 +1409,43 @@ fn bit_ix(bit: PermBit) -> usize {
 /// The checkbox grid as data: `[class][bit]`, all false when the mode is not
 /// known. Pure, so a transposed grid is a failing test rather than a baseline
 /// nobody opened.
+/// The mode `mode` becomes when `class`'s `bit` is flipped — what a click on
+/// one box in the R/W/X grid submits.
+///
+/// Masked to `0o7777`: the setuid/setgid/sticky bits the grid does not paint
+/// are carried through untouched (flipping "others may write" must not clear
+/// the sticky bit off `/tmp`), and the file-type bits are not a mode value at
+/// all.
+pub(crate) fn toggled_mode(mode: u32, class: PermClass, bit: PermBit) -> u32 {
+    let shift = match class {
+        PermClass::Owner => 6,
+        PermClass::Group => 3,
+        PermClass::Others => 0,
+    };
+    let mask = match bit {
+        PermBit::Read => 0o4,
+        PermBit::Write => 0o2,
+        PermBit::Exec => 0o1,
+    } << shift;
+    (mode ^ mask) & 0o7777
+}
+
+/// What the octal field accepts: one to four octal digits, nothing else.
+///
+/// Deliberately strict, and deliberately *silent* about a rejection (the
+/// editor closes and the real mode stays painted). `"755"` is a mode;
+/// `"0755"` is the same mode written as C; `"7778"`, `"rwxr-xr-x"` and `"-1"`
+/// are not modes, and guessing at what someone meant by them is how a file
+/// ends up world-writable.
+pub(crate) fn parse_octal_mode(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 4 || !text.bytes().all(|byte| (b'0'..=b'7').contains(&byte))
+    {
+        return None;
+    }
+    u32::from_str_radix(text, 8).ok()
+}
+
 fn perm_matrix(perms: Option<fs_core::UnixPerms>) -> [[bool; 3]; 3] {
     let mut matrix = [[false; 3]; 3];
     for class in [PermClass::Owner, PermClass::Group, PermClass::Others] {
@@ -1032,10 +1456,15 @@ fn perm_matrix(perms: Option<fs_core::UnixPerms>) -> [[bool; 3]; 3] {
     matrix
 }
 
-/// A read-only checkbox: filled with the theme accent when set, an empty
-/// outline when not, and drawn at [`DISABLED_ALPHA`] with no click handler at
-/// all so it reads as a disabled control rather than a dead one.
-fn checkbox(theme: &Theme, checked: bool) -> impl IntoElement + use<> {
+/// A checkbox: filled with the theme accent when set, an empty outline when
+/// not.
+///
+/// `live` is what tells the two kinds apart, and it is a *visual* claim, not
+/// only a wiring one — a checkbox drawn at full strength promises that
+/// clicking it does something. The M6b permission grid passes `true` once its
+/// mode has been read; Hide Extension, Hidden and Locked pass `false` and are
+/// dimmed to [`DISABLED_ALPHA`], reading as disabled rather than dead.
+fn checkbox(theme: &Theme, checked: bool, live: bool) -> impl IntoElement + use<> {
     let mut box_ = div()
         .flex()
         .flex_none()
@@ -1046,11 +1475,12 @@ fn checkbox(theme: &Theme, checked: bool) -> impl IntoElement + use<> {
         .rounded(px(3.0))
         .border_1()
         .border_color(theme.border);
+    let alpha = if live { 1.0 } else { DISABLED_ALPHA };
     if checked {
         box_ = box_
-            .bg(theme.accent.opacity(DISABLED_ALPHA))
+            .bg(theme.accent.opacity(alpha))
             .text_size(px(9.0))
-            .text_color(theme.text.opacity(DISABLED_ALPHA))
+            .text_color(theme.text.opacity(alpha))
             .child(SharedString::new_static("✓"));
     }
     box_
@@ -1247,6 +1677,50 @@ mod tests {
         assert_eq!(perm_matrix(None), [[false; 3]; 3]);
     }
 
+    // M6b: what a click on one box submits. The interesting half is what it
+    // leaves alone — the other eight boxes, and the special bits the grid
+    // cannot even show.
+    #[test]
+    fn toggling_one_box_flips_that_bit_and_nothing_else() {
+        // 0o644 → owner loses write.
+        assert_eq!(toggled_mode(0o644, PermClass::Owner, PermBit::Write), 0o444);
+        // ...and back, so the grid is its own inverse.
+        assert_eq!(toggled_mode(0o444, PermClass::Owner, PermBit::Write), 0o644);
+        // Each class shifts to its own three bits.
+        assert_eq!(toggled_mode(0o000, PermClass::Group, PermBit::Read), 0o040);
+        assert_eq!(toggled_mode(0o000, PermClass::Others, PermBit::Exec), 0o001);
+        assert_eq!(toggled_mode(0o000, PermClass::Owner, PermBit::Read), 0o400);
+        // The sticky bit on a /tmp-shaped mode survives a click on "others may
+        // write" — the grid has no box for it, so a click must not clear it.
+        assert_eq!(
+            toggled_mode(0o1777, PermClass::Others, PermBit::Write),
+            0o1775
+        );
+        // setuid likewise, and file-type bits (0o40000 here) are not part of a
+        // mode at all: masked off rather than carried into a `chmod`.
+        assert_eq!(
+            toggled_mode(0o104755, PermClass::Group, PermBit::Exec),
+            0o4745
+        );
+    }
+
+    #[test]
+    fn the_octal_field_accepts_only_a_mode() {
+        assert_eq!(parse_octal_mode("644"), Some(0o644));
+        assert_eq!(parse_octal_mode("0"), Some(0));
+        assert_eq!(parse_octal_mode("4755"), Some(0o4755));
+        assert_eq!(parse_octal_mode("0755"), Some(0o755));
+        assert_eq!(parse_octal_mode(" 755 "), Some(0o755), "typed with spaces");
+        assert_eq!(parse_octal_mode("7777"), Some(0o7777));
+        // Everything else is refused rather than guessed at.
+        assert_eq!(parse_octal_mode(""), None);
+        assert_eq!(parse_octal_mode("7778"), None, "8 is not an octal digit");
+        assert_eq!(parse_octal_mode("rwxr-xr-x"), None);
+        assert_eq!(parse_octal_mode("-1"), None);
+        assert_eq!(parse_octal_mode("07777"), None, "five digits is not a mode");
+        assert_eq!(parse_octal_mode("6 4 4"), None);
+    }
+
     // ------------------------------------------------------------------
     // The machine, on a real workspace
     // ------------------------------------------------------------------
@@ -1317,6 +1791,29 @@ mod tests {
                 .push(path.to_owned());
             self.inner.file_attrs(path).await
         }
+
+        // M6b: delegated to the stub, so a test that seeds tags on it sees them
+        // through this double too.
+        async fn read_tags(&self, path: &Path) -> anyhow::Result<Vec<fs_core::Tag>> {
+            self.inner.read_tags(path).await
+        }
+
+        async fn write_tags(&self, path: &Path, tags: &[fs_core::Tag]) -> anyhow::Result<()> {
+            self.inner.write_tags(path, tags).await
+        }
+
+        async fn known_tags(&self) -> anyhow::Result<Vec<fs_core::Tag>> {
+            self.inner.known_tags().await
+        }
+
+        async fn set_ownership(
+            &self,
+            path: &Path,
+            owner: Option<&str>,
+            group: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.set_ownership(path, owner, group).await
+        }
     }
 
     /// One slow lookup, deliberately far longer than [`LOAD_DEBOUNCE`] so a
@@ -1343,10 +1840,15 @@ mod tests {
     fn open_root(
         cx: &mut TestAppContext,
         delay: Option<Duration>,
-    ) -> (Arc<Calls>, Entity<Workspace>, &mut VisualTestContext) {
+    ) -> (
+        Arc<Calls>,
+        Arc<fs_core::FakeVfs>,
+        Entity<Workspace>,
+        &mut VisualTestContext,
+    ) {
         let calls: Arc<Calls> = Arc::default();
         let platform_calls = calls.clone();
-        cx.update(|cx| {
+        let vfs = cx.update(|cx| {
             let spawner: Arc<dyn Spawner> =
                 Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
             let vfs = fs_core::FakeVfs::new(spawner.clone());
@@ -1363,7 +1865,7 @@ mod tests {
             crate::keymap::init(cx);
             crate::app_state::install(
                 cx,
-                vfs,
+                vfs.clone(),
                 spawner.clone(),
                 Arc::new(LoggingOpener),
                 Arc::new(RecordingPlatform {
@@ -1374,10 +1876,11 @@ mod tests {
                 }),
             );
             crate::settings::init_with_path(cx, PathBuf::from("/config/settings.json"));
+            vfs
         });
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::new(Theme::dark(), window, cx));
-        (calls, workspace, cx)
+        (calls, vfs, workspace, cx)
     }
 
     fn navigate(workspace: &Entity<Workspace>, path: &str, cx: &mut VisualTestContext) {
@@ -1421,7 +1924,7 @@ mod tests {
 
     #[gpui::test]
     fn with_no_folder_open_the_panel_is_empty_and_stats_nothing(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         settle(cx);
         assert_eq!(subject(&workspace, cx), Subject::Nothing);
         assert!(
@@ -1436,7 +1939,7 @@ mod tests {
     // and the panel must then describe *that* row.
     #[gpui::test]
     fn selecting_a_row_retargets_the_panel_at_it(cx: &mut TestAppContext) {
-        let (_calls, workspace, cx) = open_root(cx, None);
+        let (_calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
 
         // Nothing selected: the panel describes the open folder rather than
@@ -1498,7 +2001,7 @@ mod tests {
     // (nine files have nine modes; showing the first one's would be a lie).
     #[gpui::test]
     fn a_multi_selection_shows_the_summary_and_loads_nothing(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         settle(cx);
         let before = calls.started().len();
@@ -1533,7 +2036,7 @@ mod tests {
     // fires* — one stat for the row you stop on, not one per row.
     #[gpui::test]
     fn walking_the_listing_costs_one_load_not_one_per_row(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         settle(cx);
         let before = calls.started().len();
@@ -1578,7 +2081,7 @@ mod tests {
     // moves. The abandoned lookup must never reach the panel.
     #[gpui::test]
     fn retargeting_abandons_the_load_it_left_in_flight(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, Some(SLOW));
+        let (calls, _vfs, workspace, cx) = open_root(cx, Some(SLOW));
         navigate(&workspace, "/root", cx);
         // Let the folder's own load finish so it is not the one in flight.
         settle(cx);
@@ -1626,7 +2129,7 @@ mod tests {
     // executor.
     #[gpui::test]
     fn a_slow_platform_never_blocks_the_ui_thread(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, Some(SLOW));
+        let (calls, _vfs, workspace, cx) = open_root(cx, Some(SLOW));
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/a.txt"], cx);
         // If `file_attrs` ran on the UI thread this would never return.
@@ -1657,7 +2160,7 @@ mod tests {
     // `.txt`-shaped non-image extension outside the allowlist gets none.
     #[gpui::test]
     fn only_a_previewable_subject_asks_for_a_preview(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         settle(cx);
         assert!(
@@ -1695,7 +2198,7 @@ mod tests {
     // the repaint cadence would otherwise never arrive.
     #[gpui::test]
     fn idle_notifies_neither_restart_the_debounce_nor_reload(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/a.txt"], cx);
         settle(cx);
@@ -1721,7 +2224,7 @@ mod tests {
     // the UI thread, so it has to happen before the subject is derived.
     #[gpui::test]
     fn an_idle_follow_does_not_build_the_projection(cx: &mut TestAppContext) {
-        let (_calls, workspace, cx) = open_root(cx, None);
+        let (_calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/a.txt"], cx);
         settle(cx);
@@ -1748,7 +2251,7 @@ mod tests {
     // open folder leaves the panel permanently at em dashes.
     #[gpui::test]
     fn repeated_relistings_keep_the_values_painted(cx: &mut TestAppContext) {
-        let (_calls, workspace, cx) = open_root(cx, None);
+        let (_calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/photo.png"], cx);
         settle(cx);
@@ -1786,7 +2289,7 @@ mod tests {
     // re-describes the current selection rather than a stale one.
     #[gpui::test]
     fn a_hidden_panel_stops_loading_and_a_shown_one_catches_up(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/a.txt"], cx);
         settle(cx);
@@ -1822,7 +2325,7 @@ mod tests {
     // focusing back retargets it again.
     #[gpui::test]
     fn the_panel_follows_the_active_pane_across_a_split(cx: &mut TestAppContext) {
-        let (_calls, workspace, cx) = open_root(cx, None);
+        let (_calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/a.txt"], cx);
         settle(cx);
@@ -1899,7 +2402,7 @@ mod tests {
     // leaves the pane strip's own layout state alone.
     #[gpui::test]
     fn cmd_shift_i_toggles_the_panel_without_disturbing_the_strip(cx: &mut TestAppContext) {
-        let (_calls, workspace, cx) = open_root(cx, None);
+        let (_calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| workspace.toggle_split_pane(window, cx));
@@ -1948,7 +2451,7 @@ mod tests {
     // witness notices.
     #[gpui::test]
     fn a_relisting_re_reads_the_selected_entrys_attributes(cx: &mut TestAppContext) {
-        let (calls, workspace, cx) = open_root(cx, None);
+        let (calls, _vfs, workspace, cx) = open_root(cx, None);
         navigate(&workspace, "/root", cx);
         select(&workspace, &["/root/a.txt"], cx);
         settle(cx);
@@ -1971,6 +2474,241 @@ mod tests {
                 path: Arc::from(Path::new("/root/a.txt")),
                 kind: OneKind::Selected,
             }
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M6b: editing the Permissions section
+    // ------------------------------------------------------------------
+
+    /// The mode the **filesystem** holds — what a `chmod` submitted by the
+    /// panel actually landed on, as opposed to what the panel painted.
+    fn mode_on_disk(vfs: &Arc<fs_core::FakeVfs>, path: &str) -> Option<u32> {
+        vfs.mode_of(path)
+    }
+
+    /// The mode the panel is showing for its subject.
+    fn painted_mode(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<u32> {
+        panel(workspace, cx)
+            .read_with(cx, |panel, _| panel.perms())
+            .map(|perms| perms.mode())
+    }
+
+    /// Open the editor on `field` and type `text` into it, without committing.
+    fn type_into(
+        workspace: &Entity<Workspace>,
+        field: PermField,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let panel = panel(workspace, cx);
+        let text = text.to_string();
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.begin_field_edit(field, window, cx));
+            let input = panel
+                .read(cx)
+                .edit
+                .as_ref()
+                .expect("the editor opened on a known value")
+                .input
+                .clone();
+            input.update(cx, |input, cx| input.set_value(text, window, cx));
+        });
+    }
+
+    fn commit(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        let panel = panel(workspace, cx);
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.confirm_field_edit(window, cx));
+        });
+        cx.run_until_parked();
+        settle(cx);
+    }
+
+    #[gpui::test]
+    fn clicking_one_permission_box_chmods_that_bit_through_the_job_queue(cx: &mut TestAppContext) {
+        let (_calls, vfs, workspace, cx) = open_root(cx, None);
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/a.txt"], cx);
+        settle(cx);
+
+        let painted = painted_mode(&workspace, cx).expect("the stub reports a mode");
+        let expected = toggled_mode(painted, PermClass::Others, PermBit::Write);
+        assert_ne!(expected, painted, "the click has something to change");
+
+        let panel = panel(&workspace, cx);
+        panel.update(cx, |panel, cx| {
+            panel.toggle_perm_bit(PermClass::Others, PermBit::Write, cx)
+        });
+        cx.run_until_parked();
+        settle(cx);
+
+        // It went through the **queue** — the panel owns no `Vfs` call of its
+        // own — and it wrote the whole flipped mode, not a delta.
+        assert_eq!(mode_on_disk(&vfs, "/root/a.txt"), Some(expected));
+    }
+
+    #[gpui::test]
+    fn a_permission_change_is_undoable_like_every_other_file_operation(cx: &mut TestAppContext) {
+        let (_calls, vfs, workspace, cx) = open_root(cx, None);
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/a.txt"], cx);
+        settle(cx);
+        let before = mode_on_disk(&vfs, "/root/a.txt").expect("the fake vfs models a mode");
+
+        let panel = panel(&workspace, cx);
+        panel.update(cx, |panel, cx| {
+            panel.toggle_perm_bit(PermClass::Owner, PermBit::Exec, cx)
+        });
+        cx.run_until_parked();
+        settle(cx);
+        assert_ne!(mode_on_disk(&vfs, "/root/a.txt"), Some(before));
+
+        cx.update(|window, cx| {
+            let handle = workspace.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        settle(cx);
+        assert_eq!(
+            mode_on_disk(&vfs, "/root/a.txt"),
+            Some(before),
+            "cmd-z puts the exact previous mode back"
+        );
+    }
+
+    #[gpui::test]
+    fn the_octal_field_commits_a_typed_mode_and_escape_abandons_it(cx: &mut TestAppContext) {
+        let (_calls, vfs, workspace, cx) = open_root(cx, None);
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/b.txt"], cx);
+        settle(cx);
+        let before = mode_on_disk(&vfs, "/root/b.txt").expect("the fake vfs models a mode");
+
+        // Escape (and blur, which shares the path) writes nothing at all.
+        type_into(&workspace, PermField::Octal, "700", cx);
+        let panel = panel(&workspace, cx);
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.cancel_field_edit(window, cx));
+        });
+        cx.run_until_parked();
+        settle(cx);
+        assert_eq!(mode_on_disk(&vfs, "/root/b.txt"), Some(before));
+        assert!(
+            panel.read_with(cx, |panel, _| panel.edit.is_none()),
+            "the editor closed"
+        );
+
+        // Enter commits the whole mode, special bits and all — the one way to
+        // reach setuid, which the nine-box grid cannot show.
+        type_into(&workspace, PermField::Octal, "4711", cx);
+        commit(&workspace, cx);
+        assert_eq!(mode_on_disk(&vfs, "/root/b.txt"), Some(0o4711));
+    }
+
+    #[gpui::test]
+    fn a_junk_octal_value_closes_the_editor_and_writes_nothing(cx: &mut TestAppContext) {
+        let (_calls, vfs, workspace, cx) = open_root(cx, None);
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/b.txt"], cx);
+        settle(cx);
+        let before = mode_on_disk(&vfs, "/root/b.txt").expect("the fake vfs models a mode");
+
+        for junk in ["7778", "rwx", "", "12345"] {
+            type_into(&workspace, PermField::Octal, junk, cx);
+            commit(&workspace, cx);
+            assert_eq!(
+                mode_on_disk(&vfs, "/root/b.txt"),
+                Some(before),
+                "{junk:?} is not a mode, so nothing is written"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn editing_the_owner_chowns_by_name_and_the_panel_re_reads_it(cx: &mut TestAppContext) {
+        let (_calls, _vfs, workspace, cx) = open_root(cx, None);
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/a.txt"], cx);
+        settle(cx);
+        panel(&workspace, cx).read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.field_text(PermField::Owner).as_deref(),
+                Some("stub-owner")
+            );
+        });
+
+        type_into(&workspace, PermField::Owner, "someone", cx);
+        commit(&workspace, cx);
+
+        // A `chown` moves no mtime and no directory entry, so no watcher can
+        // see it: this asserts the workspace's own re-read of the subject as
+        // much as it asserts the op.
+        panel(&workspace, cx).read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.field_text(PermField::Owner).as_deref(),
+                Some("someone")
+            );
+            assert_eq!(
+                panel.field_text(PermField::Group).as_deref(),
+                Some("stub-group"),
+                "the group half was not asked for, so it was left alone"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn committing_an_unchanged_value_submits_nothing(cx: &mut TestAppContext) {
+        let (_calls, vfs, workspace, cx) = open_root(cx, None);
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/a.txt"], cx);
+        settle(cx);
+        let before = mode_on_disk(&vfs, "/root/a.txt");
+        let painted = painted_mode(&workspace, cx).expect("the stub reports a mode");
+
+        // Retyping what is already there is not an edit — and this is the one
+        // case where it matters that the fake vfs's mode and the stub
+        // platform's differ: a no-op commit must not "sync" one onto the
+        // other behind the user's back.
+        let text = UnixPerms::from_mode(painted).octal();
+        type_into(&workspace, PermField::Octal, &text, cx);
+        commit(&workspace, cx);
+        assert_eq!(mode_on_disk(&vfs, "/root/a.txt"), before);
+    }
+
+    #[gpui::test]
+    fn nothing_is_editable_before_the_load_lands(cx: &mut TestAppContext) {
+        let (_calls, vfs, workspace, cx) = open_root(cx, Some(SLOW));
+        navigate(&workspace, "/root", cx);
+        select(&workspace, &["/root/a.txt"], cx);
+        advance_past_debounce(cx);
+        let panel = panel(&workspace, cx);
+
+        // The lookup is parked inside `file_attrs`: the grid is painting em
+        // dashes, and a click on one of its boxes must not submit a mode
+        // nobody chose.
+        panel.read_with(cx, |panel, _| assert!(panel.perms().is_none()));
+        panel.update(cx, |panel, cx| {
+            panel.toggle_perm_bit(PermClass::Owner, PermBit::Read, cx)
+        });
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.begin_field_edit(PermField::Octal, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.edit.is_none()),
+            "no editor opens on a value that is not known yet"
+        );
+
+        advance_past_slow(cx);
+        assert!(mode_on_disk(&vfs, "/root/a.txt").is_some());
+        assert_eq!(
+            mode_on_disk(&vfs, "/root/a.txt"),
+            Some(fs_core::FAKE_FILE_MODE),
+            "the click on the unloaded grid wrote nothing"
         );
     }
 }

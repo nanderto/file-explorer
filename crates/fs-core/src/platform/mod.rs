@@ -1,8 +1,8 @@
 //! OS services behind a trait (ARCHITECTURE.md §6 `platform/`) — volumes and
 //! eject for M2. Strictly OS integration, *not* file I/O (that is [`crate::Vfs`]).
 //!
-//! The trait grows additively in later milestones (tags, thumbnails, open,
-//! reveal — M4/M5/M6). [`MacPlatform`](macos::MacPlatform) is the real
+//! The trait grows additively in later milestones (thumbnails M4, attributes
+//! M5, Finder tags M6b, open/reveal later). [`MacPlatform`](macos::MacPlatform) is the real
 //! implementation behind `cfg(target_os = "macos")`; [`StubPlatform`] is the
 //! portable implementation used for Windows/Linux development **and** for
 //! deterministic tests and visual scenarios on every platform.
@@ -19,6 +19,7 @@ use futures::stream::BoxStream;
 
 use crate::attrs::FileAttrs;
 use crate::exec::Spawner;
+use crate::tags::Tag;
 use crate::thumbnail::Thumbnail;
 use crate::watcher::WatchGuard;
 
@@ -29,7 +30,7 @@ pub(crate) mod trash;
 
 #[cfg(target_os = "macos")]
 pub use macos::MacPlatform;
-pub use stub::StubPlatform;
+pub use stub::{STUB_PRIVILEGED_OWNER, StubPlatform};
 
 /// Stable identity of a mounted volume. M2 keys it by mount path — unique per
 /// mounted volume and exactly what both eject and navigation need.
@@ -104,6 +105,63 @@ pub trait Platform: Send + Sync {
     /// resolved degrades to `None`/`false` inside a successful [`FileAttrs`],
     /// because the panel would rather show four of six rows than none.
     async fn file_attrs(&self, path: &Path) -> Result<FileAttrs>;
+
+    /// The Finder tags on `path` — the decoded
+    /// `com.apple.metadata:_kMDItemUserTags` extended attribute (M6b).
+    ///
+    /// An untagged item is `Ok(vec![])`, not an error: "no tags" is the normal
+    /// case for almost every file, and the details row asks for every visible
+    /// row's tags. Only a genuine failure (the item is gone, the volume denied
+    /// the read, the payload is not a plist array we can parse) is an `Err`.
+    ///
+    /// Order is the on-disk order, which is the order Finder shows.
+    ///
+    /// Blocking work goes through [`crate::SpawnerExt::unblock`]; the UI thread
+    /// only ever awaits this.
+    async fn read_tags(&self, path: &Path) -> Result<Vec<Tag>>;
+
+    /// Replace the **whole** tag set on `path` (there is no add/remove — Finder
+    /// rewrites the array too, and a read-modify-write in the caller is the only
+    /// honest way to express "add one").
+    ///
+    /// An empty slice **removes** the extended attribute rather than writing an
+    /// empty array, so an untagged file is byte-identical to one that was never
+    /// tagged.
+    ///
+    /// Blocking work goes through [`crate::SpawnerExt::unblock`].
+    async fn write_tags(&self, path: &Path, tags: &[Tag]) -> Result<()>;
+
+    /// The tags to offer in the sidebar's **Tags** section: the seven standard
+    /// palette tags ([`crate::tags::standard_tags`]) plus any additional tags
+    /// this implementation can discover the user has.
+    ///
+    /// Best-effort by design — an implementation that can only see the standard
+    /// palette returns just that rather than failing.
+    async fn known_tags(&self) -> Result<Vec<Tag>>;
+
+    /// Change the owning user and/or group of `path` **by name** (M6b's info
+    /// panel, "owner/group change where privileged"). `None` leaves that half
+    /// alone, so changing only the group is expressible.
+    ///
+    /// An OS *service*, not file I/O, and that is the whole reason it lives here
+    /// rather than on [`crate::Vfs`]: the mutation itself is a one-line
+    /// `chown`, but turning `"staff"` into a gid is a directory-service lookup
+    /// (local users, Open Directory, a network domain) that only the platform
+    /// layer can do — the same lookup [`Platform::file_attrs`] already does in
+    /// reverse to render the owner row.
+    ///
+    /// **Expected to fail.** Only a privileged process may give a file away, so
+    /// an ordinary run gets `EPERM`; implementations must report that as an
+    /// ordinary `Err` with a message the UI can show, change nothing, and never
+    /// panic. An unknown account name is likewise an `Err`.
+    ///
+    /// Blocking work goes through [`crate::SpawnerExt::unblock`].
+    async fn set_ownership(
+        &self,
+        path: &Path,
+        owner: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<()>;
 }
 
 /// Watch the volume list for changes by polling [`Platform::volumes`] every
@@ -348,6 +406,91 @@ mod tests {
         assert_eq!(
             attrs.unwrap().type_description.as_deref(),
             Some("JPEG image")
+        );
+    }
+
+    #[test]
+    fn stub_tags_start_empty_round_trip_and_clear() {
+        use crate::tags::{Tag, TagColor, standard_tags};
+
+        let platform = StubPlatform::new();
+        let path = Path::new("/root/report.pdf");
+        assert_eq!(block_on(platform.read_tags(path)).unwrap(), vec![]);
+
+        // Written verbatim after codec normalization: the blank name and the
+        // duplicate are dropped exactly as macOS would drop them.
+        block_on(platform.write_tags(
+            path,
+            &[
+                Tag::new("Work", TagColor::Blue),
+                Tag::new("", TagColor::Red),
+                Tag::new("Work", TagColor::Red),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            block_on(platform.read_tags(path)).unwrap(),
+            [Tag::new("Work", TagColor::Blue)]
+        );
+
+        // Storage, not a path hash: a second instance knows nothing about it.
+        assert_eq!(
+            block_on(StubPlatform::new().read_tags(path)).unwrap(),
+            vec![],
+            "tags live in the instance, so no cross-test bleed"
+        );
+
+        // known_tags = palette + the user's own, deterministically ordered.
+        let known = block_on(platform.known_tags()).unwrap();
+        assert_eq!(known.len(), 8);
+        assert_eq!(&known[..7], &standard_tags()[..]);
+        assert_eq!(known[7], Tag::new("Work", TagColor::Blue));
+
+        block_on(platform.write_tags(path, &[])).unwrap();
+        assert_eq!(block_on(platform.read_tags(path)).unwrap(), vec![]);
+        assert_eq!(block_on(platform.known_tags()).unwrap(), standard_tags());
+    }
+
+    #[test]
+    fn stub_set_ownership_is_storage_that_file_attrs_reports_and_root_is_denied() {
+        let platform = StubPlatform::new();
+        let path = Path::new("/root/report.pdf");
+        let names = |attrs: &FileAttrs| (attrs.owner.clone(), attrs.group.clone());
+
+        let before = block_on(platform.file_attrs(path)).unwrap();
+        assert_eq!(
+            names(&before),
+            (Some("stub-owner".into()), Some("stub-group".into()))
+        );
+
+        // Group only: the owner half is left exactly as it was.
+        block_on(platform.set_ownership(path, None, Some("wheel"))).unwrap();
+        assert_eq!(
+            names(&block_on(platform.file_attrs(path)).unwrap()),
+            (Some("stub-owner".into()), Some("wheel".into()))
+        );
+
+        // Then the owner, on top of the stored group.
+        block_on(platform.set_ownership(path, Some("noel"), None)).unwrap();
+        assert_eq!(
+            names(&block_on(platform.file_attrs(path)).unwrap()),
+            (Some("noel".into()), Some("wheel".into()))
+        );
+
+        // The privileged name fails and changes nothing — the portable
+        // stand-in for a real unprivileged chown's EPERM.
+        let error =
+            block_on(platform.set_ownership(path, Some(STUB_PRIVILEGED_OWNER), None)).unwrap_err();
+        assert!(error.to_string().contains("not permitted"), "{error}");
+        assert_eq!(
+            names(&block_on(platform.file_attrs(path)).unwrap()),
+            (Some("noel".into()), Some("wheel".into()))
+        );
+
+        // Storage, not a path hash: another instance knows nothing about it.
+        assert_eq!(
+            names(&block_on(StubPlatform::new().file_attrs(path)).unwrap()),
+            (Some("stub-owner".into()), Some("stub-group".into()))
         );
     }
 

@@ -35,7 +35,7 @@
 
 use std::path::PathBuf;
 
-use fs_core::{SortKey, SortSpec};
+use fs_core::{SortKey, SortSpec, Tag, TagColor};
 use gpui::{
     Action, AnyElement, App, Context, Div, MouseButton, MouseDownEvent, Pixels, Point,
     SharedString, Stateful, Window, anchored, deferred, div, point, prelude::*, px,
@@ -43,7 +43,7 @@ use gpui::{
 
 use crate::actions::{
     Copy, Cut, DeletePermanently, DeleteToTrash, Duplicate, NewFile, NewFolder, OpenSelected,
-    Paste, Refresh, RenameSelected, SortBy, ToggleHiddenFiles,
+    Paste, Refresh, RenameSelected, SortBy, ToggleHiddenFiles, ToggleTag,
 };
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
@@ -84,6 +84,11 @@ pub struct MenuCommand {
     pub action: Box<dyn Action>,
     pub enabled: bool,
     pub checked: bool,
+    /// A Finder tag's colour slot, for the `Tags ▸` rows: the row paints the
+    /// palette dot beside its name so the submenu reads like the sidebar's
+    /// section. `None` on every other row. The colour is macOS's, not the
+    /// theme's — see [`crate::tags`].
+    pub dot: Option<TagColor>,
 }
 
 /// A row of a menu. Submenus are deliberately **one level deep** — that is
@@ -129,6 +134,7 @@ fn command(label: &'static str, action: Box<dyn Action>, enabled: bool) -> MenuI
         action,
         enabled,
         checked: false,
+        dot: None,
     })
 }
 
@@ -138,6 +144,7 @@ fn toggle(label: &'static str, action: Box<dyn Action>, checked: bool) -> MenuIt
         action,
         enabled: true,
         checked,
+        dot: None,
     })
 }
 
@@ -147,6 +154,21 @@ fn sub_command(label: &'static str, action: Box<dyn Action>, enabled: bool) -> M
         action,
         enabled,
         checked: false,
+        dot: None,
+    }
+}
+
+/// One `Tags ▸` row: the tag's name, its palette dot, and a ✓ when **every**
+/// selected item already carries it — which is also what makes the row's
+/// dispatch a *remove* rather than an add (the toggle rule lives in
+/// [`crate::tags`], not here).
+fn tag_command(tag: &Tag, on_whole_selection: bool, enabled: bool) -> MenuCommand {
+    MenuCommand {
+        label: SharedString::new(&tag.name),
+        action: Box::new(ToggleTag { tag: tag.clone() }),
+        enabled,
+        checked: on_whole_selection,
+        dot: Some(tag.color),
     }
 }
 
@@ -164,6 +186,7 @@ fn sort_command(label: &'static str, key: SortKey, sort: SortSpec) -> MenuComman
         action: Box::new(SortBy { key }),
         enabled: !active,
         checked: active,
+        dot: None,
     }
 }
 
@@ -190,6 +213,13 @@ pub struct MenuFacts {
     /// ([`fs_core::FileClipboard::contains_destination`]), so this only decides
     /// whether the item looks available.
     pub paste_dest_inside_source: bool,
+    /// The tags the `Tags ▸` submenu offers: the palette plus whatever
+    /// [`fs_core::Platform::known_tags`] reported, as cached by the view (the
+    /// menu is built synchronously and cannot await an OS call).
+    pub known_tags: Vec<Tag>,
+    /// The tags **every** selected row is known to carry — the rows that render
+    /// checked, and so the ones a click removes.
+    pub selection_tags: Vec<Tag>,
 }
 
 impl MenuFacts {
@@ -222,6 +252,26 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
             }),
             facts.can_paste(),
         ),
+        MenuItem::Separator,
+        // M6b: Finder puts Tags right here, between the clipboard rows and
+        // Rename. One level deep, like `New ▸` and `Sort by ▸`.
+        MenuItem::Submenu {
+            label: SharedString::new_static("Tags"),
+            items: facts
+                .known_tags
+                .iter()
+                .map(|tag| {
+                    tag_command(
+                        tag,
+                        facts
+                            .selection_tags
+                            .iter()
+                            .any(|checked| checked.name == tag.name),
+                        any,
+                    )
+                })
+                .collect(),
+        },
         MenuItem::Separator,
         command("Duplicate", Box::new(Duplicate), any),
         // One name, one editor: renaming a multi-selection is meaningless.
@@ -400,6 +450,8 @@ impl DirView {
                 .unwrap_or_default(),
             // The open directory, unless a row menu overrides it below.
             paste_dest: None,
+            known_tags: self.known_tags().to_vec(),
+            selection_tags: self.tags_on_whole_selection(),
             paste_dest_inside_source: pane.as_ref().is_some_and(|pane| {
                 pane.read(cx)
                     .path()
@@ -606,6 +658,13 @@ fn render_command(
                     ""
                 })),
         )
+        .children(
+            // The tag's palette dot (M6b), between the ✓ gutter and the name.
+            command
+                .dot
+                .and_then(crate::tags::tag_dot)
+                .map(|dot| div().flex_none().pr(px(5.0)).child(dot)),
+        )
         .child(div().flex_1().truncate().child(command.label.clone()));
     if command.enabled {
         let action = command.action.boxed_clone();
@@ -737,6 +796,8 @@ mod tests {
             sort: SortSpec::default(),
             paste_dest: None,
             paste_dest_inside_source: false,
+            known_tags: fs_core::standard_tags(),
+            selection_tags: Vec::new(),
         }
     }
 
@@ -812,6 +873,43 @@ mod tests {
             }),
             "each Sort by row carries its own key"
         );
+    }
+
+    /// M6b: the `Tags ▸` rows carry the tag as an *action parameter* (one
+    /// command, one implementation), render a ✓ only for tags the whole
+    /// selection has, and are disabled with nothing selected — there is
+    /// nothing to tag.
+    #[test]
+    fn the_tags_submenu_offers_every_known_tag_with_the_selections_ticked() {
+        let mut facts = facts();
+        facts.selection_tags = vec![Tag::new("Blue", TagColor::Blue)];
+        let items = row_menu(&facts);
+        let tags = items[find(&items, "Tags")].submenu().unwrap();
+        assert_eq!(
+            tags.iter()
+                .map(|row| row.label.as_ref())
+                .collect::<Vec<_>>(),
+            ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Gray"],
+            "the palette, in Finder's order"
+        );
+        let blue = tags.iter().find(|row| row.label == "Blue").unwrap();
+        assert!(blue.checked, "the selection carries Blue");
+        assert_eq!(blue.dot, Some(TagColor::Blue), "and paints its palette dot");
+        assert_eq!(
+            blue.action.as_any().downcast_ref::<ToggleTag>(),
+            Some(&ToggleTag {
+                tag: Tag::new("Blue", TagColor::Blue)
+            }),
+            "each row dispatches the boxed action for its own tag"
+        );
+        assert!(tags.iter().filter(|row| row.checked).count() == 1);
+        assert!(tags.iter().all(|row| row.enabled));
+
+        // Nothing selected: offered, but inert (nothing is hidden — §3).
+        facts.selection_len = 0;
+        let items = row_menu(&facts);
+        let tags = items[find(&items, "Tags")].submenu().unwrap();
+        assert!(tags.iter().all(|row| !row.enabled));
     }
 
     #[test]

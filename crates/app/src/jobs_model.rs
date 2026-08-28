@@ -104,6 +104,11 @@ pub fn kind_label(kind: JobKind) -> &'static str {
         JobKind::CreateFile => "New File",
         JobKind::Duplicate => "Duplicate",
         JobKind::Delete => "Delete",
+        // M6b attribute ops. "Tags" rather than "Set tags": the toast reads
+        // "Tags complete", which is how Finder talks about them too.
+        JobKind::Chmod => "Permissions",
+        JobKind::Chown => "Owner",
+        JobKind::SetTags => "Tags",
     }
 }
 
@@ -119,6 +124,9 @@ pub fn kind_verb(kind: JobKind) -> &'static str {
         JobKind::CreateFile => "Creating file",
         JobKind::Duplicate => "Duplicating",
         JobKind::Delete => "Deleting",
+        JobKind::Chmod => "Changing permissions",
+        JobKind::Chown => "Changing owner",
+        JobKind::SetTags => "Setting tags",
     }
 }
 
@@ -297,11 +305,31 @@ impl JobsModel {
             JobEvent::Completed { id, receipt } => {
                 let kind = self.remove_row(id);
                 self.remove_pending(id, cx, true);
-                self.push_toast(
-                    ToastKind::Success,
-                    format!("{} complete", kind_label(kind)),
-                    cx,
-                );
+                // M6b: the attribute ops (`Chmod`/`Chown`/`SetTags`) attempt
+                // **every** path and complete when at least one landed, so a
+                // completed job can still have refused paths in its receipt.
+                // Reporting only "complete" would claim a change that did not
+                // happen to part of the selection.
+                if receipt.failed.is_empty() {
+                    self.push_toast(
+                        ToastKind::Success,
+                        format!("{} complete", kind_label(kind)),
+                        cx,
+                    );
+                } else {
+                    let changed = receipt.restored_attrs.len();
+                    let total = changed + receipt.failed.len();
+                    let (path, reason) = &receipt.failed[0];
+                    self.push_toast(
+                        ToastKind::Error,
+                        format!(
+                            "{}: changed {changed} of {total} — {} {reason}",
+                            kind_label(kind),
+                            path.display()
+                        ),
+                        cx,
+                    );
+                }
                 cx.emit(JobsEvent::Completed { id, receipt });
             }
             JobEvent::Failed { id, error } => {

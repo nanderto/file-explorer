@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -22,6 +22,12 @@ use crate::entry::{EntryKind, EntryMeta, FileEntry, TargetKind};
 use crate::exec::{Spawner, SpawnerExt as _};
 use crate::platform::trash as trash_engine;
 use crate::watcher::{self, PathEvent, WatchGuard};
+
+/// The permission bits [`Vfs::mode`] reports and [`Vfs::set_mode`] writes:
+/// `rwxrwxrwx` plus setuid/setgid/sticky, the same window
+/// [`crate::UnixPerms`] keeps. The file-type bits are never part of a mode
+/// *value* — `chmod` cannot change them.
+pub const PERM_BITS: u32 = 0o7777;
 
 /// Identifies the volume a path lives on. Used for job-lane routing (M3);
 /// derived from the path shape in M1 (real volume enumeration is a platform
@@ -165,6 +171,44 @@ pub trait Vfs: Send + Sync {
     /// [`RemoveOptions::recursive`]; a missing path is an error (callers know
     /// what they expect to delete).
     async fn remove(&self, path: &Path, opts: RemoveOptions) -> Result<()>;
+
+    /// The item's unix permission bits (`st_mode & 0o7777`), or `Ok(None)`
+    /// where the platform has no unix mode at all (Windows). A missing or
+    /// unreadable path is an `Err` — unlike [`metadata`], because the only
+    /// caller is [`crate::FileOp::Chmod`], which must capture the *previous*
+    /// mode before it writes and cannot treat "gone" as "no mode".
+    ///
+    /// **Follows symlinks**, and so does [`set_mode`]: the pair has to describe
+    /// the same inode or an undo would write a link's mode onto its target.
+    /// (Note the divergence from [`crate::Platform::file_attrs`], which
+    /// `lstat`s because the info panel describes the item the user clicked.)
+    ///
+    /// Defaulted to `Ok(None)` so a test double that does not model permissions
+    /// keeps compiling; every implementation that can answer overrides it.
+    ///
+    /// [`metadata`]: Vfs::metadata
+    /// [`set_mode`]: Vfs::set_mode
+    async fn mode(&self, _path: &Path) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
+    /// Set the item's unix permission bits (`chmod`; `mode` is masked to
+    /// `0o7777`). Follows symlinks — see [`mode`].
+    ///
+    /// Note for undo: `chmod` changes **ctime, not mtime**, so an
+    /// mtime-fingerprint cannot see it — [`crate::UndoEntry`] guards these ops
+    /// with [`crate::AttrGuard`] instead.
+    ///
+    /// Defaulted to an error rather than a silent success: a `Vfs` that cannot
+    /// chmod must say so, never pretend.
+    ///
+    /// [`mode`]: Vfs::mode
+    async fn set_mode(&self, path: &Path, _mode: u32) -> Result<()> {
+        anyhow::bail!(
+            "this filesystem cannot change unix permissions: {}",
+            path.display()
+        )
+    }
 
     /// Move `path` to the trash, returning the undo token [`restore`]
     /// consumes. The real macOS trash sits behind `cfg(target_os = "macos")`;
@@ -441,6 +485,55 @@ impl Vfs for RealVfs {
             .await
     }
 
+    async fn mode(&self, path: &Path) -> Result<Option<u32>> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                // `metadata`, not `symlink_metadata`: this must report the mode
+                // `set_mode` would overwrite (see the trait doc).
+                let metadata = std::fs::metadata(&path)
+                    .map_err(|error| anyhow!("read permissions of {}: {error}", path.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    Ok(Some(metadata.permissions().mode() & PERM_BITS))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = metadata; // Windows has no unix mode to report.
+                    Ok(None)
+                }
+            })
+            .await
+    }
+
+    async fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(mode & PERM_BITS),
+                    )
+                    .map_err(|error| {
+                        anyhow!("chmod {:o} {}: {error}", mode & PERM_BITS, path.display())
+                    })
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = mode;
+                    anyhow::bail!(
+                        "changing unix permissions is not supported on this platform: {}",
+                        path.display()
+                    )
+                }
+            })
+            .await
+    }
+
     async fn trash(&self, path: &Path) -> Result<TrashId> {
         let path = path.to_path_buf();
         self.spawner
@@ -526,7 +619,9 @@ impl Vfs for RealVfs {
 // ---------------------------------------------------------------------------
 
 #[cfg(any(test, feature = "test-support"))]
-pub use fake::FakeVfs;
+// The mode constants come out with it: a test that asserts "nothing wrote a
+// mode here" needs to name the mode a `FakeVfs` node starts at.
+pub use fake::{FAKE_DIR_MODE, FAKE_FILE_MODE, FakeVfs};
 
 #[cfg(any(test, feature = "test-support"))]
 mod fake {
@@ -544,7 +639,18 @@ mod fake {
         size: u64,
         modified: SystemTime,
         contents: Vec<u8>,
+        /// Unix permission bits, modelled so [`Vfs::mode`]/[`Vfs::set_mode`]
+        /// (and therefore `FileOp::Chmod` and its undo) are testable headlessly
+        /// on Windows and Linux too. New nodes start at
+        /// [`FAKE_FILE_MODE`]/[`FAKE_DIR_MODE`].
+        mode: u32,
     }
+
+    /// Mode a newly created `FakeVfs` file gets — `rw-r--r--`, what a real
+    /// `umask 022` process would produce.
+    pub const FAKE_FILE_MODE: u32 = 0o644;
+    /// Mode a newly created `FakeVfs` directory gets — `rwxr-xr-x`.
+    pub const FAKE_DIR_MODE: u32 = 0o755;
 
     struct FakeWatchSub {
         id: u64,
@@ -602,6 +708,7 @@ mod fake {
                 path.clone(),
                 FakeNode {
                     kind: EntryKind::File,
+                    mode: FAKE_FILE_MODE,
                     size,
                     modified,
                     contents: vec![0; size as usize],
@@ -624,6 +731,7 @@ mod fake {
                 path.clone(),
                 FakeNode {
                     kind: EntryKind::Dir,
+                    mode: FAKE_DIR_MODE,
                     size: 0,
                     modified,
                     contents: Vec::new(),
@@ -688,6 +796,21 @@ mod fake {
         /// between), which `watcher_count` alone cannot show.
         pub fn watch_registrations(&self) -> u64 {
             self.state.lock().unwrap().next_watch_id
+        }
+
+        /// The modelled mode of one node, read **synchronously**.
+        ///
+        /// [`Vfs::mode`] is async, and a `#[gpui::test]` cannot await it
+        /// without a foreground task; asserting "the panel's `chmod` landed"
+        /// is a plain read of modelled state, so it gets a plain accessor.
+        /// [`None`] for a path that does not exist.
+        pub fn mode_of(&self, path: impl AsRef<Path>) -> Option<u32> {
+            self.state
+                .lock()
+                .unwrap()
+                .tree
+                .get(path.as_ref())
+                .map(|node| node.mode & PERM_BITS)
         }
 
         /// Full tree snapshot for equality assertions (undo round-trip tests):
@@ -756,6 +879,7 @@ mod fake {
                 dir.clone(),
                 FakeNode {
                     kind: EntryKind::Dir,
+                    mode: FAKE_DIR_MODE,
                     size: 0,
                     modified,
                     contents: Vec::new(),
@@ -793,6 +917,7 @@ mod fake {
                     root.to_path_buf(),
                     FakeNode {
                         kind: EntryKind::Dir,
+                        mode: FAKE_DIR_MODE,
                         size: 0,
                         modified,
                         contents: Vec::new(),
@@ -807,6 +932,7 @@ mod fake {
                     root.to_path_buf(),
                     FakeNode {
                         kind: EntryKind::File,
+                        mode: FAKE_FILE_MODE,
                         size: contents.len() as u64,
                         modified,
                         contents: contents.as_bytes().to_vec(),
@@ -894,6 +1020,7 @@ mod fake {
                 path.to_path_buf(),
                 FakeNode {
                     kind: EntryKind::Dir,
+                    mode: FAKE_DIR_MODE,
                     size: 0,
                     modified,
                     contents: Vec::new(),
@@ -930,6 +1057,7 @@ mod fake {
                 path.to_path_buf(),
                 FakeNode {
                     kind: EntryKind::File,
+                    mode: FAKE_FILE_MODE,
                     size: 0,
                     modified,
                     contents: Vec::new(),
@@ -984,6 +1112,7 @@ mod fake {
                 to.to_path_buf(),
                 FakeNode {
                     kind: EntryKind::File,
+                    mode: FAKE_FILE_MODE,
                     size: total,
                     modified,
                     contents,
@@ -1036,6 +1165,36 @@ mod fake {
             }
             state.tree.retain(|p, _| !p.starts_with(path));
             emit_locked(&mut state, path_event(path, PathEventKind::Removed));
+            Ok(())
+        }
+
+        /// The node's modelled mode. A missing path is an `Err` (the trait's
+        /// contract — `Chmod` may not treat "gone" as "no mode"), and an
+        /// injected error surfaces here too, which is how the denied/EPERM
+        /// path is tested on every OS.
+        async fn mode(&self, path: &Path) -> Result<Option<u32>> {
+            let state = self.state.lock().unwrap();
+            check_error_locked(&state, path)?;
+            state
+                .tree
+                .get(path)
+                .map(|node| Some(node.mode & PERM_BITS))
+                .ok_or_else(|| anyhow!("no such file: {}", path.display()))
+        }
+
+        /// Sets the modelled mode and emits `Changed` — but deliberately does
+        /// **not** advance `modified`, because `chmod` changes ctime and not
+        /// mtime. That asymmetry is exactly why undo of a permission change
+        /// cannot be guarded by an mtime fingerprint, and a test pins it here.
+        async fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            check_error_locked(&state, path)?;
+            let node = state
+                .tree
+                .get_mut(path)
+                .ok_or_else(|| anyhow!("no such file: {}", path.display()))?;
+            node.mode = mode & PERM_BITS;
+            emit_locked(&mut state, path_event(path, PathEventKind::Changed));
             Ok(())
         }
 
@@ -1156,6 +1315,7 @@ mod fake {
                     dir.clone(),
                     FakeNode {
                         kind: EntryKind::Dir,
+                        mode: FAKE_DIR_MODE,
                         size: 0,
                         modified,
                         contents: Vec::new(),
@@ -1169,6 +1329,7 @@ mod fake {
                 path.to_path_buf(),
                 FakeNode {
                     kind: EntryKind::File,
+                    mode: FAKE_FILE_MODE,
                     size: data.len() as u64,
                     modified,
                     contents: data,
@@ -1883,5 +2044,103 @@ mod tests {
             block_on(vfs.restore(id)).unwrap_err(),
             TrashRestoreError::NotFound
         );
+    }
+
+    #[test]
+    fn fake_vfs_models_a_mode_and_a_chmod_never_touches_the_mtime() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree("/root", json!({ "a.txt": "a", "sub": {} }));
+        let file = Path::new("/root/a.txt");
+
+        assert_eq!(
+            block_on(vfs.mode(file)).unwrap(),
+            Some(fake::FAKE_FILE_MODE)
+        );
+        assert_eq!(
+            block_on(vfs.mode(Path::new("/root/sub"))).unwrap(),
+            Some(fake::FAKE_DIR_MODE),
+            "directories start executable"
+        );
+        let before = block_on(vfs.metadata(file)).unwrap().unwrap().modified;
+
+        // The type bits are masked off: a mode is only ever the low 12 bits.
+        block_on(vfs.set_mode(file, 0o100_600)).unwrap();
+        assert_eq!(block_on(vfs.mode(file)).unwrap(), Some(0o600));
+        // The sync accessor the UI tests read through agrees with the async
+        // one, and answers `None` — not an error — for a missing path.
+        assert_eq!(vfs.mode_of(file), Some(0o600));
+        assert_eq!(vfs.mode_of("/root/gone.txt"), None);
+        assert_eq!(
+            block_on(vfs.metadata(file)).unwrap().unwrap().modified,
+            before,
+            "chmod changes ctime, not mtime"
+        );
+
+        // A missing path is an error, not `Ok(None)` — Chmod may not treat
+        // "gone" as "no mode".
+        let error = block_on(vfs.mode(Path::new("/root/gone.txt"))).unwrap_err();
+        assert!(error.to_string().contains("no such file"), "{error}");
+        let error = block_on(vfs.set_mode(Path::new("/root/gone.txt"), 0o600)).unwrap_err();
+        assert!(error.to_string().contains("no such file"), "{error}");
+
+        // Injected errors surface, which is how a denied chmod is tested off macOS.
+        vfs.set_error("/root/a.txt", "Permission denied");
+        assert!(block_on(vfs.set_mode(file, 0o644)).is_err());
+    }
+
+    /// `chmod` straight through `std::fs`, so the tests below can set up (and
+    /// double-check) permissions without going through the code under test.
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_vfs_reads_and_writes_a_unix_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = real_test_vfs();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"a").unwrap();
+
+        chmod(&file, 0o644);
+        assert_eq!(block_on(vfs.mode(&file)).unwrap(), Some(0o644));
+
+        block_on(vfs.set_mode(&file, 0o600)).unwrap();
+        assert_eq!(block_on(vfs.mode(&file)).unwrap(), Some(0o600));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & PERM_BITS,
+                0o600,
+                "the real file on disk changed, not just our view of it"
+            );
+        }
+
+        // Setuid and sticky survive the round trip (four-digit modes).
+        block_on(vfs.set_mode(&file, 0o4755)).unwrap();
+        assert_eq!(block_on(vfs.mode(&file)).unwrap(), Some(0o4755));
+
+        let error = block_on(vfs.mode(&dir.path().join("gone.txt"))).unwrap_err();
+        assert!(error.to_string().contains("read permissions of"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_vfs_permissions_follow_a_symlink_the_way_chmod_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = real_test_vfs();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&target, b"t").unwrap();
+        chmod(&target, 0o644);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // `mode` and `set_mode` must describe the SAME inode, or an undo would
+        // write a link's mode onto its target.
+        assert_eq!(block_on(vfs.mode(&link)).unwrap(), Some(0o644));
+        block_on(vfs.set_mode(&link, 0o600)).unwrap();
+        assert_eq!(block_on(vfs.mode(&target)).unwrap(), Some(0o600));
     }
 }

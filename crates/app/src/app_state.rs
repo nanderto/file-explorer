@@ -97,7 +97,10 @@ pub fn install(
     opener: Arc<dyn Opener>,
     platform: Arc<dyn Platform>,
 ) -> Entity<JobsModel> {
-    let queue = JobQueue::new(vfs.clone(), spawner.clone());
+    // M6b: `with_platform`, not `new` — `FileOp::SetTags` and `FileOp::Chown`
+    // need the OS services behind the `Platform` seam, and a queue built
+    // without one refuses them.
+    let queue = JobQueue::with_platform(vfs.clone(), platform.clone(), spawner.clone());
     let undo: SharedUndoStack = Arc::new(futures::lock::Mutex::new(UndoStack::new()));
     let jobs = cx.new(|cx| {
         JobsModel::new(
