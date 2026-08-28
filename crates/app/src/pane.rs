@@ -237,6 +237,16 @@ pub struct Pane {
     /// it only to draw its own checkbox — the pane never reads that mirror,
     /// because the field's text and its toggle reach the pane one flush apart.
     pub(crate) search_recursive: bool,
+    /// The sidebar's Tags filter, if a tag is selected (M6b). A field here for
+    /// the same reason the search is: it filters *this* pane's projection, and
+    /// its rows are served through [`Pane::filtered_rows`] — the one accessor
+    /// the [`DirView`] projection reads. The machine lives in [`crate::tags`].
+    pub(crate) tag_filter: Option<crate::tags::TagFilter>,
+    /// The single cancellable slot for the tag scan behind that filter.
+    pub(crate) _tag_filter_task: Option<Task<()>>,
+    /// Bumped with every tag-filter mutation, so a throttled batch resolved for
+    /// a superseded filter can never apply.
+    pub(crate) tag_filter_generation: u64,
     scroll_top: f32,
     /// Restore waiting for the fresh snapshot (cache misses).
     pending_restore: Option<NavEntry>,
@@ -333,6 +343,9 @@ impl Pane {
             _search_task: None,
             search_generation: 0,
             search_recursive: false,
+            tag_filter: None,
+            _tag_filter_task: None,
+            tag_filter_generation: 0,
             focus_handle,
             theme,
             vfs,
@@ -553,6 +566,10 @@ impl Pane {
             // An in-place reload (refresh, sort flip, hidden toggle) keeps the
             // search and simply re-derives its rows from the new snapshot.
             self.cancel_search_for_navigation(cx);
+            // M6b: and the tag filter with it — it filters *that* folder's
+            // listing, so it means nothing in the next one (see `crate::tags`
+            // on the deviation from Finder's volume-wide query).
+            self.cancel_tag_filter_for_navigation(cx);
         }
         self.generation += 1;
         let generation = self.generation;
@@ -773,16 +790,19 @@ impl Pane {
         // actually paint. This is also what stops a watcher patch from
         // resurrecting a row the filter excludes.
         self.refresh_search_rows();
-        let search_rows = self.search_rows();
+        // M6b: the tag filter's rows are derived from the snapshot the same
+        // way, and go through the same projection accessor below.
+        self.refresh_tag_filter(cx);
+        let filtered_rows = self.filtered_rows();
         let snapshot = self.snapshot.clone();
         self.dir_view.update(cx, |dir_view, cx| {
-            dir_view.retain_selection_in_listing(snapshot.as_deref(), search_rows.as_deref(), cx);
+            dir_view.retain_selection_in_listing(snapshot.as_deref(), filtered_rows.as_deref(), cx);
             // §4c: an editor whose target the filesystem removed under it would
             // otherwise keep the `renaming` key context — and with it every
             // dead `DirView && !renaming` binding — forever.
             dir_view.cancel_rename_if_target_vanished(
                 snapshot.as_deref(),
-                search_rows.as_deref(),
+                filtered_rows.as_deref(),
                 cx,
             );
         });
@@ -814,7 +834,7 @@ impl Pane {
     fn listing_contains(&self, id: &EntryId, cx: &App) -> bool {
         self.dir_view.read(cx).listing_contains(
             self.snapshot.as_deref(),
-            self.search_rows().as_deref(),
+            self.filtered_rows().as_deref(),
             id,
         )
     }
@@ -919,7 +939,7 @@ impl Pane {
         // query, and §3 puts it on the line unconditionally.
         let count = self.item_count();
         let counts = self
-            .search_status_text()
+            .filter_status_text()
             .unwrap_or_else(|| format!("{count} item{}", if count == 1 { "" } else { "s" }));
         match self.free_space {
             Some(bytes) if self.path.is_some() => {

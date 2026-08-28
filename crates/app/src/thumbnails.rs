@@ -502,6 +502,29 @@ mod tests {
         async fn file_attrs(&self, path: &Path) -> anyhow::Result<fs_core::FileAttrs> {
             self.inner.file_attrs(path).await
         }
+
+        // M6b: delegated to the stub, so a test that seeds tags on it sees them
+        // through this double too.
+        async fn read_tags(&self, path: &Path) -> anyhow::Result<Vec<fs_core::Tag>> {
+            self.inner.read_tags(path).await
+        }
+
+        async fn write_tags(&self, path: &Path, tags: &[fs_core::Tag]) -> anyhow::Result<()> {
+            self.inner.write_tags(path, tags).await
+        }
+
+        async fn known_tags(&self) -> anyhow::Result<Vec<fs_core::Tag>> {
+            self.inner.known_tags().await
+        }
+
+        async fn set_ownership(
+            &self,
+            path: &Path,
+            owner: Option<&str>,
+            group: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.set_ownership(path, owner, group).await
+        }
     }
 
     /// One slow fetch, long enough that nothing completes until a test

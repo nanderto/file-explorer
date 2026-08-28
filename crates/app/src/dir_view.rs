@@ -78,7 +78,7 @@ use crate::actions::Cancel;
 use crate::actions::{
     CollapseSelected, Copy, Cut, DeleteToTrash, Duplicate, ExpandSelected, ExtendSelectionLeft,
     ExtendSelectionNext, ExtendSelectionPrev, ExtendSelectionRight, OpenSelected, PageDown, PageUp,
-    Paste, RenameSelected, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrev,
+    Paste, RenameSelected, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrev, ToggleTag,
 };
 use crate::app_state::FsContext;
 use crate::context_menu::{self, ContextMenuState};
@@ -88,6 +88,7 @@ use crate::pane::{Pane, ViewMode};
 use crate::rename::RenameState;
 use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionModel;
+use crate::tags::TagState;
 use crate::theme::Theme;
 use crate::thumbnails::ThumbnailState;
 use crate::views::{details_list, icon_grid};
@@ -133,7 +134,7 @@ pub(crate) fn projections_built() -> usize {
 
 /// A live search's result rows plus the folder they are a search *of* — what
 /// [`DirView::projected_rows`] builds its rows from while a query is on.
-type SearchProjection = (Arc<[FileEntry]>, Option<Arc<Path>>);
+type FilteredProjection = (Arc<[FileEntry]>, Option<Arc<Path>>);
 
 /// One visible row of the flat projection (§8): a snapshot entry or an
 /// injected child of an expanded folder, with its indentation depth.
@@ -213,6 +214,10 @@ pub struct DirView {
     /// the painted tiles reference, and the single-slot fetch task that
     /// cancels itself on scroll-away. See [`crate::thumbnails`].
     pub(crate) thumbnails: ThumbnailState,
+    /// Finder tag dots (M6b): the window-shaped tag cache, the tags the
+    /// `Tags ▸` submenu offers, and the single-slot read task that cancels
+    /// itself on scroll-away. See [`crate::tags`].
+    pub(crate) tags: TagState,
     /// The auto-hide scrollbar's visibility + fade timer (M4). See
     /// [`crate::scrollbar`].
     pub(crate) scrollbar: ScrollbarState,
@@ -258,6 +263,7 @@ impl DirView {
             drop: None,
             menu: None,
             thumbnails: ThumbnailState::default(),
+            tags: TagState::default(),
             scrollbar: ScrollbarState::default(),
             // One column until the first layout, which makes an unpainted
             // grid behave exactly like the list rather than dividing by zero.
@@ -585,7 +591,7 @@ impl DirView {
         // row band, the grid's `cols`, thumbnail windowing, the scrollbar's
         // content height) reads the projection, so it all keeps working with
         // no knowledge that a search is on.
-        if let Some((rows, root)) = self.search_projection(cx) {
+        if let Some((rows, root)) = self.filtered_projection(cx) {
             flat.extend(rows.iter().map(|entry| ProjectedRow {
                 search_parent: crate::search::search_parent_label(root.as_deref(), entry),
                 entry: entry.clone(),
@@ -633,13 +639,14 @@ impl DirView {
         flat
     }
 
-    /// The pane's live search results and the folder they are a search *of*,
-    /// or `None` when no search is on. Both come from the pane, which owns the
-    /// query and the walk ([`crate::search`]).
-    fn search_projection(&self, cx: &App) -> Option<SearchProjection> {
+    /// The pane's filtered rows — M6a's search results or M6b's tag filter —
+    /// and the folder they are a filter *of*, or `None` when the listing is
+    /// unfiltered. Both come from the pane, which owns the query, the walk and
+    /// the tag scan ([`crate::search`], [`crate::tags`]).
+    fn filtered_projection(&self, cx: &App) -> Option<FilteredProjection> {
         let pane = self.pane.upgrade()?;
         let pane = pane.read(cx);
-        let rows = pane.search_rows()?;
+        let rows = pane.filtered_rows()?;
         Some((rows, pane.path().map(Arc::from)))
     }
 
@@ -750,15 +757,16 @@ impl DirView {
         }
     }
 
-    /// Whether the pane is showing search results (M6a). Those are flat, so
-    /// every expansion gesture is inert while one is live: `left`/`right` do
+    /// Whether the pane is showing a *filtered* projection — search results
+    /// (M6a) or the sidebar's tag filter (M6b). Those are flat, so every
+    /// expansion gesture is inert while one is live: `left`/`right` do
     /// nothing, and no row paints a triangle to click. Expanding *into* the
     /// result set would mean showing children of a folder that is only on
     /// screen because its name matched — and the expansion state it left behind
     /// outlived the search, so clearing the query brought folders back
     /// pre-expanded over a stale cached listing.
     fn search_is_live(&self, cx: &App) -> bool {
-        self.search_projection(cx).is_some()
+        self.filtered_projection(cx).is_some()
     }
 
     /// Disclosure-triangle click (and visual-scenario driver): expand or
@@ -860,7 +868,7 @@ impl DirView {
                 // path-keyed selection must not keep acting on rows that left
                 // the projection.
                 let snapshot = this.snapshot(cx);
-                let search_rows = this.search_projection(cx).map(|(rows, _)| rows);
+                let search_rows = this.filtered_projection(cx).map(|(rows, _)| rows);
                 this.retain_selection_in_listing(snapshot.as_deref(), search_rows.as_deref(), cx);
                 cx.notify();
             })
@@ -1373,7 +1381,14 @@ impl Render for DirView {
             // handle, and both read the same path-keyed selection — which is
             // what makes switching mode a pure re-render.
             match view_mode {
-                ViewMode::List => details_list::render_rows(self, columns, cx).into_any_element(),
+                ViewMode::List => {
+                    // M6b: keep the visible band's tag dots coming, on the same
+                    // scroll-offset-derived window as the grid's thumbnails and
+                    // for the same reason (see `crate::tags`). One row per
+                    // entry here, so `cols` is 1.
+                    self.request_tags(1, details_list::ROW_HEIGHT, cx);
+                    details_list::render_rows(self, columns, cx).into_any_element()
+                }
                 ViewMode::Icons => {
                     // The one place `cols` is measured: from here on this
                     // frame — and every hit test against the pixels it paints
@@ -1388,6 +1403,8 @@ impl Render for DirView {
                     // flipped like that would cancel and restart its own
                     // fetch on every repaint.
                     self.request_thumbnails(cols, window, cx);
+                    // ...and the tiles' tag dots, off the same band (M6b).
+                    self.request_tags(cols, icon_grid::TILE_HEIGHT, cx);
                     icon_grid::render_grid(self, cols, cx).into_any_element()
                 }
             }
@@ -1518,6 +1535,12 @@ impl Render for DirView {
             )
             // §0 toolbar row (M3): duplicate with keep-both names.
             .on_action(cx.listener(|this, _: &Duplicate, _, cx| this.duplicate_selection(cx)))
+            // M6b `Tags ▸`: the menu's only entry point (no keybinding), which
+            // submits `FileOp::SetTags` through the job spine — so `cmd-z`
+            // undoes a tagging like any other operation.
+            .on_action(cx.listener(|this, action: &ToggleTag, _, cx| {
+                this.toggle_tag_on_selection(action.tag.clone(), cx)
+            }))
             // §8 context menu: `escape` dismisses it. Only reachable while the
             // `menu` token is on this node, so it never shadows the rename
             // editor's own `Cancel` (that row's `TextInput` node is deeper).

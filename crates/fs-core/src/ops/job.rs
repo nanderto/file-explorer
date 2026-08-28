@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::entry::EntryMeta;
 use crate::ops::FileOp;
+use crate::tags::Tag;
 use crate::vfs::TrashId;
 
 /// Identity of one submitted job.
@@ -23,6 +24,9 @@ pub enum JobKind {
     CreateFile,
     Duplicate,
     Delete,
+    Chmod,
+    Chown,
+    SetTags,
 }
 
 /// Summary emitted with [`JobEvent::Started`], after planning.
@@ -71,6 +75,29 @@ impl Resolution {
     }
 }
 
+/// One path's attribute value, captured **before** an attribute op changed it
+/// so undo can put back exactly what was there (M6b).
+///
+/// Also used the other way round, as an [`crate::AttrGuard`]'s `expected`: the
+/// value the job *left behind*, which must still hold for its undo to be safe.
+/// One type for both because the shape is identical and a second near-identical
+/// enum would be one more thing to keep in step.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrevAttrs {
+    /// Unix permission bits (`0o7777` window), from [`crate::Vfs::mode`].
+    Mode(u32),
+    /// Owner and group *names*, from [`crate::FileAttrs`]. Either may be
+    /// [`None`] when the platform could not resolve it — or, in a guard, when
+    /// the op did not ask to change that half.
+    Ownership {
+        owner: Option<String>,
+        group: Option<String>,
+    },
+    /// The whole Finder tag set, from [`crate::Platform::read_tags`]. An empty
+    /// vector is a real value ("this file had no tags"), not a missing one.
+    Tags(Vec<Tag>),
+}
+
 /// What a completed job actually did — everything the undo stack needs to
 /// build the inverse operation ([`crate::undo::UndoEntry::from_receipt`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +112,19 @@ pub struct OpReceipt {
     pub trashed: Vec<TrashId>,
     /// `(token, restored_path)` pairs this job restored.
     pub restored: Vec<(TrashId, PathBuf)>,
+    /// Per-path attribute values as they were **before** this job changed them
+    /// ([`FileOp::Chmod`] / [`FileOp::Chown`] / [`FileOp::SetTags`]), in the
+    /// order they were applied. Only paths that actually changed appear, so the
+    /// inverse built from it is exact even when part of the selection failed.
+    pub restored_attrs: Vec<(PathBuf, PrevAttrs)>,
+    /// Paths this job could **not** change, with the reason (an EPERM chmod, a
+    /// path that vanished mid-job). A non-empty `failed` alongside a non-empty
+    /// `restored_attrs` is a partial success: the job still completes, so what
+    /// did land stays undoable, and the UI reports the rest.
+    ///
+    /// Only the attribute ops populate this — every other op in the vocabulary
+    /// still fails the whole job on the first error (see `docs/AS_BUILT.md`).
+    pub failed: Vec<(PathBuf, String)>,
 }
 
 impl OpReceipt {
@@ -95,6 +135,8 @@ impl OpReceipt {
             moved: Vec::new(),
             trashed: Vec::new(),
             restored: Vec::new(),
+            restored_attrs: Vec::new(),
+            failed: Vec::new(),
         }
     }
 }

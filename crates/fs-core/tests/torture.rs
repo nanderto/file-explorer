@@ -14,15 +14,29 @@ use std::sync::Arc;
 
 use fs_core::{
     ConflictChoice, CopyCancelled, EntryKind, FakeVfs, FileOp, JobEvent, JobId, JobQueue,
-    OpReceipt, ProgressFn, RealVfs, RemoveOptions, Resolution, Spawner, TestSpawner, UndoEntry,
-    UndoOutcome, UndoStack, Vfs,
+    OpReceipt, Platform, PrevAttrs, ProgressFn, RealVfs, RemoveOptions, Resolution,
+    STUB_PRIVILEGED_OWNER, Spawner, Tag, TagColor, TestSpawner, UndoEntry, UndoOutcome, UndoStack,
+    Vfs,
 };
 use futures::StreamExt as _;
 use futures::executor::block_on;
 use serde_json::json;
 
+/// `MacPlatform` on macOS (so the M6b tag ops really touch the xattr), the
+/// portable stub elsewhere — CLAUDE.md's two-machine rule.
+#[cfg(target_os = "macos")]
+fn platform(spawner: Arc<dyn Spawner>) -> Arc<dyn Platform> {
+    Arc::new(fs_core::MacPlatform::new(spawner))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform(_spawner: Arc<dyn Spawner>) -> Arc<dyn Platform> {
+    Arc::new(fs_core::StubPlatform::new())
+}
+
 struct Harness {
     vfs: Arc<dyn Vfs>,
+    platform: Arc<dyn Platform>,
     queue: Arc<JobQueue>,
     events: async_channel::Receiver<JobEvent>,
     root: PathBuf,
@@ -36,10 +50,12 @@ impl Harness {
         let vfs: Arc<dyn Vfs> = Arc::new(RealVfs::new(spawner.clone()));
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        let queue = JobQueue::new(vfs.clone(), spawner);
+        let platform = platform(spawner.clone());
+        let queue = JobQueue::with_platform(vfs.clone(), platform.clone(), spawner);
         let events = queue.subscribe();
         Self {
             vfs,
+            platform,
             queue,
             events,
             root,
@@ -52,10 +68,12 @@ impl Harness {
         let fake = FakeVfs::new(spawner.clone());
         fake.insert_tree("/torture", json!({}));
         let vfs: Arc<dyn Vfs> = fake;
-        let queue = JobQueue::new(vfs.clone(), spawner);
+        let platform = platform(spawner.clone());
+        let queue = JobQueue::with_platform(vfs.clone(), platform.clone(), spawner);
         let events = queue.subscribe();
         Self {
             vfs,
+            platform,
             queue,
             events,
             root: PathBuf::from("/torture"),
@@ -513,6 +531,62 @@ fn every_file_op_runs_against_a_real_temp_tree() {
         "last restore cleans the .fake-trash root"
     );
 
+    // SetTags: the whole set is replaced, and the previous set is captured.
+    let tagged = root.join("work/report.pdf");
+    let id = harness.queue.submit(FileOp::SetTags {
+        paths: vec![tagged.clone()],
+        tags: vec![Tag::new("Red", TagColor::Red)],
+    });
+    let receipt = harness.expect_completed(id);
+    assert_eq!(
+        receipt.restored_attrs,
+        vec![(tagged.clone(), PrevAttrs::Tags(vec![]))],
+        "an untagged file's previous set is the empty one"
+    );
+    assert_eq!(
+        block_on(harness.platform.read_tags(&tagged)).unwrap(),
+        [Tag::new("Red", TagColor::Red)]
+    );
+    // Clear them again so the tree is left as it was found.
+    let id = harness.queue.submit(FileOp::SetTags {
+        paths: vec![tagged.clone()],
+        tags: vec![],
+    });
+    harness.expect_completed(id);
+    assert_eq!(
+        block_on(harness.platform.read_tags(&tagged)).unwrap(),
+        Vec::<Tag>::new()
+    );
+
+    // Chmod: file I/O, so it runs wherever there are unix permissions.
+    #[cfg(unix)]
+    {
+        block_on(harness.vfs.set_mode(&tagged, 0o644)).unwrap();
+        let id = harness.queue.submit(FileOp::Chmod {
+            paths: vec![tagged.clone()],
+            mode: 0o600,
+        });
+        let receipt = harness.expect_completed(id);
+        assert_eq!(
+            receipt.restored_attrs,
+            vec![(tagged.clone(), PrevAttrs::Mode(0o644))]
+        );
+        assert_eq!(block_on(harness.vfs.mode(&tagged)).unwrap(), Some(0o600));
+    }
+
+    // Chown: an unprivileged process may not give a file away, on either
+    // platform implementation. It must fail per path, not panic.
+    let id = harness.queue.submit(FileOp::Chown {
+        paths: vec![tagged.clone()],
+        owner: Some(STUB_PRIVILEGED_OWNER.to_string()),
+        group: None,
+    });
+    let terminal = harness.run_scripted(id, &[]);
+    assert!(
+        matches!(&terminal, JobEvent::Failed { error, .. } if error.contains("report.pdf")),
+        "unprivileged chown fails cleanly: {terminal:?}"
+    );
+
     // Delete: permanent, recursive, uninvertible receipt.
     let id = harness.queue.submit(FileOp::Delete {
         paths: vec![root.join("work/junk")],
@@ -522,4 +596,5 @@ fn every_file_op_runs_against_a_real_temp_tree() {
     assert!(receipt.created.is_empty());
     assert!(receipt.moved.is_empty());
     assert!(receipt.trashed.is_empty());
+    assert!(receipt.restored_attrs.is_empty());
 }

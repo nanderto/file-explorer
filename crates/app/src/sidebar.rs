@@ -10,6 +10,12 @@
 //!   unpins; every change persists immediately through `Vfs::atomic_write` on
 //!   the background executor. (Drag-to-add, context menus, and reordering
 //!   arrive at M3 with the drag infrastructure.)
+//! - **Tags** (M6b): the Finder tags [`fs_core::Platform::known_tags`] reports,
+//!   each with its fixed macOS palette dot. Clicking one filters the active
+//!   pane to the items in the open folder carrying it; clicking the lit one
+//!   again clears the filter. **Deliberate deviation:** Finder's tag click is a
+//!   volume-wide Spotlight query — see [`crate::tags`] and
+//!   `docs/AS_BUILT.md`.
 //! - **Folders**: an Explorer-style tree. Expanded nodes are flattened into a
 //!   `Vec<TreeRow>` rendered by `uniform_list`; disclosure triangles mutate
 //!   the expansion set and re-flatten (§8 flat-projection technique, shared
@@ -25,7 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs_core::{FileEntry, SortSpec, VolumeId, VolumeInfo, WatchGuard, list_dir, watch_volumes};
+use fs_core::{
+    FileEntry, SortSpec, Tag, VolumeId, VolumeInfo, WatchGuard, list_dir, watch_volumes,
+};
 use futures::StreamExt as _;
 use gpui::{
     Context, EventEmitter, ExternalPaths, IntoElement, Render, SharedString, Subscription, Task,
@@ -56,6 +64,9 @@ pub enum SidebarEvent {
     NavigateTo(PathBuf),
     /// Eject this volume (workspace runs `Platform::eject` off the UI thread).
     Eject(VolumeId),
+    /// Filter the active pane by a tag, or — with `None` — stop filtering
+    /// (M6b). Events up: the sidebar never touches a pane itself (§2).
+    FilterByTag(Option<Tag>),
 }
 
 /// The sidebar's collapsible sections.
@@ -63,6 +74,7 @@ pub enum SidebarEvent {
 pub enum Section {
     Devices,
     Favorites,
+    Tags,
     Tree,
 }
 
@@ -81,7 +93,15 @@ pub struct Sidebar {
     volumes: Vec<VolumeInfo>,
     collapsed_devices: bool,
     collapsed_favorites: bool,
+    collapsed_tags: bool,
     collapsed_tree: bool,
+    /// The tags the **Tags** section lists: the palette plus whatever the user
+    /// has, loaded once off the UI thread. Seeded with
+    /// [`fs_core::standard_tags`] so the section is never empty and the first
+    /// paint does no I/O.
+    tags: Vec<Tag>,
+    /// The one-shot `known_tags` load; a field, never detached (§5).
+    _tags_load: Option<Task<()>>,
     /// Expanded tree nodes, path-keyed so expansion survives re-flattening.
     expanded: BTreeSet<Arc<Path>>,
     /// Background-loaded, sorted, dirs-only child listings per tree node.
@@ -111,6 +131,7 @@ pub struct Sidebar {
 impl Sidebar {
     pub fn new(theme: Theme, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let fs = FsContext::global(cx);
+        let platform = fs.platform.clone();
         let (mut stream, guard) =
             watch_volumes(fs.platform.clone(), &fs.spawner, VOLUME_POLL_INTERVAL);
         let pump = cx.spawn(async move |this, cx| {
@@ -122,13 +143,34 @@ impl Sidebar {
             }
         });
         let settings_observer = cx.observe_global::<AppSettings>(|_, cx| cx.notify());
+        // M6b: the Tags section's rows. One `known_tags` call, on the
+        // background executor — the sidebar never touches the OS on the UI
+        // thread (§5), and the palette is already painted while it runs.
+        let tags_load = cx.spawn(async move |this, cx| {
+            let known = cx
+                .background_executor()
+                .spawn(async move { platform.known_tags().await })
+                .await;
+            if let Ok(known) = known
+                && !known.is_empty()
+            {
+                this.update(cx, |this, cx| {
+                    this.tags = known;
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
         Self {
             theme,
             workspace,
             volumes: Vec::new(),
             collapsed_devices: false,
             collapsed_favorites: false,
+            collapsed_tags: false,
             collapsed_tree: false,
+            tags: fs_core::standard_tags(),
+            _tags_load: Some(tags_load),
             expanded: BTreeSet::new(),
             children: HashMap::new(),
             flat: Vec::new(),
@@ -292,6 +334,7 @@ impl Sidebar {
         match section {
             Section::Devices => self.collapsed_devices,
             Section::Favorites => self.collapsed_favorites,
+            Section::Tags => self.collapsed_tags,
             Section::Tree => self.collapsed_tree,
         }
     }
@@ -300,6 +343,7 @@ impl Sidebar {
         let flag = match section {
             Section::Devices => &mut self.collapsed_devices,
             Section::Favorites => &mut self.collapsed_favorites,
+            Section::Tags => &mut self.collapsed_tags,
             Section::Tree => &mut self.collapsed_tree,
         };
         *flag = !*flag;
@@ -675,6 +719,87 @@ impl Sidebar {
         div().flex().flex_col().children(rows)
     }
 
+    /// The tags the section lists (the palette plus the user's).
+    pub fn tags(&self) -> &[Tag] {
+        &self.tags
+    }
+
+    /// The tag the **active pane** is currently filtered by, read straight off
+    /// that pane rather than mirrored here: the pane also drops the filter on
+    /// its own (navigating away), and a mirror would keep a row lit for a
+    /// filter that is gone.
+    pub fn active_tag(&self, cx: &gpui::App) -> Option<Tag> {
+        let workspace = self.workspace.upgrade()?;
+        let pane = workspace.read(cx).active_pane().clone();
+        pane.read(cx)
+            .tag_filter()
+            .map(|filter| filter.tag().clone())
+    }
+
+    /// Click a tag row: filter the active pane by it, or clear the filter when
+    /// the lit row is clicked again (Finder's toggle).
+    pub fn toggle_tag_filter(&mut self, tag: &Tag, cx: &mut Context<Self>) {
+        let active = self.active_tag(cx);
+        let next = if active.as_ref() == Some(tag) {
+            None
+        } else {
+            Some(tag.clone())
+        };
+        cx.emit(SidebarEvent::FilterByTag(next));
+        cx.notify();
+    }
+
+    /// The **Tags** section's rows: the palette dot, the name, and the active
+    /// row tinted like a selected favorite. Every colour but the dot comes from
+    /// the theme — the dot is macOS's (see [`crate::tags`]).
+    fn render_tags(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = self.theme.clone();
+        let active = self.active_tag(cx);
+        let rows: Vec<_> = self
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(ix, tag)| {
+                let is_active = active.as_ref() == Some(tag);
+                let clicked = tag.clone();
+                let name = SharedString::new(&tag.name);
+                let mut row = div()
+                    .id(("sidebar-tag", ix))
+                    .debug_selector(|| format!("sidebar-tag-{ix}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(16.0))
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.accent.opacity(0.15)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_tag_filter(&clicked, cx);
+                    }))
+                    .children(crate::tags::tag_dot(tag.color).or_else(|| {
+                        // An uncoloured tag still needs the dot's width, or its
+                        // name would not line up under the coloured ones.
+                        Some(
+                            div()
+                                .flex_none()
+                                .w(px(crate::tags::TAG_DOT_PX))
+                                .h(px(crate::tags::TAG_DOT_PX))
+                                .rounded(px(crate::tags::TAG_DOT_PX / 2.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .into_any_element(),
+                        )
+                    }))
+                    .child(div().flex_1().truncate().child(name));
+                if is_active {
+                    row = row.bg(theme.accent.opacity(FAVORITE_REORDER_ALPHA));
+                }
+                row
+            })
+            .collect();
+        div().flex().flex_col().children(rows)
+    }
+
     fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         uniform_list(
             "sidebar-tree",
@@ -749,6 +874,10 @@ impl Render for Sidebar {
             root = root.child(self.render_devices(cx));
         }
         root = root.child(self.favorites_section(&favorites, cx));
+        root = root.child(self.section_header(Section::Tags, "Tags", false, cx));
+        if !self.collapsed_tags {
+            root = root.child(self.render_tags(cx));
+        }
         root = root.child(self.section_header(Section::Tree, "Folders", false, cx));
         if !self.collapsed_tree {
             root = root.child(self.render_tree(cx));

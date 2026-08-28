@@ -51,10 +51,21 @@ use crate::jobs_model::JobsEvent;
 /// Shared by every view mode that can host the editor — the details row
 /// (`views/details_list.rs`) and the grid tile (`views/icon_grid.rs`) — so
 /// the wiring, like every other command in §0, exists exactly once.
-pub(crate) fn with_editor_actions<E: gpui::InteractiveElement>(
+///
+/// Generic over the *view*, not just over the element: M6b's permission
+/// fields (`info_panel.rs`) are an inline editor on an [`InfoPanel`], not on
+/// a [`DirView`], and they need exactly this dispatch node. `confirm` and
+/// `cancel` are the only parts that differ, so they come in as function
+/// items — a third hand-copied block of `forward!` arms is precisely what
+/// this helper exists to prevent.
+///
+/// [`InfoPanel`]: crate::info_panel::InfoPanel
+pub(crate) fn with_editor_actions<V: 'static, E: gpui::InteractiveElement>(
     element: E,
     input: &Entity<InputState>,
-    cx: &mut Context<DirView>,
+    cx: &mut Context<V>,
+    confirm: fn(&mut V, &mut Window, &mut Context<V>),
+    cancel: fn(&mut V, &mut Window, &mut Context<V>),
 ) -> E {
     use crate::input::text_input as ti;
 
@@ -62,8 +73,8 @@ pub(crate) fn with_editor_actions<E: gpui::InteractiveElement>(
     let mut element = element
         .track_focus(&focus)
         .key_context("TextInput")
-        .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm_rename(window, cx)))
-        .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel_rename(window, cx)));
+        .on_action(cx.listener(move |this, _: &Confirm, window, cx| confirm(this, window, cx)))
+        .on_action(cx.listener(move |this, _: &Cancel, window, cx| cancel(this, window, cx)));
     macro_rules! forward {
         ($action:ty, $method:ident) => {{
             let input = input.clone();

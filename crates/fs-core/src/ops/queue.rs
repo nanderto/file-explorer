@@ -22,9 +22,11 @@ use futures::channel::oneshot;
 use crate::entry::{EntryKind, EntryMeta};
 use crate::exec::Spawner;
 use crate::ops::job::{
-    Conflict, ConflictChoice, JobEvent, JobId, JobInfo, JobKind, OpReceipt, Resolution,
+    Conflict, ConflictChoice, JobEvent, JobId, JobInfo, JobKind, OpReceipt, PrevAttrs, Resolution,
 };
 use crate::ops::{FileOp, keep_both_candidates};
+use crate::platform::Platform;
+use crate::tags::Tag;
 use crate::vfs::{
     CopyCancelled, CreateOptions, ProgressFn, RemoveOptions, RenameOptions, Vfs, VolumeKey,
 };
@@ -32,6 +34,13 @@ use crate::vfs::{
 /// Serial-per-destination-volume executor for [`FileOp`]s.
 pub struct JobQueue {
     vfs: Arc<dyn Vfs>,
+    /// Only the M6b attribute ops need it (owner/group name resolution and the
+    /// Finder-tag xattr are OS services, not file I/O), so it is optional
+    /// rather than a breaking change to [`JobQueue::new`]: a queue built
+    /// without one runs every other op exactly as before and fails
+    /// [`FileOp::Chown`]/[`FileOp::SetTags`] with a plain message instead of
+    /// silently doing nothing.
+    platform: Option<Arc<dyn Platform>>,
     spawner: Arc<dyn Spawner>,
     events_tx: async_channel::Sender<JobEvent>,
     events_rx: async_channel::Receiver<JobEvent>,
@@ -55,6 +64,17 @@ struct QueuedJob {
     op: FileOp,
 }
 
+/// Which attribute one [`JobQueue::run_attrs`] pass writes — the op's payload
+/// with its path list stripped off, so the three attribute ops share one loop.
+enum AttrChange {
+    Mode(u32),
+    Ownership {
+        owner: Option<String>,
+        group: Option<String>,
+    },
+    Tags(Vec<Tag>),
+}
+
 /// One step of a planned copy tree, in parent-before-child order.
 enum PlannedAction {
     EnsureDir {
@@ -69,15 +89,43 @@ enum PlannedAction {
 }
 
 impl JobQueue {
+    /// A queue without platform services: everything but [`FileOp::Chown`] and
+    /// [`FileOp::SetTags`] works. Prefer [`JobQueue::with_platform`] in the app.
     pub fn new(vfs: Arc<dyn Vfs>, spawner: Arc<dyn Spawner>) -> Arc<Self> {
+        Self::build(vfs, None, spawner)
+    }
+
+    /// A queue that can also run the attribute ops that need OS services
+    /// ([`Platform::set_ownership`], [`Platform::read_tags`]/`write_tags`).
+    pub fn with_platform(
+        vfs: Arc<dyn Vfs>,
+        platform: Arc<dyn Platform>,
+        spawner: Arc<dyn Spawner>,
+    ) -> Arc<Self> {
+        Self::build(vfs, Some(platform), spawner)
+    }
+
+    fn build(
+        vfs: Arc<dyn Vfs>,
+        platform: Option<Arc<dyn Platform>>,
+        spawner: Arc<dyn Spawner>,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = async_channel::unbounded();
         Arc::new(Self {
             vfs,
+            platform,
             spawner,
             events_tx,
             events_rx,
             state: Mutex::new(QueueState::default()),
         })
+    }
+
+    /// The platform services this queue was built with, if any — undo's
+    /// attribute guards read tags and ownership back through it
+    /// ([`crate::UndoStack`] is given the queue, not a platform).
+    pub fn platform(&self) -> Option<Arc<dyn Platform>> {
+        self.platform.clone()
     }
 
     /// The queue's event stream. Single-consumer by contract (the JobsModel);
@@ -286,7 +334,127 @@ impl JobQueue {
                 // Permanent removal has no inverse: an empty receipt.
                 Ok(Some(OpReceipt::empty(op)))
             }
+            FileOp::Chmod { paths, mode } => {
+                self.run_attrs(id, op, paths, AttrChange::Mode(mode), cancelled)
+                    .await
+            }
+            FileOp::Chown {
+                paths,
+                owner,
+                group,
+            } => {
+                self.run_attrs(
+                    id,
+                    op,
+                    paths,
+                    AttrChange::Ownership { owner, group },
+                    cancelled,
+                )
+                .await
+            }
+            FileOp::SetTags { paths, tags } => {
+                self.run_attrs(id, op, paths, AttrChange::Tags(tags), cancelled)
+                    .await
+            }
         }
+    }
+
+    /// The shared spine of the three attribute ops (M6b): one pass over the
+    /// paths, cancel checked between them, the previous value captured before
+    /// each change so undo is exact, and a per-path failure recorded rather
+    /// than aborting the selection.
+    ///
+    /// Partial-failure contract, deliberately **different** from the copy/move
+    /// ops: those fail the whole job on the first error, and the app records no
+    /// undo entry for a `Failed` job — which for a half-applied chmod over 200
+    /// files would mean 200 changed modes and no way back. So here every path
+    /// is attempted, successes land in [`OpReceipt::restored_attrs`] and
+    /// failures in [`OpReceipt::failed`], and the job completes as long as at
+    /// least one path changed. Only a job where **nothing** changed fails
+    /// outright — nothing was applied, so there is nothing to undo.
+    async fn run_attrs(
+        &self,
+        id: JobId,
+        op: FileOp,
+        paths: Vec<PathBuf>,
+        change: AttrChange,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Option<OpReceipt>> {
+        let total = paths.len() as u64;
+        self.emit_started(id, op.kind(), total, total);
+        let mut receipt = OpReceipt::empty(op);
+        for (index, path) in paths.iter().enumerate() {
+            if cancelled.load(Ordering::SeqCst) {
+                // Same as a cancelled multi-file move: the terminal event is
+                // Cancelled, which carries no receipt, so whatever was already
+                // applied is not undoable. Recorded as a Known gap.
+                return Ok(None);
+            }
+            self.emit(JobEvent::Progress {
+                id,
+                done_bytes: index as u64,
+                total_bytes: total,
+                current: path.clone(),
+            });
+            match self.apply_attr(path, &change).await {
+                Ok(previous) => receipt.restored_attrs.push((path.clone(), previous)),
+                Err(error) => receipt.failed.push((path.clone(), error.to_string())),
+            }
+        }
+        if receipt.restored_attrs.is_empty() && !receipt.failed.is_empty() {
+            let reasons: Vec<String> = receipt
+                .failed
+                .iter()
+                .map(|(path, reason)| format!("{}: {reason}", path.display()))
+                .collect();
+            bail!("{}", reasons.join("; "));
+        }
+        Ok(Some(receipt))
+    }
+
+    /// Apply one attribute change to one path, returning the value it replaced.
+    ///
+    /// Every arm **captures before it writes**: a change whose previous value
+    /// was never read is not undoable, and a failed capture (a path that
+    /// vanished) must not be followed by a write.
+    async fn apply_attr(&self, path: &Path, change: &AttrChange) -> Result<PrevAttrs> {
+        match change {
+            AttrChange::Mode(mode) => {
+                let previous = self
+                    .vfs
+                    .mode(path)
+                    .await?
+                    .ok_or_else(|| anyhow!("{} has no unix permissions", path.display()))?;
+                self.vfs.set_mode(path, *mode).await?;
+                Ok(PrevAttrs::Mode(previous))
+            }
+            // Both halves of the previous value are captured even when the op
+            // changes only one, so the inverse is a single self-contained
+            // `FileOp::Chown`.
+            AttrChange::Ownership { owner, group } => {
+                let platform = self.platform_or_err("changing ownership")?;
+                let attrs = platform.file_attrs(path).await?;
+                platform
+                    .set_ownership(path, owner.as_deref(), group.as_deref())
+                    .await?;
+                Ok(PrevAttrs::Ownership {
+                    owner: attrs.owner,
+                    group: attrs.group,
+                })
+            }
+            AttrChange::Tags(tags) => {
+                let platform = self.platform_or_err("changing Finder tags")?;
+                let previous = platform.read_tags(path).await?;
+                platform.write_tags(path, tags).await?;
+                Ok(PrevAttrs::Tags(previous))
+            }
+        }
+    }
+
+    fn platform_or_err(&self, what: &str) -> Result<Arc<dyn Platform>> {
+        self.platform.clone().ok_or_else(|| {
+            anyhow!("{what} needs platform services: this JobQueue was built without a Platform")
+        })
     }
 
     /// Copy `pairs` of `(source, dest_dir)`. Keep-both names are resolved at
@@ -798,6 +966,8 @@ impl Drop for JobTracker {
 mod tests {
     use super::*;
     use crate::exec::TestSpawner;
+    use crate::platform::{STUB_PRIVILEGED_OWNER, StubPlatform};
+    use crate::tags::{Tag, TagColor};
     use crate::vfs::FakeVfs;
     use futures::executor::block_on;
     use serde_json::json;
@@ -812,6 +982,38 @@ mod tests {
         let queue = JobQueue::new(vfs.clone() as Arc<dyn Vfs>, spawner);
         let events = queue.subscribe();
         (vfs, queue, events)
+    }
+
+    /// A queue with platform services, for the M6b attribute ops.
+    fn setup_with_platform() -> (
+        Arc<FakeVfs>,
+        Arc<StubPlatform>,
+        Arc<JobQueue>,
+        async_channel::Receiver<JobEvent>,
+    ) {
+        let spawner: Arc<dyn Spawner> = Arc::new(TestSpawner::new());
+        let vfs = FakeVfs::new(spawner.clone());
+        let platform = Arc::new(StubPlatform::new());
+        let queue = JobQueue::with_platform(
+            vfs.clone() as Arc<dyn Vfs>,
+            platform.clone() as Arc<dyn Platform>,
+            spawner,
+        );
+        let events = queue.subscribe();
+        (vfs, platform, queue, events)
+    }
+
+    fn mode_of(vfs: &Arc<FakeVfs>, path: &str) -> u32 {
+        block_on(vfs.mode(Path::new(path)))
+            .expect("mode readable")
+            .expect("fake vfs models a mode")
+    }
+
+    fn mtime_of(vfs: &Arc<FakeVfs>, path: &str) -> std::time::SystemTime {
+        block_on(vfs.metadata(Path::new(path)))
+            .unwrap()
+            .expect("exists")
+            .modified
     }
 
     fn recv(events: &async_channel::Receiver<JobEvent>) -> JobEvent {
@@ -1295,6 +1497,288 @@ mod tests {
         assert!(
             matches!(seen.last(), Some(JobEvent::Failed { id: i, .. }) if *i == id),
             "{seen:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // M6b attribute ops: Chmod / Chown / SetTags on the same job spine.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn chmod_job_changes_every_path_and_captures_each_previous_mode() {
+        let (vfs, _platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a", "b.sh": "b" }));
+        // A mixed selection: the two paths start at different modes.
+        block_on(vfs.set_mode(Path::new("/d/b.sh"), 0o755)).unwrap();
+        let mtime_before = mtime_of(&vfs, "/d/a.txt");
+
+        let id = queue.submit(FileOp::Chmod {
+            paths: vec![PathBuf::from("/d/a.txt"), PathBuf::from("/d/b.sh")],
+            mode: 0o600,
+        });
+        let seen = drain_until_terminal(&events, id);
+        let receipt = receipt_of(&seen, id);
+
+        assert_eq!(mode_of(&vfs, "/d/a.txt"), 0o600);
+        assert_eq!(mode_of(&vfs, "/d/b.sh"), 0o600);
+        assert_eq!(
+            receipt.restored_attrs,
+            vec![
+                (PathBuf::from("/d/a.txt"), PrevAttrs::Mode(0o644)),
+                (PathBuf::from("/d/b.sh"), PrevAttrs::Mode(0o755)),
+            ],
+            "each path's own previous mode is captured, not one flattened value"
+        );
+        assert!(receipt.failed.is_empty());
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, JobEvent::Progress { id: i, .. } if *i == id)),
+            "per-path progress is emitted like every other op: {seen:?}"
+        );
+        assert_eq!(
+            mtime_of(&vfs, "/d/a.txt"),
+            mtime_before,
+            "chmod changes ctime, not mtime — the whole reason undo needs an \
+             AttrGuard instead of a fingerprint"
+        );
+    }
+
+    #[test]
+    fn chmod_masks_the_mode_to_the_permission_bits() {
+        let (vfs, _platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a" }));
+        // 0o100644 is a full st_mode (regular-file type bits included); chmod
+        // may not touch the type, so only the low bits land.
+        let id = queue.submit(FileOp::Chmod {
+            paths: vec![PathBuf::from("/d/a.txt")],
+            mode: 0o100_644,
+        });
+        drain_until_terminal(&events, id);
+        assert_eq!(mode_of(&vfs, "/d/a.txt"), 0o644);
+    }
+
+    #[test]
+    fn a_denied_or_vanished_path_is_reported_and_the_rest_still_changes() {
+        let (vfs, _platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "ok.txt": "o", "denied.txt": "d" }));
+        vfs.set_error("/d/denied.txt", "Permission denied (os error 1)");
+
+        let id = queue.submit(FileOp::Chmod {
+            paths: vec![
+                PathBuf::from("/d/ok.txt"),
+                PathBuf::from("/d/denied.txt"),
+                PathBuf::from("/d/gone.txt"),
+            ],
+            mode: 0o640,
+        });
+        let seen = drain_until_terminal(&events, id);
+        let receipt = receipt_of(&seen, id);
+
+        assert_eq!(
+            mode_of(&vfs, "/d/ok.txt"),
+            0o640,
+            "the good path went through"
+        );
+        assert_eq!(
+            receipt.restored_attrs,
+            vec![(PathBuf::from("/d/ok.txt"), PrevAttrs::Mode(0o644))],
+            "only what actually changed is undoable"
+        );
+        let failed: Vec<&str> = receipt
+            .failed
+            .iter()
+            .map(|(path, _)| path.to_str().unwrap())
+            .collect();
+        assert_eq!(failed, ["/d/denied.txt", "/d/gone.txt"]);
+        assert!(
+            receipt.failed[0].1.contains("Permission denied"),
+            "the EPERM reason survives to the UI: {:?}",
+            receipt.failed[0]
+        );
+        assert!(
+            receipt.failed[1].1.contains("no such file"),
+            "{:?}",
+            receipt.failed[1]
+        );
+        assert!(
+            matches!(seen.last(), Some(JobEvent::Completed { .. })),
+            "a partial success completes (so the applied half stays undoable)"
+        );
+    }
+
+    #[test]
+    fn an_attribute_job_that_changes_nothing_fails_and_names_every_reason() {
+        let (vfs, _platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({}));
+        let id = queue.submit(FileOp::Chmod {
+            paths: vec![PathBuf::from("/d/gone.txt"), PathBuf::from("/d/also.txt")],
+            mode: 0o600,
+        });
+        let seen = drain_until_terminal(&events, id);
+        let Some(JobEvent::Failed { error, .. }) = seen.last() else {
+            panic!("expected Failed, got {seen:?}");
+        };
+        assert!(error.contains("/d/gone.txt"), "{error}");
+        assert!(error.contains("/d/also.txt"), "{error}");
+    }
+
+    #[test]
+    fn chown_reports_eperm_without_panicking_and_changes_nothing() {
+        let (vfs, platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a" }));
+        let id = queue.submit(FileOp::Chown {
+            paths: vec![PathBuf::from("/d/a.txt")],
+            owner: Some(STUB_PRIVILEGED_OWNER.to_string()),
+            group: None,
+        });
+        let seen = drain_until_terminal(&events, id);
+        let Some(JobEvent::Failed { error, .. }) = seen.last() else {
+            panic!("expected Failed, got {seen:?}");
+        };
+        assert!(error.contains("not permitted"), "{error}");
+        assert_eq!(
+            block_on(platform.file_attrs(Path::new("/d/a.txt")))
+                .unwrap()
+                .owner
+                .as_deref(),
+            Some("stub-owner"),
+            "a denied chown leaves the ownership alone"
+        );
+    }
+
+    #[test]
+    fn chown_captures_both_halves_even_when_only_one_changes() {
+        let (vfs, platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a" }));
+        let id = queue.submit(FileOp::Chown {
+            paths: vec![PathBuf::from("/d/a.txt")],
+            owner: None,
+            group: Some("wheel".to_string()),
+        });
+        let receipt = receipt_of(&drain_until_terminal(&events, id), id);
+        assert_eq!(
+            receipt.restored_attrs,
+            vec![(
+                PathBuf::from("/d/a.txt"),
+                PrevAttrs::Ownership {
+                    owner: Some("stub-owner".to_string()),
+                    group: Some("stub-group".to_string()),
+                }
+            )],
+            "the inverse must be able to put both halves back"
+        );
+        let attrs = block_on(platform.file_attrs(Path::new("/d/a.txt"))).unwrap();
+        assert_eq!(attrs.group.as_deref(), Some("wheel"));
+        assert_eq!(
+            attrs.owner.as_deref(),
+            Some("stub-owner"),
+            "owner untouched"
+        );
+    }
+
+    #[test]
+    fn set_tags_captures_the_previous_set_and_writes_the_new_one() {
+        let (vfs, platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a", "b.txt": "b" }));
+        platform.seed_tags("/d/a.txt", vec![Tag::new("Work", TagColor::Blue)]);
+
+        let tags = vec![Tag::new("Red", TagColor::Red), Tag::uncolored("Later")];
+        let id = queue.submit(FileOp::SetTags {
+            paths: vec![PathBuf::from("/d/a.txt"), PathBuf::from("/d/b.txt")],
+            tags: tags.clone(),
+        });
+        let receipt = receipt_of(&drain_until_terminal(&events, id), id);
+
+        assert_eq!(
+            block_on(platform.read_tags(Path::new("/d/a.txt"))).unwrap(),
+            tags
+        );
+        assert_eq!(
+            block_on(platform.read_tags(Path::new("/d/b.txt"))).unwrap(),
+            tags
+        );
+        assert_eq!(
+            receipt.restored_attrs,
+            vec![
+                (
+                    PathBuf::from("/d/a.txt"),
+                    PrevAttrs::Tags(vec![Tag::new("Work", TagColor::Blue)])
+                ),
+                // An untagged file's previous value is the empty set — a real
+                // value, so undo clears the tags again rather than skipping it.
+                (PathBuf::from("/d/b.txt"), PrevAttrs::Tags(vec![])),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_tag_set_clears_the_tags() {
+        let (vfs, platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a" }));
+        platform.seed_tags("/d/a.txt", vec![Tag::new("Work", TagColor::Blue)]);
+        let id = queue.submit(FileOp::SetTags {
+            paths: vec![PathBuf::from("/d/a.txt")],
+            tags: vec![],
+        });
+        drain_until_terminal(&events, id);
+        assert_eq!(
+            block_on(platform.read_tags(Path::new("/d/a.txt"))).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn platformless_queue_fails_the_ops_that_need_os_services() {
+        // Chmod is file I/O and still works; tags and ownership are OS
+        // services and say so instead of silently doing nothing.
+        let (vfs, queue, events) = setup();
+        vfs.insert_tree("/d", json!({ "a.txt": "a" }));
+
+        let id = queue.submit(FileOp::Chmod {
+            paths: vec![PathBuf::from("/d/a.txt")],
+            mode: 0o600,
+        });
+        drain_until_terminal(&events, id);
+        assert_eq!(mode_of(&vfs, "/d/a.txt"), 0o600);
+
+        for op in [
+            FileOp::SetTags {
+                paths: vec![PathBuf::from("/d/a.txt")],
+                tags: vec![Tag::new("Work", TagColor::Blue)],
+            },
+            FileOp::Chown {
+                paths: vec![PathBuf::from("/d/a.txt")],
+                owner: Some("someone".to_string()),
+                group: None,
+            },
+        ] {
+            let id = queue.submit(op);
+            let seen = drain_until_terminal(&events, id);
+            let Some(JobEvent::Failed { error, .. }) = seen.last() else {
+                panic!("expected Failed, got {seen:?}");
+            };
+            assert!(error.contains("without a Platform"), "{error}");
+        }
+    }
+
+    #[test]
+    fn cancelling_an_attribute_job_stops_between_paths() {
+        let (vfs, _platform, queue, events) = setup_with_platform();
+        vfs.insert_tree("/d", json!({ "a.txt": "a" }));
+        let id = queue.submit(FileOp::Chmod {
+            paths: vec![PathBuf::from("/d/a.txt")],
+            mode: 0o600,
+        });
+        queue.cancel(id);
+        let seen = drain_until_terminal(&events, id);
+        assert!(
+            matches!(seen.last(), Some(JobEvent::Cancelled { id: i }) if *i == id),
+            "{seen:?}"
+        );
+        assert_eq!(
+            mode_of(&vfs, "/d/a.txt"),
+            0o644,
+            "cancelled before the first path: nothing was applied"
         );
     }
 }

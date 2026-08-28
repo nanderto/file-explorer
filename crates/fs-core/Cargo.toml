@@ -46,6 +46,11 @@ objc2-quick-look-thumbnailing = { version = "0.3", features = [
 image = { workspace = true, features = ["bmp", "gif", "jpeg", "tiff", "webp"] }
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
+    # M6b Finder tags: NSPropertyListSerialization (+ its NSData currency type)
+    # writes the binary plist Finder stores in _kMDItemUserTags and reads back
+    # either binary or XML. Features on an existing dependency, not a new crate.
+    "NSData",
+    "NSPropertyList",
     # NSDate: M5 reads NSURLAddedToDirectoryDateKey ("Date Added") as an NSDate.
     "NSDate",
     "NSDictionary",

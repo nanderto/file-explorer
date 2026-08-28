@@ -404,6 +404,77 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     is inserted with `FakeVfs::insert_file` after `insert_tree`, not as a
     fixture key, because `FakeVfs` mtimes come from an insertion-order counter
     and a new key inside the tree would shift every node declared after it.
+  - **M6b: the section is live.** The R/W/X grid, the octal box and the
+    Owner/Group boxes all write, and every one of them writes *through the job
+    queue* (`FileOp::Chmod` / `FileOp::Chown`) — the panel owns no `Vfs` or
+    `Platform` call of its own, so a permission change is undoable with
+    `cmd-z`, cancellable, reported as a toast when it is refused, and off the
+    UI thread, exactly like a copy. A click on one box submits the whole
+    flipped mode (`toggled_mode`, which preserves the setuid/setgid/sticky
+    bits the nine-box grid cannot show); the octal box is the only way to
+    reach those bits, and it accepts one to four octal digits and nothing
+    else (`parse_octal_mode` — junk closes the editor and writes nothing
+    rather than guessing). The editor itself is one replaceable slot
+    (`InfoPanel::edit`) built on the same vendored `InputState` the rename
+    overlay uses, wired with the *same* `rename::with_editor_actions`, which
+    this milestone made generic over the view and its confirm/cancel pair
+    rather than copying a third block of action-forwarding arms. `Enter`
+    commits, `Escape` and blur abandon, and focus goes back to whatever had it
+    before.
+  - **No optimism.** The panel never paints the value it hopes for: `chmod`'s
+    honest failure mode is refusal (`EPERM` on anything the user does not own,
+    and on a locked file), so the grid keeps showing what was last *read*
+    until the job completes. Completion is also the only thing that can
+    refresh it — an attribute write moves no directory entry and no mtime, so
+    no pane watcher can see it — which is why `Workspace::handle_jobs_event`
+    calls `InfoPanel::reload` for any receipt carrying non-tag
+    `restored_attrs`. Undo and redo come back through the same path.
+  - **Editable, not clickable-looking:** `checkbox(theme, checked, live)` takes
+    the liveness as a *visual* argument. The permission grid passes `true`
+    once its mode has been read and is drawn at full strength; Hide Extension,
+    Hidden and Locked pass `false` and stay dimmed, and nothing is live before
+    the load lands (a click on a grid of em dashes would submit a mode nobody
+    chose — unit-tested).
+  - **Deviation: Owner and Group are name fields, not dropdowns.** The
+    blueprint draws them as popups. Listing the machine's accounts needs a
+    directory-service enumeration `fs_core::Platform` does not have — it can
+    *set* an owner by name (`set_ownership`) but not list candidates — and a
+    dropdown whose only row is the current owner cannot change anything, so
+    the chevron is gone rather than decorative.
+- `tags.rs` (M6b, §6 `tags.rs`, plan §7's M6 tag line): Finder tags in the UI,
+  three machines in one file, none of them a new shape.
+  - `TagState` — a **field of `DirView`** holding the window-shaped tag cache
+    and one cancellable `Task`. A tag set is one `getxattr` per path, so it
+    loads exactly the way `thumbnails.rs` loads previews: the visible band
+    plus a margin, from the scroll offset and viewport (**not** the row range
+    `uniform_list` hands its processor, which gpui calls with `0..1` twice a
+    frame just to measure — the M4 bug that stopped every thumbnail loading),
+    cancelled when the band moves, always on the background executor.
+  - `TagFilter` — a **field of `Pane`**, the sidebar's "show me what is tagged
+    Red". It invents no second projection: its rows are served through
+    `Pane::filtered_rows`, the same accessor M6a's search results go through,
+    so marquee, drag & drop, the context menu, the icon grid, thumbnails, the
+    scrollbar and selection pruning all keep working knowing nothing about it.
+    The scan is M6a's pump shape — background walk, channel, batches folded in
+    on `SEARCH_THROTTLE` — and it *replaces* a live search rather than
+    stacking with it.
+  - The `Tags ▸` submenu's write path (`DirView::toggle_tag_on_selection`),
+    which reads the current sets off the UI thread, plans the toggle
+    (`plan_tag_toggle`: one job per distinct resulting set, so a mixed
+    selection is brought up to the tag without rewriting the items that
+    already have it) and submits `FileOp::SetTags` through the queue — so a
+    tagging is undoable like every other file operation.
+  - **Tag colours are the one exception to "no hard-coded colors in
+    `crates/app`"**, and they are not hard-coded here either: they come from
+    `fs_core::TagColor::rgba`, macOS's fixed palette (plan §6 says so). A dot
+    that is not the colour Finder paints is the wrong dot, so it cannot be a
+    theme value. Everything else — text, hover, the active row's tint — is
+    the theme as usual.
+- `sidebar.rs` gained a **Tags** section (M6b) between Favorites and Folders:
+  the palette plus whatever `Platform::known_tags` reports, one row per tag
+  with its dot, collapsible like the others, and clicking a row emits
+  `SidebarEvent::FilterByTag` — a toggle, so clicking the active tag clears
+  the filter.
 - `search.rs` (M6a, §0 "Search field focus", §8's TextInput row "reused by
   address bar, rename, **search**"): the toolbar search, in two halves in one
   file — the `SearchBar` entity and a `SearchState` machine that is a *field of

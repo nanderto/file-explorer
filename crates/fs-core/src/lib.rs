@@ -20,6 +20,15 @@
 //! M6a adds [`search`]: the pure per-keystroke name filter over a loaded
 //! listing, and the breadth-first streamed recursive walk under a folder.
 //!
+//! M6b adds [`tags`]: the Finder-tag model and the pure codec for the
+//! `com.apple.metadata:_kMDItemUserTags` payload, plus
+//! [`platform::Platform::read_tags`]/`write_tags`/`known_tags`. It also grows
+//! the mutation surface with three attribute ops on the same job spine —
+//! [`ops::FileOp::Chmod`] (via [`vfs::Vfs::mode`]/`set_mode`),
+//! [`ops::FileOp::Chown`] (via [`platform::Platform::set_ownership`]) and
+//! [`ops::FileOp::SetTags`] — each capturing the previous value so undo is
+//! exact ([`undo::AttrGuard`]).
+//!
 //! M5 backs the info panel with [`attrs`]: unix permissions, the
 //! multi-selection summary, the previewable-type gate, and
 //! [`platform::Platform::file_attrs`] for the attributes that need an OS call.
@@ -33,6 +42,7 @@ pub mod ops;
 pub mod platform;
 pub mod search;
 pub mod sort;
+pub mod tags;
 pub mod thumbnail;
 pub mod undo;
 pub mod vfs;
@@ -51,28 +61,31 @@ pub use listing::{
 };
 pub use ops::{
     Conflict, ConflictChoice, FileOp, JobEvent, JobId, JobInfo, JobKind, JobQueue, OpReceipt,
-    Resolution, keep_both_candidates, plan_keep_both_names, split_name,
+    PrevAttrs, Resolution, keep_both_candidates, plan_keep_both_names, split_name,
 };
 #[cfg(target_os = "macos")]
 pub use platform::MacPlatform;
-pub use platform::{Platform, StubPlatform, VolumeId, VolumeInfo, watch_volumes};
+pub use platform::{
+    Platform, STUB_PRIVILEGED_OWNER, StubPlatform, VolumeId, VolumeInfo, watch_volumes,
+};
 pub use search::{
     CYCLE_REPEATS, MAX_CONCURRENT_DIR_READS, MAX_CYCLE_PERIOD, MAX_DEPTH, PROGRESS_EVERY_DIRS,
     SearchEvent, SearchQuery, filter_snapshot, looks_like_a_directory_cycle, search_recursive,
 };
 pub use sort::{SortDirection, SortKey, SortSpec, natural_cmp};
+pub use tags::{Tag, TagColor, decode_tag_strings, encode_tag_strings, standard_tags};
 pub use thumbnail::{
     ContentStamp, MAX_PX, Thumbnail, ThumbnailCache, ThumbnailKey,
     validate_px as validate_thumbnail_px,
 };
-pub use undo::{Fingerprint, UndoEntry, UndoOutcome, UndoStack};
+pub use undo::{AttrGuard, Fingerprint, UndoEntry, UndoOutcome, UndoStack};
 pub use vfs::{
-    CopyCancelled, CreateOptions, ProgressFn, RealVfs, RemoveOptions, RenameOptions, TrashId,
-    TrashRestoreError, Vfs, VolumeKey,
+    CopyCancelled, CreateOptions, PERM_BITS, ProgressFn, RealVfs, RemoveOptions, RenameOptions,
+    TrashId, TrashRestoreError, Vfs, VolumeKey,
 };
 pub use watcher::{PathEvent, PathEventKind, WatchGuard};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use exec::TestSpawner;
 #[cfg(any(test, feature = "test-support"))]
-pub use vfs::FakeVfs;
+pub use vfs::{FAKE_DIR_MODE, FAKE_FILE_MODE, FakeVfs};

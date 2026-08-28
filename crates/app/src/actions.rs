@@ -100,3 +100,17 @@ pub struct Paste {
 pub struct SortBy {
     pub key: fs_core::SortKey,
 }
+
+/// Add a Finder tag to the selection, or remove it when every selected item
+/// already has it (M6b, plan §7 M6's "Finder tags read/write"). Dispatched by
+/// the context menu's `Tags ▸` submenu, which is its only entry point — there
+/// is no keybinding for "the third tag in your palette".
+///
+/// Parameterized for the same reason `Paste`/`SortBy` are: one command, one
+/// implementation ([`crate::dir_view::DirView::toggle_tag_on_selection`]),
+/// however many rows the menu paints.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = file_explorer, no_json)]
+pub struct ToggleTag {
+    pub tag: fs_core::Tag,
+}

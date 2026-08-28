@@ -398,6 +398,173 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   determinism, stub eject rules, and the volume-watch poller on fake time.
   The objc2 macOS path compiles only on macOS (exercised by CI + the
   per-milestone Mac checklist, like the notify watcher).
+- `tags.rs` (M6b, Finder tags): `Tag { name: Arc<str>, color: TagColor }`, the fixed macOS
+  palette `TagColor { None=0, Gray=1, Green=2, Purple=3, Blue=4, Yellow=5,
+  Red=6, Orange=7 }` with `index`/`from_index`/`rgba`/`standard_name`/
+  `from_standard_name`/`PALETTE`, `standard_tags()`, and the pure codec
+  `encode_tag_strings`/`decode_tag_strings` for the `"Name\ncolorindex"` strings
+  macOS stores in the `com.apple.metadata:_kMDItemUserTags` xattr. The enum's
+  discriminants **are the on-disk colour indices** — renumbering them would
+  recolour every tagged file on the user's disk, so
+  `color_indices_are_the_on_disk_values_and_never_change` fails if anyone does.
+  `TagColor::rgba` is the one **theme-exempt** colour source in the product
+  (plan §6): a tag dot that is not the colour Finder paints is the wrong dot, so
+  the palette is pinned in fs-core (`Red = 0xFF5257FF`, …) rather than themed;
+  `TagColor::None` is transparent and callers branch on it instead of painting
+  it. Codec rules, all unit-tested: encode always writes the index (including
+  `0`), drops blank names and collapses duplicate names keeping the first;
+  decode reads `"Name\n6"`, a bare `"Name"` (colour `None`), an out-of-range
+  index (**name kept, colour dropped** — a future macOS must not cost the user a
+  tag), and a non-numeric trailing line as *part of the name*, which is how a
+  tag name containing a newline survives both directions. Split at the **last**
+  newline, so the one documented ambiguity is a name whose own final line is a
+  bare integer; recorded as a gap rather than papered over. Array order is
+  preserved — it is the order Finder shows.
+- `Platform::read_tags` / `write_tags` / `known_tags` (M6b, ARCHITECTURE.md §6
+  already listed the first two). `read_tags` is `Ok(vec![])` for an untagged
+  item — the details rows ask for every visible row — and `Err` only for a real
+  failure or a payload that is a property list but not an array (loud, because
+  the next write would overwrite whatever it held). `write_tags` replaces the
+  whole set and **removes the xattr** when handed an empty slice, so an
+  untagged file is byte-identical to one never tagged. `known_tags` is
+  best-effort: the standard palette plus whatever the implementation can
+  discover.
+- macOS tags (`platform/macos.rs`), two mechanisms, both chosen to avoid a new
+  crate (a `Cargo.toml` dependency change costs a full silent workspace
+  rebuild, CLAUDE.md): (a) the xattr syscalls `getxattr`/`setxattr`/
+  `removexattr` are declared in a private `mod xattr` rather than pulled from
+  the `xattr` crate or `libc` — three stable BSD entry points, the same
+  argument that already justifies the hand-written `UF_IMMUTABLE`. `ENOATTR`
+  and `ENOTSUP` mean "no tags", not failure; `ERANGE` between the sizing call
+  and the read is retried up to three times; paths go through
+  `OsStrExt::as_bytes`, never `to_string_lossy`, because a lossily-converted
+  path would tag a *different* file. `options` is `0` throughout, i.e. symlinks
+  are **followed** — a mode belongs to the link (hence `file_attrs`' `lstat`)
+  but a tag belongs to the item the user clicked. (b) the plist is serialized
+  by `NSPropertyListSerialization` from the already-present `objc2-foundation`
+  — two extra *features* on that dependency (`NSData`, `NSPropertyList`), no
+  new crate. Writes are **binary** (`BinaryFormat_v1_0`), which is what Finder
+  writes; reads let Foundation sniff the format, so an XML payload from a
+  third-party tagger or a hand-run `xattr -w` is read too. All of it inside one
+  `SpawnerExt::unblock` per call — the UI thread only awaits.
+- `known_tags` on macOS reads `FavoriteTagNames` out of
+  `~/Library/Preferences/com.apple.finder.plist` (with the same Foundation
+  parser, straight from the file rather than through `NSUserDefaults`, which
+  would read *our* domain) and appends any favourite not already in the
+  palette. Finder records favourites by name only — the colour assignments live
+  in the user's SyncedPreferences store, which is not a documented format — so
+  a favourite whose name is not one of the seven standard colour names comes
+  back uncoloured. Recorded as a Known gap.
+- Stub tags: an in-memory `BTreeMap<PathBuf, Vec<Tag>>` per `StubPlatform`,
+  empty until written, plus a synchronous `seed_tags` for visual scenarios.
+  Deliberately **storage, not a path hash** like the stub's thumbnails and
+  attributes: tags are the one thing the app writes, so a write-then-read test
+  over a stub that answered from a hash of a `tempfile` path would be fiction —
+  and that is exactly the shape of the M5 flake (see the M5 review-fixes row).
+  Writes go through the codec first, so the stub normalizes exactly as macOS
+  would; `known_tags` is palette + stored names in `BTreeMap` order.
+- Tag tests: 13 codec/palette unit tests in `tags.rs`, 1 stub test in
+  `platform/mod.rs`, 2 in `platform/macos.rs` and 9 in `tests/tags.rs`. The
+  **acceptance criterion** (a file tagged here shows in Finder and vice versa)
+  is pinned by four of those that share no code with our own reader:
+  `tests/tags.rs` writes tags and then reads the raw xattr back with **Apple's
+  `xattr -px`**, asserts the bytes start with `bplist00`, and hands them to
+  **`plutil -convert xml1`** to assert the array holds exactly
+  `<string>Red\n6</string>`, `<string>Wörk\n0</string>`,
+  `<string>Später\n3</string>`; the reverse direction builds a plist with
+  `plutil -convert binary1`, installs it with `xattr -wx`, and asserts
+  `read_tags` decodes it (plus an XML-payload variant via `xattr -w`). In
+  `macos.rs`, two more cross-check against **Foundation's own public tag API**
+  (`NSURL`'s `NSURLTagNamesKey`, the key Finder and every tag-aware app use):
+  what we write, Foundation reports as tags, and what Foundation sets, we read.
+
+### M6b attribute ops: Chmod / Chown / SetTags (ops + undo lane)
+- Three new `FileOp` variants on the **existing** job spine — same
+  destination-volume lanes (`lane_path` is the first path, as for Trash and
+  Delete), same cancel flag, same `OpReceipt`, same `JobEvent` stream:
+  `Chmod { paths, mode }`, `Chown { paths, owner: Option<String>, group:
+  Option<String> }`, `SetTags { paths, tags }`, with `JobKind::Chmod/Chown/
+  SetTags`. One shared `JobQueue::run_attrs` loop drives all three, dispatching
+  on a private `AttrChange` enum (the op's payload minus its path list).
+- **Where the mutation lives, and why.** A unix mode is file I/O, so
+  `Vfs::mode(&Path) -> Result<Option<u32>>` and `Vfs::set_mode(&Path, u32)` sit
+  beside `remove`/`rename`; resolving an owner *name* to a uid is a
+  directory-service lookup, so `Platform::set_ownership(&Path, Option<&str>,
+  Option<&str>)` is a platform method; tags were already
+  `Platform::read_tags`/`write_tags`. Both `Vfs` methods are **defaulted**
+  (`Ok(None)` and an explicit "this filesystem cannot change unix permissions"
+  error) so the app's test-double `Vfs` keeps compiling; `RealVfs` overrides
+  them (`std::fs::metadata` + `set_permissions` under `cfg(unix)`, masked to the
+  new `PERM_BITS = 0o7777`; Windows reports `None` and refuses to write), and
+  `FakeVfs` models a per-node mode (`FAKE_FILE_MODE` 0o644 / `FAKE_DIR_MODE`
+  0o755) so the ops are testable headlessly on every OS. A missing path is an
+  `Err` from `mode`, not `Ok(None)` — `Chmod` may not read "gone" as "no mode".
+- **Symlinks**: `mode` and `set_mode` both *follow* them (they must name one
+  inode, or an undo would write a link's mode onto its target), which diverges
+  from `file_attrs`' `lstat`. Recorded as a Known gap for the panel lane.
+- `Platform::set_ownership` on macOS is `NSFileManager
+  setAttributes:ofItemAtPath:error:` with `NSFileOwnerAccountName` /
+  `NSFileGroupOwnerAccountName` — the *name* keys, so Foundation does the
+  account lookup and there is no `getpwnam` and no `libc` (and no new
+  dependency: `NSDictionary` was already an enabled feature). It refuses a
+  non-UTF-8 path rather than lossily converting it, for the same reason
+  `file_attrs` does: the lossy form names a different file, and here that would
+  give away the wrong one. **Verified on this Mac:** `setAttributes:` returns
+  *success* for an account name it cannot resolve and silently changes nothing,
+  so the implementation reads the ownership back afterwards and fails if the
+  request was ignored (a "stuck" value only — a value that moved but does not
+  string-match is treated as an alias, not a failure).
+- `StubPlatform` models ownership as storage (a `BTreeMap` of overrides layered
+  over `file_attrs`' path-derived defaults) rather than a path hash, for the same
+  reason as tags: it is something the app *writes*. It refuses
+  `STUB_PRIVILEGED_OWNER` (`"root"`), which gives the EPERM path a deterministic
+  test on every OS — and since real macOS refuses the same name, one assertion
+  covers both machines.
+- **The queue now optionally holds a `Platform`.** `JobQueue::new` is unchanged;
+  `JobQueue::with_platform(vfs, platform, spawner)` adds it, and
+  `JobQueue::platform()` hands it to undo's guards. A platformless queue runs
+  every other op exactly as before and fails `Chown`/`SetTags` with "…this
+  JobQueue was built without a Platform" rather than silently doing nothing.
+- **Exact undo.** Each op captures the previous value *before* it writes, into
+  `OpReceipt::restored_attrs: Vec<(PathBuf, PrevAttrs)>` where `PrevAttrs` is
+  `Mode(u32)` | `Ownership { owner, group }` | `Tags(Vec<Tag>)`.
+  `UndoEntry::from_receipt` groups those into **one inverse op per distinct
+  previous value**, so a mixed selection comes back exactly as it was rather
+  than flattened to one mode. `Chown` captures *both* halves even when the op
+  changes one, so the inverse is self-contained. An empty tag set is a real
+  previous value ("this file had no tags"), so undo clears the tags again.
+- **`AttrGuard`, not `Fingerprint`.** `chmod` changes ctime, **not** mtime, so
+  the existing `(path, mtime)` fingerprint is structurally blind to exactly the
+  change these ops make (pinned by a `FakeVfs` test *and* a real-file test).
+  `UndoEntry::attr_guards: Vec<AttrGuard { path, expected: PrevAttrs }>` instead
+  asserts that the attribute still holds what the job wrote, read back through
+  the `Vfs` (mode) or the queue's `Platform` (ownership, tags) at undo time;
+  a mismatch yields `UndoOutcome::Invalidated` with "'x' permissions changed
+  since" / "ownership changed since" / "tags changed since" and touches nothing.
+  Guards cover only the paths that actually changed (a path that failed was
+  never written, and guarding it would invalidate a good undo), and for `Chown`
+  only the halves the op set. A guard whose value cannot be read at all (no unix
+  mode; no `Platform` on the queue) is skipped rather than treated as a
+  mismatch.
+- **Partial failure deliberately deviates from the rest of the spine.**
+  Copy/move fail the whole job on the first error, and the app records no undo
+  entry for a `Failed` job — which for a half-applied chmod over a large
+  selection would mean no way back. So the attribute ops attempt every path,
+  record per-path reasons in the new `OpReceipt::failed: Vec<(PathBuf, String)>`,
+  **complete** as long as one path changed (keeping that half undoable), and fail
+  outright only when nothing changed at all (nothing applied ⇒ nothing to undo,
+  and the error names every reason). The app is expected to surface `failed` as
+  a "changed 3 of 5" toast. A mid-job cancel still ends in `Cancelled`, which
+  carries no receipt — same as a cancelled multi-file `Move`, recorded as a gap.
+- Attribute-op tests: 27 unit (queue spine, mode masking, denied/vanished/
+  all-failed selections, cancel, the platformless queue, mixed-selection undo and
+  redo, both invalidation reasons, the guard/inverse pure helpers, the `FakeVfs`
+  chmod-does-not-touch-mtime pin, `RealVfs` real chmod + symlink-follow, stub
+  ownership, and four `set_ownership` tests on macOS including the real EPERM
+  refusal) and 6 integration in `tests/attr_ops.rs` over a real `tempfile` tree
+  with `MacPlatform`, so the tag legs really write, read and undo the xattr. The
+  "every `FileOp` variant" test in `tests/torture.rs` covers all three too.
+
 
 ## theme (crate)
 - Not started (interim `theme` module lives inside `crates/app`).

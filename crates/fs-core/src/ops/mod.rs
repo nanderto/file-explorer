@@ -10,9 +10,12 @@ pub mod queue;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::tags::Tag;
 use crate::vfs::TrashId;
 
-pub use job::{Conflict, ConflictChoice, JobEvent, JobId, JobInfo, JobKind, OpReceipt, Resolution};
+pub use job::{
+    Conflict, ConflictChoice, JobEvent, JobId, JobInfo, JobKind, OpReceipt, PrevAttrs, Resolution,
+};
 pub use queue::JobQueue;
 
 /// One user-level file operation, as submitted to the [`JobQueue`].
@@ -44,6 +47,27 @@ pub enum FileOp {
     /// Permanent removal (shift-delete; undo of copy/create). Additive to
     /// §6's abbreviated op list — DeletePermanently is a §0 M3 row.
     Delete { paths: Vec<PathBuf> },
+    /// Set the unix permission bits on each path (the info panel's permission
+    /// checkboxes and octal field, M6b). `mode` is masked to `0o7777`; the
+    /// file-type bits are not a mode value and `chmod` cannot change them.
+    ///
+    /// Applied per path and **partially tolerant**: a path that vanished or
+    /// refused (EPERM) is recorded in [`OpReceipt::failed`] and the rest of the
+    /// selection still goes through, so a mixed selection cannot be held
+    /// hostage by one denied file.
+    Chmod { paths: Vec<PathBuf>, mode: u32 },
+    /// Change the owning user and/or group of each path, by name. `None` leaves
+    /// that half alone. Needs privilege — an ordinary run fails with EPERM per
+    /// path, which is reported, never panicked on.
+    Chown {
+        paths: Vec<PathBuf>,
+        owner: Option<String>,
+        group: Option<String>,
+    },
+    /// Replace the whole Finder tag set on each path (M6b). There is no
+    /// add/remove: Finder rewrites the array too, and "add one" is a
+    /// read-modify-write in the caller. An empty `tags` clears them.
+    SetTags { paths: Vec<PathBuf>, tags: Vec<Tag> },
 }
 
 impl FileOp {
@@ -58,6 +82,9 @@ impl FileOp {
             FileOp::CreateFile { .. } => JobKind::CreateFile,
             FileOp::Duplicate { .. } => JobKind::Duplicate,
             FileOp::Delete { .. } => JobKind::Delete,
+            FileOp::Chmod { .. } => JobKind::Chmod,
+            FileOp::Chown { .. } => JobKind::Chown,
+            FileOp::SetTags { .. } => JobKind::SetTags,
         }
     }
 
@@ -68,7 +95,11 @@ impl FileOp {
         match self {
             FileOp::Copy { dest_dir, .. } | FileOp::Move { dest_dir, .. } => dest_dir,
             FileOp::Rename { to, .. } => to,
-            FileOp::TrashOp { paths } | FileOp::Delete { paths } => {
+            FileOp::TrashOp { paths }
+            | FileOp::Delete { paths }
+            | FileOp::Chmod { paths, .. }
+            | FileOp::Chown { paths, .. }
+            | FileOp::SetTags { paths, .. } => {
                 paths.first().map(PathBuf::as_path).unwrap_or(fallback)
             }
             FileOp::Restore { ids } => ids
@@ -232,6 +263,51 @@ mod tests {
             FileOp::Delete { paths: vec![] }.lane_path(),
             Path::new("/"),
             "empty ops fall back to the root lane"
+        );
+    }
+
+    #[test]
+    fn attribute_ops_route_and_label_themselves() {
+        // The attribute ops have no destination: they act in place, so the lane
+        // is the first path's volume — same as Trash and Delete.
+        let paths = vec![
+            PathBuf::from("/Volumes/SSD/a.txt"),
+            PathBuf::from("/Volumes/SSD/b.txt"),
+        ];
+        for (op, kind) in [
+            (
+                FileOp::Chmod {
+                    paths: paths.clone(),
+                    mode: 0o644,
+                },
+                JobKind::Chmod,
+            ),
+            (
+                FileOp::Chown {
+                    paths: paths.clone(),
+                    owner: Some("noel".into()),
+                    group: None,
+                },
+                JobKind::Chown,
+            ),
+            (
+                FileOp::SetTags {
+                    paths: paths.clone(),
+                    tags: vec![crate::tags::Tag::uncolored("Work")],
+                },
+                JobKind::SetTags,
+            ),
+        ] {
+            assert_eq!(op.kind(), kind);
+            assert_eq!(op.lane_path(), Path::new("/Volumes/SSD/a.txt"));
+        }
+        assert_eq!(
+            FileOp::Chmod {
+                paths: vec![],
+                mode: 0o644
+            }
+            .lane_path(),
+            Path::new("/")
         );
     }
 }

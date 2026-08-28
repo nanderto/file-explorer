@@ -16,6 +16,16 @@
 //! the plan's own fallback (`image`-crate decode) when QuickLook declines a
 //! file. See [`quicklook_blocking`] for the threading argument.
 //!
+//! Finder tags (M6b) are the `com.apple.metadata:_kMDItemUserTags` extended
+//! attribute holding a **binary plist array of strings**. Two mechanisms, both
+//! chosen to avoid a new dependency (and the full workspace rebuild a
+//! `Cargo.toml` dependency change costs): the xattr syscalls are declared
+//! directly in [`xattr`] rather than pulling in the `xattr` crate or `libc`
+//! (same precedent as [`UF_IMMUTABLE`]), and the plist is serialized by
+//! `NSPropertyListSerialization` from the already-present `objc2-foundation`
+//! (two extra *features* on that dependency, no new crate). Foundation is also
+//! why reading accepts XML as well as binary for free — it sniffs the format.
+//!
 //! NOTE: this file only compiles under `cfg(target_os = "macos")`. Earlier
 //! milestones were written on a Windows machine and checked only by macOS CI;
 //! from M4 on it is also compiled and tested locally.
@@ -31,6 +41,7 @@ use async_trait::async_trait;
 use super::{Platform, VolumeId, VolumeInfo};
 use crate::attrs::{FileAttrs, UnixPerms};
 use crate::exec::{Spawner, SpawnerExt as _};
+use crate::tags::{Tag, TagColor, decode_tag_strings, encode_tag_strings, standard_tags};
 use crate::thumbnail::{Thumbnail, validate_px};
 
 /// Real macOS platform services, constructed once at boot with the app's
@@ -80,6 +91,54 @@ impl Platform for MacPlatform {
         let path = path.to_path_buf();
         self.spawner
             .unblock(move || file_attrs_blocking(&path))
+            .await
+    }
+
+    /// One `getxattr` plus a Foundation plist parse, both blocking, both
+    /// inside one [`SpawnerExt::unblock`].
+    async fn read_tags(&self, path: &Path) -> Result<Vec<Tag>> {
+        let path = path.to_path_buf();
+        self.spawner
+            .unblock(move || read_tags_blocking(&path))
+            .await
+    }
+
+    /// Encode → binary plist → `setxattr`, or `removexattr` when the set is
+    /// empty. All blocking, all inside one [`SpawnerExt::unblock`].
+    async fn write_tags(&self, path: &Path, tags: &[Tag]) -> Result<()> {
+        let path = path.to_path_buf();
+        let tags = tags.to_vec();
+        self.spawner
+            .unblock(move || write_tags_blocking(&path, &tags))
+            .await
+    }
+
+    /// The standard palette plus the user's Finder favourites (see
+    /// [`favorite_tag_names`]); reading a preferences file, hence `unblock`.
+    async fn known_tags(&self) -> Result<Vec<Tag>> {
+        self.spawner.unblock(known_tags_blocking).await
+    }
+
+    /// `NSFileManager setAttributes:ofItemAtPath:error:` with
+    /// `NSFileOwnerAccountName` / `NSFileGroupOwnerAccountName` — the *name*
+    /// keys, so Foundation performs the account lookup and we never hand-roll
+    /// `getpwnam`/`getgrnam` (nor take a `libc` dependency for them). It is the
+    /// exact API [`account_names`] already reads through, so a successful write
+    /// is guaranteed to show up in the panel's owner row.
+    ///
+    /// Blocking, inside one [`SpawnerExt::unblock`]. An unprivileged run gets
+    /// Foundation's `EPERM` error text back as an ordinary `Err`.
+    async fn set_ownership(
+        &self,
+        path: &Path,
+        owner: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let path = path.to_path_buf();
+        let owner = owner.map(str::to_string);
+        let group = group.map(str::to_string);
+        self.spawner
+            .unblock(move || set_ownership_blocking(&path, owner.as_deref(), group.as_deref()))
             .await
     }
 
@@ -265,6 +324,75 @@ fn file_attrs_blocking(path: &Path) -> Result<FileAttrs> {
         extension_hidden: resources.extension_hidden,
         type_description: resources.type_description,
     })
+}
+
+/// Change the owner and/or group of `path` by name. Blocking — always called
+/// through `unblock`.
+///
+/// A non-UTF-8 path is refused rather than lossily converted, for the same
+/// reason [`file_attrs_blocking`] refuses it: the lossy form would name a
+/// *different* file, and here that would mean giving away the wrong one.
+#[allow(unused_unsafe)] // see volumes_blocking
+fn set_ownership_blocking(path: &Path, owner: Option<&str>, group: Option<&str>) -> Result<()> {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{
+        NSDictionary, NSFileAttributeKey, NSFileGroupOwnerAccountName, NSFileManager,
+        NSFileOwnerAccountName, NSString,
+    };
+
+    if owner.is_none() && group.is_none() {
+        return Ok(()); // nothing asked for, nothing to do
+    }
+    let path_str = path.to_str().ok_or_else(|| {
+        anyhow!(
+            "cannot change ownership of a non-UTF-8 path: {}",
+            path.display()
+        )
+    })?;
+
+    let owner_value = owner.map(NSString::from_str);
+    let group_value = group.map(NSString::from_str);
+    let mut keys: Vec<&NSFileAttributeKey> = Vec::new();
+    let mut values: Vec<&AnyObject> = Vec::new();
+    if let Some(value) = &owner_value {
+        keys.push(unsafe { NSFileOwnerAccountName });
+        values.push(value.as_ref());
+    }
+    if let Some(value) = &group_value {
+        keys.push(unsafe { NSFileGroupOwnerAccountName });
+        values.push(value.as_ref());
+    }
+    let attributes: objc2::rc::Retained<NSDictionary<NSFileAttributeKey, AnyObject>> =
+        NSDictionary::from_slices(&keys, &values);
+
+    // Captured for the verification below, which is not optional: see the
+    // `ignored` check.
+    let before = account_names(path).unwrap_or_default();
+
+    let manager = unsafe { NSFileManager::defaultManager() };
+    unsafe { manager.setAttributes_ofItemAtPath_error(&attributes, &NSString::from_str(path_str)) }
+        .map_err(|error| anyhow!("chown {}: {}", path.display(), error.localizedDescription()))?;
+
+    // `setAttributes:` reports **success** for an account name it could not
+    // resolve, and simply leaves that half alone (verified on macOS 15: a
+    // nonexistent group name returns no error and changes nothing). Reporting
+    // that as done would hand the info panel a lie and record an undo entry for
+    // a change that never happened, so read the ownership back and insist it
+    // took.
+    let after = account_names(path).unwrap_or_default();
+    let ignored = |requested: Option<&str>, after: &Option<String>, before: &Option<String>| {
+        // Only a *stuck* value is a failure: a value that moved but does not
+        // string-match the request is an alias (a uid spelled numerically, a
+        // directory service canonicalizing a name), not a silent no-op.
+        requested.is_some_and(|want| after.as_deref() != Some(want) && after == before)
+    };
+    if ignored(owner, &after.owner, &before.owner) || ignored(group, &after.group, &before.group) {
+        bail!(
+            "chown {}: the system ignored the request (unknown account name?)",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Owner and group *names*, either of which the directory service may decline
@@ -564,6 +692,79 @@ mod tests {
         path
     }
 
+    /// Independent proof that what [`write_tags_blocking`] leaves on disk is a
+    /// *Finder* tag, not merely something our own reader accepts: it asks
+    /// **Foundation's public tag API** (`NSURL`'s `NSURLTagNamesKey`, the same
+    /// key Finder and every tag-aware app use) what the file's tags are. That
+    /// code path shares nothing with ours — different framework, no xattr call,
+    /// no plist parsing of ours — so agreement means the on-disk format is
+    /// right. `tests/tags.rs` pins the bytes; this pins the interpretation.
+    #[allow(unused_unsafe)] // see volumes_blocking
+    fn foundation_tag_names(path: &Path) -> Vec<String> {
+        use objc2_foundation::{NSArray, NSString, NSURL, NSURLResourceKey, NSURLTagNamesKey};
+
+        let keys: [&NSURLResourceKey; 1] = unsafe { [NSURLTagNamesKey] };
+        let keys = NSArray::from_slice(&keys);
+        let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(path.to_str().unwrap())) };
+        let values = unsafe { url.resourceValuesForKeys_error(&keys) }.expect("resource values");
+        let Some(names) = (unsafe { values.objectForKey(NSURLTagNamesKey) }) else {
+            return Vec::new(); // no tags at all
+        };
+        names
+            .downcast_ref::<NSArray>()
+            .expect("NSURLTagNamesKey is an array")
+            .iter()
+            .filter_map(|item| item.downcast_ref::<NSString>().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn foundations_own_tag_api_sees_the_tags_we_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tagged.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(foundation_tag_names(&file).is_empty(), "starts untagged");
+
+        write_tags_blocking(
+            &file,
+            &[Tag::new("Red", TagColor::Red), Tag::uncolored("Quarterly")],
+        )
+        .unwrap();
+        assert_eq!(foundation_tag_names(&file), ["Red", "Quarterly"]);
+
+        // …and clearing them makes Foundation agree the file is untagged.
+        write_tags_blocking(&file, &[]).unwrap();
+        assert!(foundation_tag_names(&file).is_empty());
+    }
+
+    /// The reverse direction through Foundation: tags set with
+    /// `NSURL setResourceValue:forKey:` (what a tag-aware Cocoa app does) are
+    /// what [`read_tags_blocking`] returns.
+    #[test]
+    #[allow(unused_unsafe)] // see volumes_blocking
+    fn tags_set_through_foundation_are_read_back() {
+        use objc2_foundation::{NSArray, NSString, NSURL, NSURLTagNamesKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cocoa.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(file.to_str().unwrap())) };
+        let names = NSArray::from_retained_slice(&[
+            NSString::from_str("Green"),
+            NSString::from_str("Later"),
+        ]);
+        unsafe { url.setResourceValue_forKey_error(Some(&names), NSURLTagNamesKey) }
+            .expect("set tag names");
+
+        let tags = read_tags_blocking(&file).unwrap();
+        let read_names: Vec<&str> = tags.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(read_names, ["Green", "Later"]);
+        // Foundation resolves the standard colour for "Green" itself, which is
+        // exactly the interop we care about.
+        assert_eq!(tags[0].color, TagColor::Green);
+    }
+
     #[test]
     fn thumbnail_of_a_real_image_never_exceeds_the_requested_size() {
         let dir = tempfile::tempdir().unwrap();
@@ -713,6 +914,78 @@ mod tests {
         );
     }
 
+    /// The `Chown` "where privileged" path, exercised on a real Mac: an
+    /// unprivileged process must get a plain error and leave the file alone —
+    /// never a panic, never a half-applied change. Skipped when the test
+    /// happens to run as root, where the give-away would actually succeed.
+    #[test]
+    fn chown_to_root_is_refused_cleanly_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("owned.txt");
+        std::fs::write(&file, b"mine").unwrap();
+        let owner_before = account_names(&file).unwrap().owner;
+        if owner_before.as_deref() == Some("root") {
+            return; // running as root: nothing to prove
+        }
+
+        let error = set_ownership_blocking(&file, Some("root"), None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("chown"), "{message}");
+        assert!(
+            message.contains(&file.display().to_string()),
+            "the message names the file the UI must report: {message}"
+        );
+        assert_eq!(
+            account_names(&file).unwrap().owner,
+            owner_before,
+            "a refused chown leaves the owner exactly as it was"
+        );
+    }
+
+    #[test]
+    fn chown_to_an_unknown_account_is_an_error_not_a_silent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("owned.txt");
+        std::fs::write(&file, b"mine").unwrap();
+        let group_before = account_names(&file).unwrap().group;
+
+        let error =
+            set_ownership_blocking(&file, None, Some("no-such-group-exists-here")).unwrap_err();
+        assert!(error.to_string().contains("chown"), "{error}");
+        assert_eq!(account_names(&file).unwrap().group, group_before);
+    }
+
+    /// Asking for nothing does nothing — and in particular does not touch the
+    /// file, so the info panel can call the op unconditionally.
+    #[test]
+    fn chown_with_neither_half_set_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("owned.txt");
+        std::fs::write(&file, b"mine").unwrap();
+        set_ownership_blocking(&file, None, None).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+    }
+
+    /// The group half must be settable by an unprivileged process for any group
+    /// the user belongs to — the realistic half of "where privileged".
+    #[test]
+    fn chown_to_one_of_the_users_own_groups_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("owned.txt");
+        std::fs::write(&file, b"mine").unwrap();
+        let group_before = account_names(&file)
+            .unwrap()
+            .group
+            .expect("a group name on a temp file");
+
+        // Setting the group to the one it already has needs no privilege at all.
+        set_ownership_blocking(&file, None, Some(&group_before)).unwrap();
+        assert_eq!(
+            account_names(&file).unwrap().group.as_deref(),
+            Some(group_before.as_str())
+        );
+    }
+
     #[test]
     fn account_names_fall_back_to_the_numeric_ids() {
         let named = AccountNames {
@@ -737,5 +1010,297 @@ mod tests {
         assert_eq!(&pixels[0..4], &[128, 128, 128, 128]);
         assert_eq!(&pixels[4..8], &[10, 20, 30, 255], "opaque is untouched");
         assert_eq!(&pixels[8..12], &[0, 0, 0, 0], "transparent is untouched");
+    }
+}
+
+/// The extended attribute Finder stores tags in. The `com.apple.metadata:`
+/// prefix is what makes Spotlight index it (and what makes the tags survive a
+/// copy through Finder), so the full name is load-bearing.
+const USER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
+
+/// Finder tags on `path`. Blocking — always called through `unblock`.
+///
+/// A missing attribute, an empty payload, or a filesystem that does not support
+/// extended attributes all mean the same user-visible thing: no tags. Only a
+/// real failure (permission denied, path gone) or a payload that is not a plist
+/// array of strings is an error — a corrupt payload is reported loudly rather
+/// than silently treated as "no tags", because the next write would overwrite
+/// whatever it actually held.
+fn read_tags_blocking(path: &Path) -> Result<Vec<Tag>> {
+    let Some(bytes) = xattr::get(path, USER_TAGS_XATTR)? else {
+        return Ok(Vec::new());
+    };
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let strings = plist_strings(&bytes)
+        .with_context(|| format!("reading Finder tags of {}", path.display()))?;
+    Ok(decode_tag_strings(&strings))
+}
+
+/// Replace the tag set on `path`. Blocking — always called through `unblock`.
+///
+/// Empty ⇒ remove the attribute entirely (see [`Platform::write_tags`]).
+/// Removing an attribute that is not there is success, not an error, so
+/// clearing an untagged file is a no-op rather than a spurious failure.
+fn write_tags_blocking(path: &Path, tags: &[Tag]) -> Result<()> {
+    let strings = encode_tag_strings(tags);
+    if strings.is_empty() {
+        return xattr::remove(path, USER_TAGS_XATTR)
+            .with_context(|| format!("clearing Finder tags of {}", path.display()));
+    }
+    let plist = plist_data(&strings)?;
+    xattr::set(path, USER_TAGS_XATTR, &plist)
+        .with_context(|| format!("writing Finder tags of {}", path.display()))
+}
+
+/// Standard palette first, then any of the user's Finder favourite tag names we
+/// do not already have. Never fails: an unreadable preferences file just means
+/// the palette.
+fn known_tags_blocking() -> Result<Vec<Tag>> {
+    let mut known = standard_tags();
+    for name in favorite_tag_names().unwrap_or_default() {
+        if name.trim().is_empty() || known.iter().any(|tag| tag.name.as_ref() == name) {
+            continue;
+        }
+        // Finder's preferences record favourites by *name* only; the colour
+        // assignments live in the user's SyncedPreferences store, which is not
+        // a documented format. A favourite whose name is not one of the seven
+        // standard colour names therefore comes back uncoloured — recorded as a
+        // Known gap in AS_BUILT, and harmless: the sidebar shows the tag, just
+        // with no dot until the user's own files reveal its colour.
+        let color = TagColor::from_standard_name(&name).unwrap_or(TagColor::None);
+        known.push(Tag::new(name, color));
+    }
+    Ok(known)
+}
+
+/// The `FavoriteTagNames` array out of `~/Library/Preferences/com.apple.finder.plist`
+/// — the tags Finder itself offers in its sidebar. Read straight from the file
+/// with Foundation rather than through `NSUserDefaults`/`CFPreferences`, which
+/// would read *our* app's domain unless we asked for a suite and would drag in
+/// another objc2-foundation feature; the file is the user's own and the value is
+/// advisory, so a stale read costs nothing. `None` on any failure at all.
+fn favorite_tag_names() -> Option<Vec<String>> {
+    use objc2_foundation::{NSDictionary, NSString};
+
+    let home = std::env::var_os("HOME")?;
+    let plist = PathBuf::from(home).join("Library/Preferences/com.apple.finder.plist");
+    let bytes = std::fs::read(plist).ok()?;
+    let object = plist_object(&bytes).ok()?;
+    let dictionary = object.downcast_ref::<NSDictionary>()?;
+    let favorites = dictionary.objectForKey(&*NSString::from_str("FavoriteTagNames"))?;
+    let array = favorites.downcast_ref::<objc2_foundation::NSArray>()?;
+    Some(
+        array
+            .iter()
+            .filter_map(|item| item.downcast_ref::<NSString>().map(|s| s.to_string()))
+            .collect(),
+    )
+}
+
+/// Serialize `strings` as a **binary** plist array — the format Finder writes,
+/// so a file tagged here is byte-shaped like a file tagged there.
+#[allow(unused_unsafe)] // see volumes_blocking
+fn plist_data(strings: &[String]) -> Result<Vec<u8>> {
+    use objc2_foundation::{NSArray, NSPropertyListFormat, NSPropertyListSerialization, NSString};
+
+    let items: Vec<objc2::rc::Retained<NSString>> =
+        strings.iter().map(|s| NSString::from_str(s)).collect();
+    let refs: Vec<&NSString> = items.iter().map(|s| &**s).collect();
+    let array = NSArray::from_slice(&refs);
+    let data = unsafe {
+        NSPropertyListSerialization::dataWithPropertyList_format_options_error(
+            &array,
+            NSPropertyListFormat::BinaryFormat_v1_0,
+            0,
+        )
+    }
+    .map_err(|error| anyhow!("serializing tag plist: {error}"))?;
+    Ok(data.to_vec())
+}
+
+/// Parse a plist payload into an object. Accepts **either** binary or XML:
+/// Foundation sniffs the format, which matters because third-party taggers
+/// (and `xattr -w` by hand) do write XML.
+#[allow(unused_unsafe)] // see volumes_blocking
+fn plist_object(bytes: &[u8]) -> Result<objc2::rc::Retained<objc2::runtime::AnyObject>> {
+    use objc2_foundation::{NSData, NSPropertyListMutabilityOptions, NSPropertyListSerialization};
+
+    let data = NSData::with_bytes(bytes);
+    unsafe {
+        NSPropertyListSerialization::propertyListWithData_options_format_error(
+            &data,
+            NSPropertyListMutabilityOptions::Immutable,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(|error| anyhow!("not a property list: {error}"))
+}
+
+/// The strings of a top-level plist array. A payload that is not an array is an
+/// error (see [`read_tags_blocking`]); a *non-string element* inside the array
+/// is skipped, since one odd element is no reason to drop the other tags.
+fn plist_strings(bytes: &[u8]) -> Result<Vec<String>> {
+    use objc2_foundation::{NSArray, NSString};
+
+    let object = plist_object(bytes)?;
+    let array = object
+        .downcast_ref::<NSArray>()
+        .ok_or_else(|| anyhow!("tag payload is a property list but not an array"))?;
+    Ok(array
+        .iter()
+        .filter_map(|item| item.downcast_ref::<NSString>().map(|s| s.to_string()))
+        .collect())
+}
+
+/// The three extended-attribute syscalls, declared here rather than taken from
+/// `libc` or the `xattr` crate: a new dependency costs a full workspace rebuild
+/// (CLAUDE.md) for three stable BSD entry points, and the same argument already
+/// justifies [`UF_IMMUTABLE`] above. Only these three, only for this file's use.
+///
+/// `options` is left at `0` throughout, i.e. symlinks are **followed** —
+/// matching the `xattr` command-line tool's default and Finder's behaviour of
+/// tagging what the user thinks they clicked. (`file_attrs` uses `lstat`
+/// deliberately, but a *mode* belongs to the link while a *tag* belongs to the
+/// item.)
+mod xattr {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    use anyhow::{Result, anyhow, bail};
+
+    unsafe extern "C" {
+        fn getxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+            position: u32,
+            options: c_int,
+        ) -> isize;
+        fn setxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *const c_void,
+            size: usize,
+            position: u32,
+            options: c_int,
+        ) -> c_int;
+        fn removexattr(path: *const c_char, name: *const c_char, options: c_int) -> c_int;
+    }
+
+    /// `<sys/xattr.h>`: no such attribute on this file — the overwhelmingly
+    /// common case, and not an error.
+    const ENOATTR: i32 = 93;
+    /// `<sys/errno.h>`: the filesystem does not do extended attributes.
+    const ENOTSUP: i32 = 45;
+    /// `<sys/errno.h>`: the buffer we sized from the previous call is now too
+    /// small, because someone else rewrote the attribute in between.
+    const ERANGE: i32 = 34;
+
+    /// How many times to re-size the buffer before giving up on a value that
+    /// keeps growing under us. Three is generous for a tag list.
+    const MAX_RESIZE_ATTEMPTS: usize = 3;
+
+    fn c_path(path: &Path) -> Result<CString> {
+        // Bytes, not `to_string_lossy`: a lossy path would address a *different*
+        // file, and tagging the wrong file is worse than failing.
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| anyhow!("path contains an interior NUL: {}", path.display()))
+    }
+
+    /// The raw attribute value, or `None` when the file has no such attribute
+    /// or the filesystem has no extended attributes at all.
+    pub(super) fn get(path: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+        let c_path = c_path(path)?;
+        let c_name = CString::new(name)?;
+        for _ in 0..MAX_RESIZE_ATTEMPTS {
+            let size = unsafe {
+                getxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if size < 0 {
+                return absent_or_error(path, name, "getxattr").map(|()| None);
+            }
+            let mut buffer = vec![0u8; size as usize];
+            let read = unsafe {
+                getxattr(
+                    c_path.as_ptr(),
+                    c_name.as_ptr(),
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    buffer.len(),
+                    0,
+                    0,
+                )
+            };
+            if read >= 0 {
+                buffer.truncate(read as usize);
+                return Ok(Some(buffer));
+            }
+            if io::Error::last_os_error().raw_os_error() == Some(ERANGE) {
+                continue; // grew between the sizing call and the read — retry
+            }
+            return absent_or_error(path, name, "getxattr").map(|()| None);
+        }
+        bail!(
+            "{} of {} kept changing size while reading it",
+            name,
+            path.display()
+        )
+    }
+
+    /// Replace the attribute's value.
+    pub(super) fn set(path: &Path, name: &str, value: &[u8]) -> Result<()> {
+        let c_path = c_path(path)?;
+        let c_name = CString::new(name)?;
+        let status = unsafe {
+            setxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast::<c_void>(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "setxattr {name} on {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ))
+        }
+    }
+
+    /// Remove the attribute. Removing one that is not there succeeds.
+    pub(super) fn remove(path: &Path, name: &str) -> Result<()> {
+        let c_path = c_path(path)?;
+        let c_name = CString::new(name)?;
+        let status = unsafe { removexattr(c_path.as_ptr(), c_name.as_ptr(), 0) };
+        if status == 0 {
+            return Ok(());
+        }
+        absent_or_error(path, name, "removexattr")
+    }
+
+    /// Map the current `errno` to either "there is no such attribute here"
+    /// (`Ok`) or a real error.
+    fn absent_or_error(path: &Path, name: &str, call: &str) -> Result<()> {
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(ENOATTR) | Some(ENOTSUP) => Ok(()),
+            _ => Err(anyhow!("{call} {name} on {}: {error}", path.display())),
+        }
     }
 }
