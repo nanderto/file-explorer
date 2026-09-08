@@ -1050,25 +1050,78 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   the context menus: `escape` → `Cancel` in `DirView && menu`, guarded from
   both sides (it fires with the token, and is dead without it) so it can never
   shadow the rename editor's own `TextInput` escape.
+- `keymap.rs` (M7b: user overrides): `keymap.json`, beside `settings.json`,
+  read as `[{ context, bindings }]` with Zed's spelling — `"f2":
+  "RenameSelected"`, `"cmd-9": ["file_explorer::Paste", {…}]`, `"backspace":
+  null` to unbind (gpui's own `NoAction`, which shadows the default rather
+  than deleting it). An action is named fully or by its bare name when that is
+  unambiguous; `Paste` is deliberately *not* unambiguous (ours and the
+  vendored input's), and the error names both candidates.
+  **Overrides are applied by rebuilding**: `clear_key_bindings`, the §0
+  defaults, then the file — so deleting a row from the file restores the
+  default it replaced, with no accumulation. **Nothing in the file is fatal**:
+  an unknown action, an unparseable keystroke and an invalid context
+  expression are each reported into `UserKeymap::diagnostics` and skipped, and
+  the defaults stand — a typo must never leave the app without a keyboard
+  (`every_broken_row_is_reported_and_skipped`,
+  `a_structurally_broken_file_leaves_the_defaults_alone`). The file is watched
+  on the same 150 ms debounce as settings and themes, so an edit applies
+  without a restart. `keymap::init` (defaults only) is unchanged and is still
+  what every test uses; `init_with_overrides` is what `main` calls.
+
 - `app_state.rs`: `FsContext` global (`Arc<dyn Vfs>` + `Arc<dyn Spawner>` +
   `Arc<dyn Platform>` since M2 — `MacPlatform` on macOS, `StubPlatform`
   elsewhere and in tests/visual scenarios; job queue/undo/clipboard join at
   M3) and `GpuiSpawner`, the fs-core `Spawner` adapter over
   `gpui::BackgroundExecutor` (timers run on the deterministic test clock
   under `#[gpui::test]`).
-- `settings.rs` (M2 stub per §1, growing into the real store across M7):
-  `AppSettings` global — `SettingsContent { favorites: Vec<PathBuf>, theme:
-  Option<String> }` (the `theme` key is M7a; absent means the built-in
-  default, and a pre-M7 file still loads) as
-  serde JSON at `dirs::config_dir()/file-explorer/settings.json` (path
-  injectable for tests). `settings::init` (called by `main` after
-  `app_state::init`) installs defaults immediately, then swaps in the
-  background-loaded file unless the global was already mutated; missing or
-  corrupt files load as defaults, unknown fields are tolerated. `save()`
-  serializes and spawns `Vfs::atomic_write` on the fs-core `Spawner` —
-  fire-and-forget, never on the UI thread. Tests: favorites round-trip +
-  removal, corrupt/missing/sparse files, and a `#[gpui::test]` proving
-  save-then-restart-load survives (the M2 acceptance row's persistence half).
+- `settings.rs` (M2 stub per §1, the real store at M7b): `AppSettings`
+  global over `SettingsContent { favorites, theme, confirm_delete_to_trash,
+  folders_first }`, at `dirs::config_dir()/file-explorer/settings.json` (path
+  injectable for tests). Four properties, in the shape the theme system
+  established:
+  * **Embedded defaults, refined by the user file.** `settings/defaults.json`
+    is compiled in and is the *complete* document; the file on disk
+    deserializes into an all-optional partial and is overlaid on top. A key
+    the user never wrote — or one this version does not know — can therefore
+    never leave a setting undefined, and unknown keys are reported in
+    `AppSettings::warnings()` rather than dropped silently. A structurally
+    broken file loads the defaults **and says so**, instead of looking like an
+    empty settings file.
+  * **The file is watched** (150 ms debounce, the parent directory rather than
+    the file, because an atomic write replaces the inode). Editing
+    `settings.json` in a text editor applies live. Our own writes come back
+    through the same watcher and are recognised as no-ops by comparison.
+  * **Writes are serialized.** `save()` parks the newest content in a
+    single-slot `WriterState` and starts one writer task if none is running;
+    the task drains that slot until it is empty. Two settings changed in quick
+    succession can no longer race two `atomic_write`s at one path, where the
+    second could land first and lose the newer content
+    (`rapid_saves_are_serialized_and_the_last_one_wins`).
+  * **Only overrides are written.** `user_overrides` diffs against the
+    compiled-in defaults, so the file stays small and a default this app
+    changes later still reaches everyone who never overrode it. Setting a
+    value back to its default removes the key again.
+
+  **A settings load only pushes what the file changed.** `apply_loaded`
+  compares the incoming theme against the one the store was holding and calls
+  `ActiveTheme::set_selection` only if it moved. Pushing unconditionally meant
+  every load overrode whatever the theme system had been told by anyone else —
+  which is exactly what the visual-test runner does when it installs a
+  per-scenario theme while the boot load is still in flight, and it would have
+  captured every light scenario in the dark theme
+  (`a_settings_load_that_changes_no_theme_does_not_touch_the_theme`).
+
+  The two §3 behaviors are wired, both defaulting to what the app already did:
+  `folders_first` (on) feeds each pane's `SortSpec` — read at construction,
+  fanned out by `Workspace::settings_changed` on any settings change, exactly
+  like `ToggleHiddenFiles`; and `confirm_delete_to_trash` (off) turns the bare
+  `delete` key into a confirmation. The trash is undoable, so that dialog asks
+  ("Move 3 items to the Trash?") rather than warning, unlike the
+  `DeletePermanently` one. The paths travel up as
+  `DirViewEvent::ConfirmTrash` → `PaneEvent::ConfirmTrash` → the workspace's
+  existing `ConfirmRequest` machinery: events up, method calls down (§2), and
+  nothing is queued until the dialog is confirmed.
 - Watcher coverage (all on fake time — `advance_clock(WATCH_LATENCY)` is the
   only thing between an injected event and its batch): `pane.rs` — external
   create/remove/rename patch the listing with no `Refresh` (and nothing applies
@@ -1247,10 +1300,18 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   * **Nothing touches the disk on the UI thread** (§5): the folder read, the
     parse and the watch registration all run on the background executor, and
     unregistration goes through the shared `BackgroundWatchGuard`.
-  * `settings.json` gained `theme: Option<String>`; `settings::init` applies
-    it once its own background load lands (both are in flight at boot, so
-    the theme system starts on the default and switches at most once). The
-    picker that *writes* it is M7b.
+  * **Selections, not just names** (M7b): `ActiveTheme` holds a
+    `ThemeSelection` — one theme, or the light/dark pair that follows macOS —
+    plus the last-seen system appearance, and `resolve()` is the single place
+    that turns those three (selection, appearance, registry) into the painted
+    theme. `Workspace::new` registers `Window::observe_window_appearance` and
+    calls `ActiveTheme::set_system_appearance`; for a `Static` selection that
+    is a no-op, which is why the observer is cheap to leave installed.
+  * `settings.json` carries the selection in either spelling
+    (`"theme": "Graphite Dark"` or `{"light": …, "dark": …}`) and
+    `settings::init` applies it when its own background load lands — but only
+    if the file actually changed it (see `settings.rs`). The picker that
+    *writes* it is M7c.
 - `watch_guard.rs` (M7a): `BackgroundWatchGuard`, lifted verbatim out of
   `pane.rs` now that the themes folder watches too. Dropping a `WatchGuard`
   is disk-touching (macOS stops and joins an FSEvents run-loop thread), so

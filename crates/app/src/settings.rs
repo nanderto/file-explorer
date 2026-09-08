@@ -1,33 +1,112 @@
-//! Settings persistence stub (ARCHITECTURE.md §1 `settings.rs` — "M7, stub M2").
+//! The settings store (ARCHITECTURE.md §1 `settings.rs`, §M7).
 //!
-//! M2 surface: a small JSON file (`favorites: Vec<PathBuf>`) under the platform
-//! config dir, loaded at boot and saved through [`Vfs::atomic_write`] on the
-//! background executor — the UI thread never touches the disk. The file path is
-//! injectable so tests point it at a `FakeVfs` location. M7 grows this into the
-//! real settings store (embedded defaults, watch, keymap overrides).
+//! M2 shipped a stub: one JSON file holding `favorites`, read once at boot.
+//! M7b makes it the real thing, in the shape the theme system already
+//! established:
+//!
+//! * **Embedded defaults, refined by the user file.** `settings/defaults.json`
+//!   is compiled in and is the complete document; the file on disk is a
+//!   *partial* overlay, so a key the user never wrote — or one this version
+//!   does not recognise — can never leave a setting undefined. Unknown keys
+//!   are reported rather than silently dropped.
+//! * **The file is watched.** Editing `settings.json` in a text editor
+//!   applies live, exactly like a theme file. Our own writes come back
+//!   through the same watcher and are recognised as no-ops by comparison.
+//! * **Writes are serialized.** Two settings changed in quick succession must
+//!   not race two `atomic_write`s to the same path — the second could land
+//!   first and lose the first change. One writer task drains a single pending
+//!   slot, so the last content written always wins and no write interleaves.
+//! * **Only what differs from the defaults is written.** The file stays small
+//!   and readable, and a default this app changes later reaches users who
+//!   never overrode it.
+//!
+//! Everything still goes through the `Vfs` on the background executor: the UI
+//! thread never touches the disk (§5).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fs_core::Vfs;
+use futures::StreamExt;
 use futures::future::BoxFuture;
-use gpui::{App, Global};
+use gpui::{App, AppContext as _, BorrowAppContext as _, Global, Task};
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::FsContext;
+use crate::theme::{ActiveTheme, ThemeSelection};
+use crate::watch_guard::BackgroundWatchGuard;
 
-/// The persisted content — everything serde, everything optional-with-default
-/// so old files keep loading as the schema grows.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Debounce for the settings file. An editor saves in a burst (write, rename,
+/// chmod) and one reload per burst is enough.
+pub const SETTINGS_WATCH_LATENCY: Duration = Duration::from_millis(150);
+
+/// The complete document. Compiled in, so a setting always has a value.
+const DEFAULTS_JSON: &str = include_str!("../settings/defaults.json");
+
+/// The settings, as the app reads them: defaults with the user's file applied
+/// on top. Every field is present — "unset" is not a state a reader has to
+/// think about.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SettingsContent {
     /// Sidebar favorites, in display order.
-    #[serde(default)]
     pub favorites: Vec<PathBuf>,
-    /// The chosen theme, by name (M7). Absent means the built-in default —
-    /// which is also what a name that is no longer installed paints, without
-    /// the setting being rewritten (see `ActiveTheme`).
-    #[serde(default)]
-    pub theme: Option<String>,
+    /// The chosen theme: one name, or the light/dark pair that follows the
+    /// system (plan §6's `appearance: system`).
+    pub theme: ThemeSelection,
+    /// Plan §3: "Delete to trash — **Delete** key, no modifier; confirmation
+    /// optional (setting)". Off by default, which is the Explorer behavior
+    /// the app has had since M3.
+    pub confirm_delete_to_trash: bool,
+    /// Plan §3: "Folders always grouped first (setting)". On by default,
+    /// which is `SortSpec::default()`.
+    pub folders_first: bool,
+}
+
+impl Default for SettingsContent {
+    fn default() -> Self {
+        match serde_json::from_str(DEFAULTS_JSON) {
+            Ok(content) => content,
+            // A malformed embedded default is a bug in this crate, not
+            // anything a user did — and a test parses it on every build.
+            Err(error) => panic!("embedded settings defaults are malformed: {error}"),
+        }
+    }
+}
+
+/// The file on disk: every key optional, unknown keys kept so they can be
+/// reported.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct SettingsPartial {
+    favorites: Option<Vec<PathBuf>>,
+    theme: Option<ThemeSelection>,
+    confirm_delete_to_trash: Option<bool>,
+    folders_first: Option<bool>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
+}
+
+impl SettingsPartial {
+    fn merge_onto(self, mut base: SettingsContent, warnings: &mut Vec<String>) -> SettingsContent {
+        if let Some(favorites) = self.favorites {
+            base.favorites = favorites;
+        }
+        if let Some(theme) = self.theme {
+            base.theme = theme;
+        }
+        if let Some(confirm) = self.confirm_delete_to_trash {
+            base.confirm_delete_to_trash = confirm;
+        }
+        if let Some(folders_first) = self.folders_first {
+            base.folders_first = folders_first;
+        }
+        for key in self.unknown.keys() {
+            warnings.push(format!("unknown setting `{key}` ignored"));
+        }
+        base
+    }
 }
 
 /// App settings global (ARCHITECTURE.md §2 `AppSettings`). Mutate via
@@ -36,9 +115,24 @@ pub struct SettingsContent {
 pub struct AppSettings {
     content: SettingsContent,
     path: PathBuf,
+    /// Complaints about the last file read (unknown or malformed keys),
+    /// for the settings window to show.
+    warnings: Vec<String>,
+    /// The one place a pending write lives, shared with the writer task.
+    writer: Arc<Mutex<WriterState>>,
+    _watch: Option<Task<()>>,
+    _guard: Option<BackgroundWatchGuard>,
 }
 
 impl Global for AppSettings {}
+
+/// Serializes writes: one task drains this, so the newest content always wins
+/// and two saves can never interleave on the same path.
+#[derive(Default)]
+struct WriterState {
+    pending: Option<SettingsContent>,
+    writing: bool,
+}
 
 impl AppSettings {
     /// Defaults, persisted at `path`.
@@ -46,6 +140,10 @@ impl AppSettings {
         Self {
             content: SettingsContent::default(),
             path,
+            warnings: Vec::new(),
+            writer: Arc::new(Mutex::new(WriterState::default())),
+            _watch: None,
+            _guard: None,
         }
     }
 
@@ -59,36 +157,94 @@ impl AppSettings {
     }
 
     /// Load settings from `path` through the Vfs. A missing or unparseable
-    /// file yields defaults — settings must never block or fail boot.
+    /// file yields the defaults — settings must never block or fail boot.
     pub async fn load(vfs: Arc<dyn Vfs>, path: PathBuf) -> Self {
-        let content = match vfs.load(&path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => SettingsContent::default(),
+        let mut settings = Self::new(path.clone());
+        let Ok(bytes) = vfs.load(&path).await else {
+            return settings;
         };
-        Self { content, path }
+        let mut warnings = Vec::new();
+        match serde_json::from_slice::<SettingsPartial>(&bytes) {
+            Ok(partial) => {
+                settings.content = partial.merge_onto(SettingsContent::default(), &mut warnings)
+            }
+            Err(error) => warnings.push(format!("settings.json could not be read: {error}")),
+        }
+        settings.warnings = warnings;
+        settings
     }
 
     pub fn global(cx: &App) -> &AppSettings {
         cx.global::<AppSettings>()
     }
 
+    /// Everything as read, for the settings window and for tests.
+    pub fn content(&self) -> &SettingsContent {
+        &self.content
+    }
+
+    /// Complaints about the file as last read.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     pub fn favorites(&self) -> &[PathBuf] {
         &self.content.favorites
     }
 
-    /// The chosen theme's name, if the user has ever picked one.
-    pub fn theme_name(&self) -> Option<&str> {
-        self.content.theme.as_deref()
+    /// The chosen theme. What the picker reads and writes.
+    pub fn theme_selection(&self) -> &ThemeSelection {
+        &self.content.theme
     }
 
     /// Record the chosen theme. Returns whether anything changed.
-    pub fn set_theme_name(&mut self, name: impl Into<String>) -> bool {
-        let name = name.into();
-        if self.content.theme.as_deref() == Some(name.as_str()) {
+    pub fn set_theme_selection(&mut self, selection: ThemeSelection) -> bool {
+        if self.content.theme == selection {
             return false;
         }
-        self.content.theme = Some(name);
+        self.content.theme = selection;
         true
+    }
+
+    /// Plan §3's optional delete confirmation.
+    pub fn confirm_delete_to_trash(&self) -> bool {
+        self.content.confirm_delete_to_trash
+    }
+
+    pub fn set_confirm_delete_to_trash(&mut self, confirm: bool) -> bool {
+        if self.content.confirm_delete_to_trash == confirm {
+            return false;
+        }
+        self.content.confirm_delete_to_trash = confirm;
+        true
+    }
+
+    /// Plan §3's "folders always grouped first".
+    pub fn folders_first(&self) -> bool {
+        self.content.folders_first
+    }
+
+    pub fn set_folders_first(&mut self, folders_first: bool) -> bool {
+        if self.content.folders_first == folders_first {
+            return false;
+        }
+        self.content.folders_first = folders_first;
+        true
+    }
+
+    /// Convenience readers for call sites that only have `&App` — and which
+    /// must keep working before the global is installed (a `#[gpui::test]`
+    /// exercising one view does not boot the settings store).
+    pub fn folders_first_or_default(cx: &App) -> bool {
+        cx.try_global::<AppSettings>()
+            .map(|settings| settings.content.folders_first)
+            .unwrap_or_else(|| SettingsContent::default().folders_first)
+    }
+
+    pub fn confirm_delete_or_default(cx: &App) -> bool {
+        cx.try_global::<AppSettings>()
+            .map(|settings| settings.content.confirm_delete_to_trash)
+            .unwrap_or_else(|| SettingsContent::default().confirm_delete_to_trash)
     }
 
     /// Append a favorite (deduplicated). Returns whether anything changed.
@@ -135,33 +291,95 @@ impl AppSettings {
         self.content.favorites.len() != before
     }
 
-    /// The serialize-and-persist future. [`save`](Self::save) spawns it on the
+    /// The serialize-and-persist future. [`save`](Self::save) drives it on the
     /// background executor; tests await it directly for determinism.
     pub fn save_future(&self, vfs: Arc<dyn Vfs>) -> BoxFuture<'static, anyhow::Result<()>> {
-        let content = self.content.clone();
-        let path = self.path.clone();
-        Box::pin(async move {
-            let json = serde_json::to_vec_pretty(&content)?;
-            vfs.atomic_write(&path, json).await
-        })
+        write_future(vfs, self.path.clone(), self.content.clone())
     }
 
-    /// Persist the current settings in the background (fire-and-forget; a
-    /// failure is logged — M7 adds real error surfacing).
+    /// Persist the current settings in the background. Serialized against any
+    /// write already in flight (see [`WriterState`]); a failure is logged.
     pub fn save(&self, cx: &App) {
         let fs = FsContext::global(cx);
-        let fut = self.save_future(fs.vfs.clone());
+        let vfs = fs.vfs.clone();
+        let path = self.path.clone();
+        let writer = self.writer.clone();
+
+        let start = {
+            let mut state = writer.lock().unwrap();
+            state.pending = Some(self.content.clone());
+            let start = !state.writing;
+            state.writing = true;
+            start
+        };
+        if !start {
+            // A writer is already running; it will pick this content up.
+            return;
+        }
+
         fs.spawner.spawn(Box::pin(async move {
-            if let Err(error) = fut.await {
-                eprintln!("settings: failed to save: {error:#}");
+            loop {
+                let next = {
+                    let mut state = writer.lock().unwrap();
+                    match state.pending.take() {
+                        Some(content) => content,
+                        None => {
+                            state.writing = false;
+                            return;
+                        }
+                    }
+                };
+                if let Err(error) = write_future(vfs.clone(), path.clone(), next).await {
+                    eprintln!("settings: failed to save: {error:#}");
+                }
             }
         }));
     }
 }
 
+/// Serialize **only what differs from the defaults** and write it atomically.
+fn write_future(
+    vfs: Arc<dyn Vfs>,
+    path: PathBuf,
+    content: SettingsContent,
+) -> BoxFuture<'static, anyhow::Result<()>> {
+    Box::pin(async move {
+        let json = serde_json::to_vec_pretty(&user_overrides(&content))?;
+        vfs.atomic_write(&path, json).await
+    })
+}
+
+/// The document to write: the keys whose value is not the compiled-in default.
+/// Keeps the file small and readable, and lets a later change to a default
+/// reach every user who never overrode it.
+fn user_overrides(content: &SettingsContent) -> serde_json::Value {
+    let defaults = SettingsContent::default();
+    let mut map = serde_json::Map::new();
+    if content.favorites != defaults.favorites {
+        map.insert("favorites".into(), serde_json::json!(content.favorites));
+    }
+    if content.theme != defaults.theme {
+        map.insert("theme".into(), serde_json::json!(content.theme));
+    }
+    if content.confirm_delete_to_trash != defaults.confirm_delete_to_trash {
+        map.insert(
+            "confirm_delete_to_trash".into(),
+            serde_json::json!(content.confirm_delete_to_trash),
+        );
+    }
+    if content.folders_first != defaults.folders_first {
+        map.insert(
+            "folders_first".into(),
+            serde_json::json!(content.folders_first),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
 /// Install the [`AppSettings`] global: defaults immediately (so readers never
 /// find it missing), then the on-disk content swapped in from a background
-/// load. Requires [`FsContext`] to be initialized first.
+/// load, and then the file is kept watched. Requires [`FsContext`] to be
+/// initialized first.
 pub fn init(cx: &mut App) {
     init_with_path(cx, AppSettings::default_path());
 }
@@ -170,28 +388,104 @@ pub fn init(cx: &mut App) {
 pub fn init_with_path(cx: &mut App, path: PathBuf) {
     let vfs = FsContext::global(cx).vfs.clone();
     cx.set_global(AppSettings::new(path.clone()));
+    let load_path = path.clone();
+    let load_vfs = vfs.clone();
     cx.spawn(async move |cx| {
-        let loaded = AppSettings::load(vfs, path).await;
+        let loaded = AppSettings::load(load_vfs, load_path).await;
         cx.update(|cx| {
             // Don't clobber changes made between boot and load completion.
             if AppSettings::global(cx).content == SettingsContent::default() {
-                let theme = loaded.theme_name().map(str::to_string);
-                cx.set_global(loaded);
-                // The theme system booted on the default while this load was
-                // in flight; apply the user's choice now that it is here.
-                if let Some(theme) = theme {
-                    crate::theme::ActiveTheme::select(theme, cx);
-                }
+                apply_loaded(loaded, cx);
             }
         });
     })
     .detach();
+    start_watching(cx, path);
+}
+
+/// Swap in freshly-read content and let the rest of the app act on it. The
+/// theme is the one setting with a live consumer outside the global itself;
+/// everything else is read from the global at the point of use, and the
+/// `observe_global` subscribers repaint on the swap.
+///
+/// The store's own machinery — the writer slot, the watch task and its guard —
+/// belongs to the *store*, not to the content it is holding, so only the
+/// content and its warnings are replaced here.
+fn apply_loaded(loaded: AppSettings, cx: &mut App) {
+    let AppSettings {
+        content, warnings, ..
+    } = loaded;
+    let theme_changed = cx.update_global::<AppSettings, _>(|settings, _| {
+        let theme_changed = settings.content.theme != content.theme;
+        settings.content = content;
+        settings.warnings = warnings;
+        theme_changed
+    });
+    // **Only** when the file actually moved it. Pushing unconditionally would
+    // mean every settings load overrides whatever the theme system was told
+    // by anyone else — which is precisely what the visual-test runner does
+    // when it installs a per-scenario theme while a settings load is still in
+    // flight, and it would have rendered `workspace_light` in the dark theme.
+    if theme_changed {
+        let selection = AppSettings::global(cx).content.theme.clone();
+        ActiveTheme::set_selection(selection, cx);
+    }
+}
+
+/// Keep `settings.json` live. The **parent directory** is watched rather than
+/// the file: an atomic write replaces the file, which some backends report as
+/// a directory change rather than a change to the (now different) inode.
+fn start_watching(cx: &mut App, path: PathBuf) {
+    let vfs = FsContext::global(cx).vfs.clone();
+    let executor = cx.background_executor().clone();
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let watch_vfs = vfs.clone();
+    let task = cx.spawn(async move |cx| {
+        let (mut stream, guard) = cx
+            .background_spawn(async move { watch_vfs.watch(&dir, SETTINGS_WATCH_LATENCY) })
+            .await;
+        let guard = BackgroundWatchGuard::new(guard, executor);
+        let stored = cx.update(|cx| {
+            if !cx.has_global::<AppSettings>() {
+                return false;
+            }
+            cx.update_global::<AppSettings, _>(|settings, _| settings._guard = Some(guard));
+            true
+        });
+        if !stored {
+            return;
+        }
+        while let Some(batch) = stream.next().await {
+            if !batch.iter().any(|event| event.path.as_ref() == path) {
+                continue;
+            }
+            let reloaded = cx
+                .background_spawn(AppSettings::load(vfs.clone(), path.clone()))
+                .await;
+            cx.update(|cx| {
+                if !cx.has_global::<AppSettings>() {
+                    return;
+                }
+                // Our own `save` comes back through here; recognising it as a
+                // no-op is what stops a write from causing a repaint storm.
+                if AppSettings::global(cx).content == reloaded.content {
+                    return;
+                }
+                apply_loaded(reloaded, cx);
+            });
+        }
+    });
+    cx.update_global::<AppSettings, _>(|settings, _| settings._watch = Some(task));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app_state::{GpuiSpawner, LoggingOpener};
+    use crate::theme::ThemeSelection;
     use fs_core::{FakeVfs, Spawner, StubPlatform, TestSpawner};
     use futures::executor::block_on;
     use gpui::TestAppContext;
@@ -206,19 +500,36 @@ mod tests {
         let path = PathBuf::from("/config/file-explorer/settings.json");
 
         let mut settings = AppSettings::new(path.clone());
-        assert_eq!(settings.theme_name(), None, "no choice until one is made");
-        assert!(settings.set_theme_name("Midnight"));
-        assert!(!settings.set_theme_name("Midnight"), "same name, no change");
+        assert_eq!(
+            settings.theme_selection(),
+            &ThemeSelection::default(),
+            "the compiled-in default until a choice is made"
+        );
+        assert!(settings.set_theme_selection(ThemeSelection::Static("Midnight".into())));
+        assert!(
+            !settings.set_theme_selection(ThemeSelection::Static("Midnight".into())),
+            "same selection, no change"
+        );
         block_on(settings.save_future(vfs.clone())).unwrap();
 
         let loaded = block_on(AppSettings::load(vfs.clone(), path.clone()));
-        assert_eq!(loaded.theme_name(), Some("Midnight"));
+        assert_eq!(
+            loaded.theme_selection(),
+            &ThemeSelection::Static("Midnight".into())
+        );
+
+        // The `appearance: system` form survives the same trip.
+        let mut settings = loaded;
+        assert!(settings.set_theme_selection(ThemeSelection::system()));
+        block_on(settings.save_future(vfs.clone())).unwrap();
+        let loaded = block_on(AppSettings::load(vfs.clone(), path.clone()));
+        assert_eq!(loaded.theme_selection(), &ThemeSelection::system());
 
         // A settings.json written before M7 has no `theme` key at all; it must
         // keep loading, with the default theme.
         block_on(vfs.atomic_write(&path, br#"{ "favorites": ["/home/me"] }"#.to_vec())).unwrap();
         let old = block_on(AppSettings::load(vfs, path));
-        assert_eq!(old.theme_name(), None);
+        assert_eq!(old.theme_selection(), &ThemeSelection::default());
         assert_eq!(old.favorites(), [PathBuf::from("/home/me")]);
     }
 
@@ -313,6 +624,209 @@ mod tests {
         assert!(sparse.favorites().is_empty());
     }
 
+    #[test]
+    fn the_embedded_defaults_parse_and_are_the_documented_behavior() {
+        let defaults = SettingsContent::default();
+        assert!(defaults.favorites.is_empty());
+        assert_eq!(
+            defaults.theme,
+            ThemeSelection::Static("Graphite Dark".into())
+        );
+        // Both §3 behaviors default to what the app already did before they
+        // became settings, which is why M7b moves no baseline.
+        assert!(!defaults.confirm_delete_to_trash);
+        assert!(defaults.folders_first);
+        assert_eq!(defaults, SettingsContent::default(), "parse is stable");
+    }
+
+    #[test]
+    fn a_partial_file_keeps_every_default_it_does_not_mention() {
+        let vfs = fake_vfs();
+        let path = PathBuf::from("/config/settings.json");
+        block_on(vfs.atomic_write(&path, br#"{ "folders_first": false }"#.to_vec())).unwrap();
+
+        let loaded = block_on(AppSettings::load(vfs, path));
+        assert!(!loaded.folders_first(), "the one key the file set");
+        assert_eq!(loaded.theme_selection(), &ThemeSelection::default());
+        assert!(!loaded.confirm_delete_to_trash());
+        assert!(loaded.favorites().is_empty());
+        assert!(loaded.warnings().is_empty());
+    }
+
+    #[test]
+    fn unknown_and_malformed_keys_are_reported_rather_than_swallowed() {
+        let vfs = fake_vfs();
+        let path = PathBuf::from("/config/settings.json");
+
+        block_on(vfs.atomic_write(
+            &path,
+            br#"{ "folders_first": false, "foldrs_first": true }"#.to_vec(),
+        ))
+        .unwrap();
+        let typo = block_on(AppSettings::load(vfs.clone(), path.clone()));
+        assert!(!typo.folders_first());
+        assert_eq!(
+            typo.warnings(),
+            ["unknown setting `foldrs_first` ignored".to_string()]
+        );
+
+        // A structurally broken file loads the defaults *and says so*, rather
+        // than looking like an empty settings file.
+        block_on(vfs.atomic_write(&path, b"{ not json".to_vec())).unwrap();
+        let broken = block_on(AppSettings::load(vfs, path));
+        assert!(broken.folders_first(), "back to the default");
+        assert_eq!(broken.warnings().len(), 1);
+        assert!(broken.warnings()[0].contains("could not be read"));
+    }
+
+    /// The write path is a diff against the defaults, so a settings file only
+    /// ever grows keys the user actually changed.
+    #[test]
+    fn only_overridden_keys_are_written() {
+        let mut settings = AppSettings::new(PathBuf::from("/config/settings.json"));
+        assert_eq!(user_overrides(settings.content()), serde_json::json!({}));
+
+        settings.set_folders_first(false);
+        assert_eq!(
+            user_overrides(settings.content()),
+            serde_json::json!({ "folders_first": false })
+        );
+
+        // Setting it back to the default removes it from the file again.
+        settings.set_folders_first(true);
+        assert_eq!(user_overrides(settings.content()), serde_json::json!({}));
+    }
+
+    /// Two saves in a row must not race two `atomic_write`s at one path: the
+    /// second could land first and lose the newer content.
+    #[gpui::test]
+    async fn rapid_saves_are_serialized_and_the_last_one_wins(cx: &mut TestAppContext) {
+        let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
+        let vfs = FakeVfs::new(spawner.clone());
+        let path = PathBuf::from("/config/settings.json");
+        cx.update(|cx| {
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
+            let mut settings = AppSettings::new(path.clone());
+            for name in ["a", "b", "c"] {
+                settings.add_favorite(PathBuf::from(format!("/{name}")));
+                settings.save(cx);
+            }
+            cx.set_global(settings);
+        });
+        cx.background_executor.run_until_parked();
+
+        let bytes = vfs.load(&path).await.expect("written");
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({ "favorites": ["/a", "/b", "/c"] }),
+            "the newest content must be what is on disk"
+        );
+    }
+
+    /// Editing `settings.json` in a text editor applies live — and the theme,
+    /// the one setting with a consumer outside the global, follows it.
+    #[gpui::test]
+    async fn an_external_edit_is_picked_up_without_a_restart(cx: &mut TestAppContext) {
+        let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
+        let vfs = FakeVfs::new(spawner.clone());
+        let path = PathBuf::from("/config/settings.json");
+        vfs.insert_dir("/config");
+        cx.update(|cx| {
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
+            crate::theme::ActiveTheme::init_in(
+                PathBuf::from("/config/themes"),
+                ThemeSelection::default(),
+                cx,
+            );
+            init_with_path(cx, path.clone());
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert!(AppSettings::global(cx).folders_first()));
+
+        vfs.write_file(
+            &path,
+            br#"{ "folders_first": false, "theme": "Graphite Light" }"#.to_vec(),
+        );
+        cx.executor()
+            .advance_clock(SETTINGS_WATCH_LATENCY + Duration::from_millis(10));
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                !AppSettings::global(cx).folders_first(),
+                "the external edit did not reach the global"
+            );
+            assert_eq!(
+                crate::theme::theme(cx).name,
+                gpui::SharedString::from("Graphite Light"),
+                "the theme named by the edited file is not painted"
+            );
+        });
+    }
+
+    /// A settings load that does not change the theme must leave the theme
+    /// alone. The visual-test runner installs a per-scenario theme while the
+    /// settings load is still in flight; before this rule, that load pushed
+    /// the file's (default) theme over it and every light scenario captured
+    /// the dark one.
+    #[gpui::test]
+    async fn a_settings_load_that_changes_no_theme_does_not_touch_the_theme(
+        cx: &mut TestAppContext,
+    ) {
+        let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
+        let vfs = FakeVfs::new(spawner.clone());
+        let path = PathBuf::from("/config/settings.json");
+        // A file with no `theme` key at all — the common case.
+        vfs.insert_tree("/config", serde_json::json!({}));
+        block_on(vfs.atomic_write(&path, br#"{ "favorites": ["/home/me"] }"#.to_vec())).unwrap();
+
+        cx.update(|cx| {
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
+            crate::theme::ActiveTheme::init_in(
+                PathBuf::from("/config/themes"),
+                ThemeSelection::default(),
+                cx,
+            );
+            init_with_path(cx, path.clone());
+            // Someone else picks a theme while the load is in flight — the
+            // runner does exactly this.
+            crate::theme::ActiveTheme::select("Graphite Light", cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                crate::theme::theme(cx).name,
+                gpui::SharedString::from("Graphite Light"),
+                "the settings load overrode a theme it had no opinion about"
+            );
+            assert_eq!(
+                AppSettings::global(cx).favorites(),
+                [PathBuf::from("/home/me")],
+                "...but the rest of the file still loaded"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn save_persists_in_the_background_and_init_loads_at_boot(cx: &mut TestAppContext) {
         let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
@@ -338,8 +852,14 @@ mod tests {
         });
         cx.background_executor.run_until_parked();
         let bytes = vfs.load(&path).await.expect("settings file was written");
-        let content: SettingsContent = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(content.favorites, [PathBuf::from("/home/me/Music")]);
+        // Only what differs from the compiled-in defaults is written, so the
+        // file is one key wide however many settings exist.
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({ "favorites": ["/home/me/Music"] }),
+            "the file should carry the override and nothing else"
+        );
 
         // A fresh boot's init_with_path swaps the persisted content in.
         cx.update(|cx| init_with_path(cx, path));

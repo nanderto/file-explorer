@@ -31,5 +31,5 @@ pub mod visual_diff;
 pub(crate) mod watch_guard;
 pub mod workspace;
 
-pub use crate::theme::{ActiveTheme, Theme};
+pub use crate::theme::{ActiveTheme, Theme, ThemeSelection};
 pub use workspace::Workspace;

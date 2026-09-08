@@ -886,7 +886,6 @@ impl Render for Sidebar {
 mod tests {
     use super::*;
     use crate::app_state::{GpuiSpawner, LoggingOpener};
-    use crate::settings::SettingsContent;
     use fs_core::{FakeVfs, Spawner, Vfs as _};
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -1004,8 +1003,7 @@ mod tests {
         // Persisted immediately: the settings file already holds the favorite.
         let bytes = futures::executor::block_on(vfs.load(Path::new(SETTINGS_PATH)))
             .expect("settings file written");
-        let content: SettingsContent = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(content.favorites, [PathBuf::from("/root")]);
+        assert_eq!(written_favorites(&bytes), [PathBuf::from("/root")]);
 
         // Adding the same folder again is a no-op.
         sidebar.update(cx, |sidebar, cx| sidebar.add_current_folder(cx));
@@ -1021,8 +1019,7 @@ mod tests {
         cx.run_until_parked();
         let bytes = futures::executor::block_on(vfs.load(Path::new(SETTINGS_PATH)))
             .expect("settings file rewritten");
-        let content: SettingsContent = serde_json::from_slice(&bytes).unwrap();
-        assert!(content.favorites.is_empty(), "removal persisted");
+        assert!(written_favorites(&bytes).is_empty(), "removal persisted");
     }
 
     /// The persisted favorites, read back off the settings file — the only
@@ -1030,9 +1027,21 @@ mod tests {
     fn persisted_favorites(vfs: &Arc<FakeVfs>) -> Vec<PathBuf> {
         let bytes = futures::executor::block_on(vfs.load(Path::new(SETTINGS_PATH)))
             .expect("settings file written");
-        serde_json::from_slice::<SettingsContent>(&bytes)
-            .unwrap()
-            .favorites
+        written_favorites(&bytes)
+    }
+
+    /// M7b writes **only the keys that differ from the compiled-in
+    /// defaults**, so the file is not a whole `SettingsContent` and must not
+    /// be parsed as one — an absent `favorites` key means "none", not a
+    /// malformed file.
+    fn written_favorites(bytes: &[u8]) -> Vec<PathBuf> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).expect("valid JSON");
+        value
+            .get("favorites")
+            .map(|favorites| {
+                serde_json::from_value::<Vec<PathBuf>>(favorites.clone()).expect("path list")
+            })
+            .unwrap_or_default()
     }
 
     /// Press on `from`, cross gpui's 2px drag threshold, settle on `to`, and

@@ -613,4 +613,10 @@ watching it belongs to the app (see
   `settings.json` stores), so a user theme named exactly like a built-in
   *replaces* it — the documented way to re-tint the shipped look.
   `get_or_default` is the "the named theme is gone" path.
-- 19 tests in the crate (7 color, 12 model/registry).
+- **`ThemeSelection`** (M7b) is what the user picked, which is not always one
+  theme: `Static(name)`, or `Dynamic { light, dark }` — plan §6's
+  `appearance: system`, a *pair* so the app follows macOS's switch live
+  rather than picking one side and staying there. `name_for(appearance)`
+  resolves it. Serde-`untagged`, so `settings.json` reads naturally in both
+  spellings and both round-trip.
+- 22 tests in the crate (7 color, 15 model/registry/selection).

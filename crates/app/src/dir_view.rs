@@ -111,6 +111,11 @@ const FALLBACK_PAGE_ROWS: usize = 20;
 pub enum DirViewEvent {
     /// A folder was opened (Enter / double-click).
     NavigateTo(PathBuf),
+    /// A trash delete that the user asked to be asked about (plan §3's
+    /// optional confirmation). The dialog belongs to the workspace, so the
+    /// paths travel up rather than the dialog coming down — events up,
+    /// method calls down (§2).
+    ConfirmTrash(Vec<PathBuf>),
 }
 
 #[cfg(test)]
@@ -517,6 +522,13 @@ impl DirView {
     pub fn delete_selection_to_trash(&mut self, cx: &mut Context<Self>) {
         let paths = self.selection.selected_paths_rootmost();
         if paths.is_empty() {
+            return;
+        }
+        // Plan §3: the trash is undoable, so the confirmation is *optional*
+        // and off by default — Explorer's behavior. When it is on, the
+        // workspace asks and submits; nothing is queued from here.
+        if crate::settings::AppSettings::confirm_delete_or_default(cx) {
+            cx.emit(DirViewEvent::ConfirmTrash(paths));
             return;
         }
         FsContext::global(cx)
