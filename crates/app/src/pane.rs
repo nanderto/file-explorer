@@ -25,13 +25,12 @@ use std::time::Duration;
 
 use fs_core::{
     EntryId, ListingCache, ListingSnapshot, ResolvedBatch, SortDirection, SortKey, SortSpec, Vfs,
-    WatchGuard, list_dir, patch_listing, resolve_watch_batch,
+    list_dir, patch_listing, resolve_watch_batch,
 };
 use futures::StreamExt as _;
 use gpui::{
-    App, BackgroundExecutor, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseButton, NavigationDirection, Render, SharedString, Subscription, Task, Window, div,
-    prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
+    NavigationDirection, Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
 use crate::actions::{
@@ -43,7 +42,7 @@ use crate::app_state::FsContext;
 use crate::dir_view::{DirView, DirViewEvent};
 use crate::rename::NewEntryKind;
 use crate::search::{SearchBar, SearchBarEvent, SearchState};
-use crate::theme::Theme;
+use crate::watch_guard::BackgroundWatchGuard;
 
 /// Debounce window for the open directory's watcher (ARCHITECTURE.md §4a:
 /// `vfs.watch(path, 100ms)`). Runs on [`fs_core::Spawner::timer`], so
@@ -128,40 +127,6 @@ impl NavHistory {
     }
 }
 
-/// A [`WatchGuard`] whose *unregistration* is kept off the UI thread.
-///
-/// Registering a watch is not the only blocking, disk-touching half of
-/// `Vfs::watch`: dropping the guard calls the backend's `unwatch`, which on
-/// macOS stops and joins an FSEvents run-loop thread and canonicalizes the
-/// path again. So the guard is never dropped in place — dropping this wrapper
-/// hands it to the background executor (§5: the UI thread never touches the
-/// disk).
-struct BackgroundWatchGuard {
-    guard: Option<WatchGuard>,
-    executor: BackgroundExecutor,
-}
-
-impl BackgroundWatchGuard {
-    fn new(guard: WatchGuard, executor: BackgroundExecutor) -> Self {
-        Self {
-            guard: Some(guard),
-            executor,
-        }
-    }
-}
-
-impl Drop for BackgroundWatchGuard {
-    fn drop(&mut self) {
-        if let Some(guard) = self.guard.take() {
-            self.executor
-                .spawn(async move {
-                    drop(guard);
-                })
-                .detach();
-        }
-    }
-}
-
 /// What `SetViewColumns` tells the user while `views/columns.rs` is still a
 /// §8 stretch item. A constant so the toast text and its test cannot drift.
 pub const COLUMNS_UNAVAILABLE_NOTICE: &str = "Column view isn't available yet";
@@ -202,7 +167,6 @@ impl ViewMode {
 
 pub struct Pane {
     focus_handle: FocusHandle,
-    theme: Theme,
     vfs: Arc<dyn Vfs>,
     history: NavHistory,
     /// Directory currently shown (target of the newest load).
@@ -280,7 +244,7 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vfs = FsContext::global(cx).vfs.clone();
         let focus_handle = cx.focus_handle();
         // Events up (§2): the workspace tracks the active pane **by focus**,
@@ -291,13 +255,13 @@ impl Pane {
             cx.emit(PaneEvent::FocusIn);
         });
         let pane = cx.weak_entity();
-        let dir_view = cx.new(|cx| DirView::new(theme.clone(), pane, cx));
+        let dir_view = cx.new(|cx| DirView::new(pane, cx));
         // Events up, method calls down (§2): the DirView reports opened
         // folders; the pane navigates.
         let subscription = cx.subscribe(&dir_view, |this, _, event, cx| match event {
             DirViewEvent::NavigateTo(path) => this.navigate_to(path, cx),
         });
-        let address_bar_view = cx.new(|cx| AddressBar::new(theme.clone(), cx));
+        let address_bar_view = cx.new(AddressBar::new);
         // §8 address bar: confirmed paths navigate; escape/cancel restores the
         // breadcrumb; both hand keyboard focus back to the pane.
         let bar_subscription = cx.subscribe_in(
@@ -315,7 +279,7 @@ impl Pane {
                 }
             },
         );
-        let search_bar = cx.new(|cx| SearchBar::new(theme.clone(), cx));
+        let search_bar = cx.new(SearchBar::new);
         // §0 search: the field reports text and toggles; the pane owns the
         // query, the results and the walk (events up, method calls down).
         let search_subscription = cx.subscribe_in(
@@ -347,7 +311,6 @@ impl Pane {
             _tag_filter_task: None,
             tag_filter_generation: 0,
             focus_handle,
-            theme,
             vfs,
             history: NavHistory::default(),
             path: None,
@@ -996,7 +959,7 @@ impl Pane {
     /// The address-bar row (§8): breadcrumb segments, or the editor while
     /// `AddressBarMode::Editing`. Clicking blank space enters editing mode.
     fn render_chrome_row(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let row = div()
             .flex()
             .items_start()
@@ -1094,7 +1057,7 @@ impl Pane {
     /// pane's handler regardless of where focus was (a click on a control is
     /// not a reason for the action to land in a *different* pane).
     fn render_view_switcher(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let mut switcher = div()
             .flex()
             .items_center()
@@ -1145,7 +1108,7 @@ impl Pane {
 
 impl Render for Pane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let body: gpui::AnyElement = if self.path.is_none() {
             div()
                 .flex()
@@ -1347,7 +1310,7 @@ mod tests {
     }
 
     fn build_pane(cx: &mut TestAppContext) -> (Entity<Pane>, &mut VisualTestContext) {
-        cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx))
+        cx.add_window_view(Pane::new)
     }
 
     fn entry_id(path: &str) -> EntryId {

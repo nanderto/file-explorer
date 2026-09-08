@@ -182,27 +182,27 @@ pub struct DraggedFavorite {
 /// The drag preview rendered under the cursor. Colors from the [`Theme`].
 pub struct DragGhost {
     label: SharedString,
-    theme: Theme,
 }
 
 impl Render for DragGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::theme(cx);
         div()
             .px(px(8.0))
             .py(px(3.0))
             .rounded(px(4.0))
             .border_1()
-            .border_color(self.theme.accent)
-            .bg(self.theme.panel)
+            .border_color(theme.accent)
+            .bg(theme.panel)
             .text_size(px(12.0))
-            .text_color(self.theme.text)
+            .text_color(theme.text)
             .child(self.label.clone())
     }
 }
 
 /// Build a drag ghost (called from `on_drag` constructors).
-pub(crate) fn ghost(label: SharedString, theme: Theme, cx: &mut App) -> Entity<DragGhost> {
-    cx.new(|_| DragGhost { label, theme })
+pub(crate) fn ghost(label: SharedString, cx: &mut App) -> Entity<DragGhost> {
+    cx.new(|_| DragGhost { label })
 }
 
 /// The outbound (us → Finder) payload for `external_drag_payload`: real paths
@@ -687,7 +687,7 @@ pub(crate) fn with_drop_handlers(
 fn background_highlight(view: &DirView, cx: &App) -> Option<Div> {
     match view.active_drop_target(cx)? {
         DropTarget::Background => {
-            let theme = view.theme();
+            let theme = crate::theme::theme(cx);
             Some(
                 div()
                     .absolute()
@@ -731,7 +731,6 @@ mod tests {
     use crate::marquee::list_viewport;
     use crate::pane::Pane;
     use crate::selection::SelectionModel;
-    use crate::theme::Theme;
     use fs_core::{FakeVfs, FileEntry, Spawner};
     use gpui::{Entity, FileDropEvent, Modifiers, TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -1079,7 +1078,7 @@ mod tests {
         &mut VisualTestContext,
     ) {
         let vfs = init_test(cx);
-        let (pane, cx) = cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(Pane::new);
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
         cx.run_until_parked();
         let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());

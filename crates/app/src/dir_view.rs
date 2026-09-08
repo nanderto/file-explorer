@@ -89,7 +89,6 @@ use crate::rename::RenameState;
 use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionModel;
 use crate::tags::TagState;
-use crate::theme::Theme;
 use crate::thumbnails::ThumbnailState;
 use crate::views::{details_list, icon_grid};
 
@@ -160,7 +159,6 @@ pub struct ProjectedRow {
 
 pub struct DirView {
     focus_handle: FocusHandle,
-    theme: Theme,
     pane: WeakEntity<Pane>,
     /// The full path-keyed selection (§2): cursor + multi-select set + range
     /// anchor. Path keys are what make it survive re-sorts, watcher patches,
@@ -242,10 +240,9 @@ pub struct DirView {
 }
 
 impl DirView {
-    pub fn new(theme: Theme, pane: WeakEntity<Pane>, cx: &mut Context<Self>) -> Self {
+    pub fn new(pane: WeakEntity<Pane>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            theme,
             pane,
             selection: SelectionModel::default(),
             expanded: BTreeSet::new(),
@@ -1299,10 +1296,6 @@ impl DirView {
         (self.expanded.len(), self.children.len())
     }
 
-    pub(crate) fn theme(&self) -> &Theme {
-        &self.theme
-    }
-
     pub(crate) fn scroll_handle(&self) -> &UniformListScrollHandle {
         &self.scroll_handle
     }
@@ -1322,7 +1315,7 @@ impl Focusable for DirView {
 
 impl Render for DirView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let pane = self.pane.upgrade();
         let sort = pane.as_ref().map(|p| p.read(cx).sort()).unwrap_or_default();
         let load_error = pane
@@ -1619,7 +1612,7 @@ mod tests {
     }
 
     fn build_pane(cx: &mut TestAppContext) -> (Entity<Pane>, &mut VisualTestContext) {
-        cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx))
+        cx.add_window_view(Pane::new)
     }
 
     fn entry_id(path: &str) -> EntryId {

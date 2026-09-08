@@ -21,7 +21,6 @@ pub enum ConfirmDialogEvent {
 }
 
 pub struct ConfirmDialog {
-    theme: Theme,
     title: SharedString,
     message: SharedString,
     confirm_label: SharedString,
@@ -32,14 +31,12 @@ impl EventEmitter<ConfirmDialogEvent> for ConfirmDialog {}
 
 impl ConfirmDialog {
     pub fn new(
-        theme: Theme,
         title: impl Into<SharedString>,
         message: impl Into<SharedString>,
         confirm_label: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            theme,
             title: title.into(),
             message: message.into(),
             confirm_label: confirm_label.into(),
@@ -64,7 +61,7 @@ impl Focusable for ConfirmDialog {
 
 impl Render for ConfirmDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         div()
             .track_focus(&self.focus_handle)
             .key_context("ConfirmDialog")

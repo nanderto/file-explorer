@@ -880,11 +880,21 @@ mod macos {
         // of every scenario declared after it. Same reason the window is
         // closed below: scenarios must not depend on declaration order.
         install_fixture_vfs(cx);
+        // The theme is a global now (M7). Installed per scenario, against a
+        // themes folder the fixture does not contain, so a capture sees the
+        // built-ins and nothing a developer happens to have on disk.
+        cx.update(|cx| {
+            file_explorer_app::ActiveTheme::init_in(
+                PathBuf::from("/config/themes"),
+                theme.name.clone(),
+                cx,
+            )
+        });
 
         let mut workspace_slot: Option<Entity<Workspace>> = None;
         let window = cx
             .open_offscreen_window(size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(theme, window, cx));
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
                 workspace_slot = Some(workspace.clone());
                 workspace
             })

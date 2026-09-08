@@ -1,0 +1,26 @@
+{
+  "name": "Graphite Dark",
+  "appearance": "dark",
+  "colors": {
+    "surface": "hsl(240, 4%, 12%)",
+    "sidebar": "hsl(240, 5%, 15%)",
+    "panel": "hsl(240, 4%, 10%)",
+    "titlebar": "hsl(240, 5%, 15%)",
+    "text": "hsl(0, 0%, 92%)",
+    "muted": "hsl(0, 0%, 55%)",
+    "accent": "hsl(210, 90%, 55%)",
+    "selection": "hsla(210, 90%, 55%, 0.3)",
+    "border": "hsla(0, 0%, 0%, 0.35)",
+    "error": "hsl(0, 75%, 58%)"
+  },
+  "file_colors": {
+    "folder": "hsl(210, 90%, 62%)",
+    "image": "hsl(280, 60%, 68%)",
+    "code": "hsl(150, 55%, 58%)",
+    "archive": "hsl(35, 70%, 60%)",
+    "audio": "hsl(330, 60%, 66%)",
+    "video": "hsl(15, 70%, 62%)",
+    "document": "hsl(0, 0%, 72%)",
+    "other": "hsl(0, 0%, 55%)"
+  }
+}

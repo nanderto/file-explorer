@@ -30,7 +30,6 @@ pub enum ConflictDialogEvent {
 }
 
 pub struct ConflictDialog {
-    theme: Theme,
     conflict: Conflict,
     apply_to_all: bool,
     focus_handle: FocusHandle,
@@ -39,9 +38,8 @@ pub struct ConflictDialog {
 impl EventEmitter<ConflictDialogEvent> for ConflictDialog {}
 
 impl ConflictDialog {
-    pub fn new(theme: Theme, conflict: Conflict, cx: &mut Context<Self>) -> Self {
+    pub fn new(conflict: Conflict, cx: &mut Context<Self>) -> Self {
         Self {
-            theme,
             conflict,
             apply_to_all: false,
             focus_handle: cx.focus_handle(),
@@ -96,8 +94,12 @@ impl ConflictDialog {
 
     /// One side of the size + date comparison (plan §3 "with size+date
     /// comparison").
-    fn comparison_column(&self, label: &'static str, meta: &EntryMeta) -> impl IntoElement {
-        let theme = &self.theme;
+    fn comparison_column(
+        &self,
+        label: &'static str,
+        meta: &EntryMeta,
+        theme: &Theme,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -131,7 +133,7 @@ impl Focusable for ConflictDialog {
 
 impl Render for ConflictDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let name: SharedString = self
             .conflict
             .dest
@@ -172,8 +174,8 @@ impl Render for ConflictDialog {
                     .rounded(px(4.0))
                     .border_1()
                     .border_color(theme.border)
-                    .child(self.comparison_column("Existing", &self.conflict.dest_meta))
-                    .child(self.comparison_column("New", &self.conflict.src_meta)),
+                    .child(self.comparison_column("Existing", &self.conflict.dest_meta, &theme))
+                    .child(self.comparison_column("New", &self.conflict.src_meta, &theme)),
             )
             // Apply-to-all toggle (a).
             .child(

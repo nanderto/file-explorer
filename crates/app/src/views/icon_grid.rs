@@ -277,7 +277,7 @@ fn render_tile(
     }
 
     let entry = &row.entry;
-    let theme = this.theme().clone();
+    let theme = crate::theme::theme(cx).clone();
     let selected = this.selection().is_selected(&entry.id());
     // Cut-pending entries render dimmed (§4b, same clipboard check as the
     // details row).
@@ -344,11 +344,10 @@ fn render_tile(
     if this.rename.is_none() {
         let dragged = this.drag_payload(entry.path.clone());
         let ghost_label = dragged.label();
-        let ghost_theme = theme.clone();
         let view = cx.weak_entity();
         tile = tile
             .on_drag(dragged, move |_, _, _, cx| {
-                drag::ghost(ghost_label.clone(), ghost_theme.clone(), cx)
+                drag::ghost(ghost_label.clone(), cx)
             })
             .external_drag_payload(move |dragged: &drag::DraggedEntries, _, cx| {
                 let entries = view
@@ -433,13 +432,16 @@ fn render_rename_tile(
     ix: usize,
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
-    let theme = this.theme().clone();
+    let theme = crate::theme::theme(cx).clone();
     let thumbnail = this.thumbnail_image(&row.entry);
     let rename = this
         .rename
         .as_ref()
         .expect("render_rename_tile requires an active rename");
     let input = rename.input().clone();
+    // The inline editor holds its colors as state; keep it current so a
+    // theme change lands mid-rename too (see `crate::input`).
+    crate::input::refresh_input_colors(&input, cx);
     let processing = rename.processing().cloned();
     let error = rename.error().cloned();
 

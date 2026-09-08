@@ -42,6 +42,10 @@ once_cell.workspace = true
 regex.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The theme model + JSON loader (plan §6). Aliased so `crate::theme` (the
+# app-side glue: the ActiveTheme global, the themes-folder watcher) and
+# `::theme` (the model) can both be spelled unambiguously.
+theme = { package = "file-explorer-theme", path = "../theme" }
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use fs_core::EntryId;
 use gpui::{
-    Bounds, Context, Div, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, Point, Render, Stateful, Task, Window, div, point, prelude::*, px,
+    App, Bounds, Context, Div, DragMoveEvent, IntoElement, MouseButton, MouseDownEvent,
+    MouseUpEvent, Pixels, Point, Render, Stateful, Task, Window, div, point, prelude::*, px,
 };
 
 use crate::app_state::FsContext;
@@ -535,7 +535,7 @@ pub(crate) fn list_surface(
         .on_mouse_up(MouseButton::Left, cx.listener(DirView::end_marquee))
         .on_mouse_up_out(MouseButton::Left, cx.listener(DirView::end_marquee))
         .child(body)
-        .children(render_marquee(view))
+        .children(render_marquee(view, cx))
         // The M4 auto-hide scrollbar: an absolute overlay in the same
         // positioning context as the band, so it reserves no width and
         // shifts no row (see `crate::scrollbar`).
@@ -545,7 +545,7 @@ pub(crate) fn list_surface(
 /// The band itself: an absolutely-positioned translucent accent rectangle,
 /// clamped to the viewport (the band lives in content space and may run well
 /// past both edges).
-fn render_marquee(view: &DirView) -> Option<Div> {
+fn render_marquee(view: &DirView, cx: &App) -> Option<Div> {
     let rect = view.marquee.as_ref()?.rect()?;
     let viewport = list_viewport(view);
     let (width, height) = (
@@ -567,7 +567,7 @@ fn render_marquee(view: &DirView) -> Option<Div> {
             .clamp(0.0, width)
             .max(rect.left.clamp(0.0, width)),
     );
-    let theme = view.theme();
+    let theme = crate::theme::theme(cx);
     Some(
         div()
             .absolute()
@@ -596,7 +596,6 @@ mod tests {
 
     use crate::app_state::{GpuiSpawner, LoggingOpener};
     use crate::pane::Pane;
-    use crate::theme::Theme;
     use fs_core::{FakeVfs, Spawner};
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
     use serde_json::{Value, json};
@@ -813,7 +812,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<Pane>, Entity<DirView>, &mut VisualTestContext) {
         init_test(cx);
-        let (pane, cx) = cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(Pane::new);
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
         cx.run_until_parked();
         let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());

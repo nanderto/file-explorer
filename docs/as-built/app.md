@@ -1056,8 +1056,10 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   M3) and `GpuiSpawner`, the fs-core `Spawner` adapter over
   `gpui::BackgroundExecutor` (timers run on the deterministic test clock
   under `#[gpui::test]`).
-- `settings.rs` (M2 stub per §1, grows into the real store at M7):
-  `AppSettings` global — `SettingsContent { favorites: Vec<PathBuf> }` as
+- `settings.rs` (M2 stub per §1, growing into the real store across M7):
+  `AppSettings` global — `SettingsContent { favorites: Vec<PathBuf>, theme:
+  Option<String> }` (the `theme` key is M7a; absent means the built-in
+  default, and a pre-M7 file still loads) as
   serde JSON at `dirs::config_dir()/file-explorer/settings.json` (path
   injectable for tests). `settings::init` (called by `main` after
   `app_state::init`) installs defaults immediately, then swaps in the
@@ -1217,8 +1219,52 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   pulled up on subtree collapse, `right`/`left` dispatch on the real focused
   DirView (incl. left-moves-to-parent and top-level no-op), and the hidden
   toggle applies to already-loaded children without a reload.
-- `theme` module: hard-coded dark + light palettes (`Theme::dark()/light()`);
-  the JSON theme system replaces this at M7.
+- `theme.rs` (M7a — the model itself moved to `crates/theme`, see
+  [`as-built/fs-core.md`](fs-core.md#theme-crate)): the app's side of the
+  theme system, and the end of "every view is handed a `Theme` at
+  construction and keeps a clone" — which is unanswerable once the theme can
+  change while the app runs.
+  * **`ActiveTheme` is a gpui `Global`** holding the `ThemeRegistry`, the
+    active `Theme`, the *requested* name, the themes folder and the reload
+    task + watch guard. A view calls the free function
+    `crate::theme::theme(cx)` inside `render`; there is no `theme` field
+    anywhere in `crates/app` any more, and no constructor takes one.
+    `theme(cx)` falls back to the built-in dark theme when the global is not
+    installed, so a `#[gpui::test]` that exercises one view still paints.
+  * **Requested vs active.** A settings file naming a user theme whose file
+    is missing paints the default *and keeps the name*, so restoring the file
+    restores the choice without the user re-picking it
+    (`deleting_the_active_theme_falls_back_to_the_default`). A theme that
+    goes away must never leave the app unpainted.
+  * **Hot reload** (plan §6): `~/Library/Application Support/file-explorer/themes/`
+    is watched with the same `Vfs::watch` the pane uses for its open
+    directory, 150 ms debounce. A batch re-reads the whole folder on the
+    background executor — `*.json` only, filename order, so two themes
+    claiming one name resolve the same way every run — then installs
+    built-ins + everything that parsed and re-resolves the active theme.
+    A file that fails to parse is recorded in `ActiveTheme::diagnostics` and
+    **skipped**, leaving the previous good copy on screen.
+  * **Nothing touches the disk on the UI thread** (§5): the folder read, the
+    parse and the watch registration all run on the background executor, and
+    unregistration goes through the shared `BackgroundWatchGuard`.
+  * `settings.json` gained `theme: Option<String>`; `settings::init` applies
+    it once its own background load lands (both are in flight at boot, so
+    the theme system starts on the default and switches at most once). The
+    picker that *writes* it is M7b.
+- `watch_guard.rs` (M7a): `BackgroundWatchGuard`, lifted verbatim out of
+  `pane.rs` now that the themes folder watches too. Dropping a `WatchGuard`
+  is disk-touching (macOS stops and joins an FSEvents run-loop thread), so
+  the drop is handed to the background executor.
+- `input/mod.rs` (M7a): `input_colors(cx)` and `refresh_input_colors(input,
+  cx)`. The vendored `TextInput` is **the one widget in the app that holds
+  painted colors as state** rather than reading the theme per frame — a
+  local modification of the vendored design, kept as vendored — so its three
+  colors (placeholder, cursor, selection) are pushed in from the owner's
+  `render`: the address bar, the search field and the inline rename editor.
+  `InputState::set_colors` deliberately does not notify; its caller is
+  already painting. Covered by
+  `switching_theme_repaints_the_field_the_user_is_typing_into`, which drives
+  a real window and asserts the field's cursor color follows a live switch.
 - **Visual regression tests**: `visual_test_runner` binary (feature
   `visual-tests`, macOS-only at runtime) renders `WorkspaceView` off-screen via
   `gpui::VisualTestAppContext`, captures Metal-rendered screenshots, compares

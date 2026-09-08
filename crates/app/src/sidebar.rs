@@ -44,7 +44,6 @@ use crate::app_state::FsContext;
 use crate::drag::{self, DraggedEntries, DraggedFavorite};
 use crate::pane::format_bytes;
 use crate::settings::AppSettings;
-use crate::theme::Theme;
 use crate::workspace::Workspace;
 
 /// How often the volume list is re-polled (ARCHITECTURE.md §6: change
@@ -88,7 +87,6 @@ pub struct TreeRow {
 }
 
 pub struct Sidebar {
-    theme: Theme,
     workspace: WeakEntity<Workspace>,
     volumes: Vec<VolumeInfo>,
     collapsed_devices: bool,
@@ -129,7 +127,7 @@ pub struct Sidebar {
 }
 
 impl Sidebar {
-    pub fn new(theme: Theme, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let fs = FsContext::global(cx);
         let platform = fs.platform.clone();
         let (mut stream, guard) =
@@ -162,7 +160,6 @@ impl Sidebar {
             }
         });
         Self {
-            theme,
             workspace,
             volumes: Vec::new(),
             collapsed_devices: false,
@@ -493,7 +490,7 @@ impl Sidebar {
         with_add: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let collapsed = self.section_collapsed(section);
         let mut header = div()
             .id(title)
@@ -533,7 +530,7 @@ impl Sidebar {
     }
 
     fn render_devices(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let rows: Vec<_> = self
             .volumes
             .iter()
@@ -605,7 +602,7 @@ impl Sidebar {
         favorites: &[PathBuf],
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let external_theme = theme.clone();
         let favorite_theme = theme.clone();
         let mut section = div()
@@ -649,7 +646,7 @@ impl Sidebar {
         favorites: &[PathBuf],
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let rows: Vec<_> = favorites
             .iter()
             .enumerate()
@@ -662,7 +659,6 @@ impl Sidebar {
                 let remove_path = path.clone();
                 let drag_path = path.clone();
                 let insert_before = path.clone();
-                let ghost_theme = theme.clone();
                 let ghost_label = SharedString::from(name.clone());
                 div()
                     // Path-keyed, not index-keyed: this row is a drag source,
@@ -684,7 +680,7 @@ impl Sidebar {
                     // tint rather than an insertion rule, so arming a target
                     // never nudges the rows below it.
                     .on_drag(DraggedFavorite { path: drag_path }, move |_, _, _, cx| {
-                        drag::ghost(ghost_label.clone(), ghost_theme.clone(), cx)
+                        drag::ghost(ghost_label.clone(), cx)
                     })
                     .drag_over::<DraggedFavorite>({
                         let theme = theme.clone();
@@ -753,7 +749,7 @@ impl Sidebar {
     /// row tinted like a selected favorite. Every colour but the dot comes from
     /// the theme — the dot is macOS's (see [`crate::tags`]).
     fn render_tags(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let active = self.active_tag(cx);
         let rows: Vec<_> = self
             .tags
@@ -819,7 +815,7 @@ fn render_tree_row(
     ix: usize,
     cx: &mut Context<Sidebar>,
 ) -> gpui::Stateful<gpui::Div> {
-    let theme = this.theme.clone();
+    let theme = crate::theme::theme(cx).clone();
     let row = this.flat[ix].clone();
     let toggle_path = row.path.clone();
     let navigate_path = row.path.to_path_buf();
@@ -859,7 +855,7 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let favorites: Vec<PathBuf> = AppSettings::global(cx).favorites().to_vec();
 
         let mut root = div()
@@ -928,7 +924,7 @@ mod tests {
     }
 
     fn build_workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
-        cx.add_window_view(|window, cx| Workspace::new(crate::Theme::dark(), window, cx))
+        cx.add_window_view(Workspace::new)
     }
 
     fn sidebar_of(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Entity<Sidebar> {

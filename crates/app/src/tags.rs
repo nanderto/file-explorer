@@ -1019,8 +1019,7 @@ mod tests {
             crate::settings::init_with_path(cx, PathBuf::from("/config/settings.json"));
             vfs
         });
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::new(crate::Theme::dark(), window, cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/home"), cx));
         // A small window on purpose: the default test window paints all 60
