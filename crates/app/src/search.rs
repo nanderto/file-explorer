@@ -52,7 +52,6 @@ use crate::app_state::FsContext;
 use crate::input::text_input as ti;
 use crate::input::{InputEvent, InputState};
 use crate::pane::Pane;
-use crate::theme::Theme;
 
 /// How long arriving [`SearchEvent`]s pile up before one batch is folded into
 /// the pane and repainted. Runs on [`fs_core::Spawner::timer`], so
@@ -100,7 +99,6 @@ pub enum SearchBarEvent {
 /// and the "Subfolders" toggle that appears once there is something to search
 /// for.
 pub struct SearchBar {
-    theme: Theme,
     input: Entity<InputState>,
     recursive: bool,
     /// A clear staged by [`Self::reset`], applied by the next paint.
@@ -117,16 +115,16 @@ pub struct SearchBar {
 impl EventEmitter<SearchBarEvent> for SearchBar {}
 
 impl SearchBar {
-    pub fn new(theme: Theme, cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let colors = crate::input::input_colors(cx);
         let input = cx.new(|cx| {
             InputState::new(cx)
                 .input_type(ti::InputType::Search)
                 .placeholder(SEARCH_PLACEHOLDER)
-                .with_colors(theme.muted, theme.accent, theme.accent.opacity(0.25))
+                .with_colors(colors.0, colors.1, colors.2)
         });
         let subscription = cx.subscribe(&input, Self::on_input_event);
         Self {
-            theme,
             input,
             recursive: false,
             pending_reset: false,
@@ -223,7 +221,8 @@ impl Focusable for SearchBar {
 
 impl Render for SearchBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
+        crate::input::refresh_input_colors(&self.input, cx);
         // The staged clear, applied now that there is a window (see
         // `pending_reset`). Before `has_query` is read, so the frame that
         // clears the text also drops the clear button and the toggle.
@@ -884,7 +883,6 @@ mod gpui_tests {
     use super::*;
     use crate::app_state::{GpuiSpawner, LoggingOpener};
     use crate::pane::{Pane, WATCH_LATENCY};
-    use crate::theme::Theme;
     use fs_core::{
         CreateOptions, EntryMeta, FakeVfs, PathEvent, ProgressFn, RemoveOptions, RenameOptions,
         Spawner, TrashId, TrashRestoreError, Vfs, VolumeKey, WatchGuard,
@@ -1043,7 +1041,7 @@ mod gpui_tests {
                 Arc::new(fs_core::StubPlatform::new()),
             );
         });
-        let (pane, cx) = cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(Pane::new);
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
         cx.run_until_parked();
         recording.reset();

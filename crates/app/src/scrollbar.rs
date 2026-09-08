@@ -139,7 +139,7 @@ pub(crate) fn render(view: &DirView, cx: &gpui::App) -> Option<Div> {
             .w(px(THUMB_WIDTH))
             .h(px(thumb.height))
             .rounded(px(THUMB_WIDTH / 2.0))
-            .bg(view.theme().muted.opacity(THUMB_ALPHA)),
+            .bg(crate::theme::theme(cx).muted.opacity(THUMB_ALPHA)),
     )
 }
 
@@ -171,8 +171,7 @@ mod tests {
                 Arc::new(fs_core::StubPlatform::new()),
             );
         });
-        let (pane, cx) = cx
-            .add_window_view(|window, cx| crate::pane::Pane::new(crate::Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(crate::pane::Pane::new);
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/tall"), cx));
         cx.run_until_parked();
         let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());

@@ -202,7 +202,6 @@ impl Witness {
 }
 
 pub struct InfoPanel {
-    theme: Theme,
     subject: Subject,
     /// `None` until the debounced load for the current subject returns.
     details: Option<Details>,
@@ -273,9 +272,9 @@ struct FieldEdit {
 }
 
 impl InfoPanel {
-    pub fn new(theme: Theme) -> Self {
+    #[allow(clippy::new_without_default)] // an entity is always `cx.new(...)`d
+    pub fn new() -> Self {
         Self {
-            theme,
             subject: Subject::Nothing,
             details: None,
             preview: None,
@@ -554,7 +553,7 @@ impl InfoPanel {
         if self.subject_path().is_none() {
             return;
         }
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let input = cx.new(|cx| {
             InputState::new(cx).with_colors(theme.muted, theme.accent, theme.accent.opacity(0.25))
         });
@@ -761,10 +760,10 @@ impl Render for InfoPanel {
             cx.drop_image(image, Some(window));
         }
 
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let body: AnyElement = match &self.subject {
-            Subject::Nothing => self.render_empty(),
-            Subject::Many(summary) => self.render_summary(*summary),
+            Subject::Nothing => self.render_empty(&theme),
+            Subject::Many(summary) => self.render_summary(*summary, &theme),
             Subject::One { path, kind } => self.render_one(path.clone(), *kind, cx),
         };
         div()
@@ -781,7 +780,7 @@ impl Render for InfoPanel {
 }
 
 impl InfoPanel {
-    fn render_empty(&self) -> AnyElement {
+    fn render_empty(&self, theme: &Theme) -> AnyElement {
         div()
             .flex()
             .flex_1()
@@ -789,7 +788,7 @@ impl InfoPanel {
             .justify_center()
             .px(px(12.0))
             .text_size(px(12.0))
-            .text_color(self.theme.muted)
+            .text_color(theme.muted)
             .child(SharedString::new_static("Nothing to show"))
             .into_any_element()
     }
@@ -797,8 +796,7 @@ impl InfoPanel {
     /// The §2 multi-selection summary. Deliberately *not* the single-entry
     /// General/Permissions sections with one row's values in them: nine files
     /// have nine modes, and showing the first one's would be a lie.
-    fn render_summary(&self, summary: SelectionSummary) -> AnyElement {
-        let theme = &self.theme;
+    fn render_summary(&self, summary: SelectionSummary, theme: &Theme) -> AnyElement {
         div()
             .flex()
             .flex_col()
@@ -831,12 +829,13 @@ impl InfoPanel {
                         SharedString::new(format_size(summary.total_size)),
                     ),
                 ],
+                theme,
             ))
             .into_any_element()
     }
 
     fn render_one(&self, path: Arc<Path>, kind: OneKind, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let meta = self.details.as_ref().and_then(|d| d.meta.as_ref());
         let attrs = self.details.as_ref().map(|d| &d.attrs);
         let (name, subtitle) = header_text(&path, meta, attrs);
@@ -845,7 +844,7 @@ impl InfoPanel {
         div()
             .flex()
             .flex_col()
-            .child(self.render_preview(meta))
+            .child(self.render_preview(meta, &theme))
             // Header: the name, then "<type description> — <size>".
             .child(
                 div()
@@ -878,16 +877,21 @@ impl InfoPanel {
                     .into_any_element(),
             )
             .when(self.general_open, |el| {
-                el.child(self.rows(general))
+                el.child(self.rows(general, &theme))
                     // M6b: the subject's Finder tags — dots and names, or an em
                     // dash when it has none, so the row means the same thing
                     // whether the read has landed or the item is untagged.
-                    .child(self.tags_row())
+                    .child(self.tags_row(&theme))
                     .child(self.checkbox_row(
                         "Hide Extension",
                         attrs.is_some_and(|attrs| attrs.extension_hidden),
+                        &theme,
                     ))
-                    .child(self.checkbox_row("Hidden", meta.is_some_and(|meta| meta.hidden)))
+                    .child(self.checkbox_row(
+                        "Hidden",
+                        meta.is_some_and(|meta| meta.hidden),
+                        &theme,
+                    ))
             })
             .child(
                 self.section_header("info-permissions", "Permissions", self.permissions_open, cx)
@@ -902,8 +906,7 @@ impl InfoPanel {
     /// The preview slot: the decoded preview when there is one, the type glyph
     /// when there is not. Fixed height, so an arriving preview never reflows
     /// the sections beneath it.
-    fn render_preview(&self, meta: Option<&EntryMeta>) -> AnyElement {
-        let theme = &self.theme;
+    fn render_preview(&self, meta: Option<&EntryMeta>, theme: &Theme) -> AnyElement {
         let slot = div()
             .flex()
             .flex_none()
@@ -951,7 +954,7 @@ impl InfoPanel {
         open: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let general = title == "General";
         div()
             .id(id)
@@ -987,8 +990,9 @@ impl InfoPanel {
         &self,
         title: &'static str,
         rows: Vec<(&'static str, SharedString)>,
+        theme: &Theme,
     ) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = theme.clone();
         div()
             .flex()
             .flex_col()
@@ -1002,12 +1006,16 @@ impl InfoPanel {
                     .text_size(px(12.0))
                     .child(SharedString::new_static(title)),
             )
-            .child(self.rows(rows))
+            .child(self.rows(rows, &theme))
     }
 
     /// Label on the left, value on the right — the screenshot's General rows.
-    fn rows(&self, rows: Vec<(&'static str, SharedString)>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+    fn rows(
+        &self,
+        rows: Vec<(&'static str, SharedString)>,
+        theme: &Theme,
+    ) -> impl IntoElement + use<> {
+        let theme = theme.clone();
         div()
             .flex()
             .flex_col()
@@ -1032,8 +1040,8 @@ impl InfoPanel {
     /// The Tags row: the palette dots followed by the names, right-aligned like
     /// every other value in the section. The dots are the one non-theme colour
     /// in the app crate (macOS's palette — see [`crate::tags`]).
-    fn tags_row(&self) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+    fn tags_row(&self, theme: &Theme) -> impl IntoElement + use<> {
+        let theme = theme.clone();
         let tags = self.tags();
         let names = crate::tags::tag_names(tags);
         div()
@@ -1066,8 +1074,13 @@ impl InfoPanel {
 
     /// A label with a **read-only** checkbox on the right (Hide Extension,
     /// Hidden, Locked).
-    fn checkbox_row(&self, label: &'static str, checked: bool) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+    fn checkbox_row(
+        &self,
+        label: &'static str,
+        checked: bool,
+        theme: &Theme,
+    ) -> impl IntoElement + use<> {
+        let theme = theme.clone();
         div()
             .flex()
             .items_center()
@@ -1089,7 +1102,7 @@ impl InfoPanel {
     /// when the value is not known yet, which is the same rule the whole panel
     /// follows: a control is live exactly when there is something behind it.
     fn field_box(&self, field: PermField, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let known = self.field_text(field);
         let boxed = div()
             .id(field.id())
@@ -1154,7 +1167,7 @@ impl InfoPanel {
         field: PermField,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         div()
             .flex()
             .items_center()
@@ -1176,7 +1189,7 @@ impl InfoPanel {
     /// screenshot's Permissions section. Live since M6b: every control here
     /// except Locked writes through the job queue (module docs).
     fn render_permissions(&self, attrs: Option<&FileAttrs>, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let perms = attrs.and_then(|attrs| attrs.perms);
         let matrix = perm_matrix(perms);
         // Nothing is clickable until the load has landed: a click on a grid
@@ -1278,7 +1291,7 @@ impl InfoPanel {
             )
             .child(self.field_row("Owner", PermField::Owner, cx))
             .child(self.field_row("Group", PermField::Group, cx))
-            .child(self.checkbox_row("Locked", attrs.is_some_and(|attrs| attrs.locked)))
+            .child(self.checkbox_row("Locked", attrs.is_some_and(|attrs| attrs.locked), &theme))
             .into_any_element()
     }
 }
@@ -1889,8 +1902,7 @@ mod tests {
             crate::settings::init_with_path(cx, PathBuf::from("/config/settings.json"));
             vfs
         });
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::new(Theme::dark(), window, cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
         (calls, vfs, workspace, cx)
     }
 

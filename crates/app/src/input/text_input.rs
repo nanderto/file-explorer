@@ -252,6 +252,16 @@ impl InputState {
         self
     }
 
+    /// Local modification (M7): re-inject colors on an input that already
+    /// exists, so a theme change reaches a field the user is in the middle of
+    /// typing into. Deliberately does **not** notify — its caller is a
+    /// `render` that is already painting.
+    pub fn set_colors(&mut self, placeholder: Hsla, cursor: Hsla, selection: Hsla) {
+        self.placeholder_color = placeholder;
+        self.cursor_color = cursor;
+        self.selection_color = selection;
+    }
+
     /// Set the input type
     pub fn input_type(mut self, input_type: InputType) -> Self {
         self.input_type = input_type;

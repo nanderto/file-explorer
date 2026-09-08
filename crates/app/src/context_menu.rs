@@ -533,7 +533,7 @@ fn render_menu(
     cx: &mut Context<DirView>,
 ) -> Option<Vec<AnyElement>> {
     let state = view.context_menu()?;
-    let theme = view.theme().clone();
+    let theme = crate::theme::theme(cx).clone();
     let open_submenu = state.submenu;
     let items = state.items();
     let viewport = window.viewport_size();
@@ -782,7 +782,6 @@ mod tests {
 
     use crate::app_state::{GpuiSpawner, LoggingOpener};
     use crate::pane::Pane;
-    use crate::theme::Theme;
     use fs_core::{ClipboardMode, EntryId, FakeVfs, SortDirection, SortSpec, Spawner};
     use gpui::{Bounds, Entity, Modifiers, TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -1022,7 +1021,7 @@ mod tests {
             );
             vfs
         });
-        let (pane, cx) = cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(Pane::new);
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
         cx.run_until_parked();
         let view = pane.read_with(cx, |pane, _| pane.dir_view().clone());

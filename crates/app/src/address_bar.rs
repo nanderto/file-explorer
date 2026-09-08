@@ -21,7 +21,6 @@ use crate::actions::{AcceptSuggestion, Cancel, Confirm};
 use crate::app_state::FsContext;
 use crate::input::text_input as ti;
 use crate::input::{InputEvent, InputState};
-use crate::theme::Theme;
 
 /// Outcome of an edit, consumed by the owning Pane.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,7 +32,6 @@ pub enum AddressBarEvent {
 }
 
 pub struct AddressBar {
-    theme: Theme,
     input: Entity<InputState>,
     /// Directory-name completions for the segment being typed, as full paths.
     suggestions: Vec<SharedString>,
@@ -53,17 +51,15 @@ pub struct AddressBar {
 impl EventEmitter<AddressBarEvent> for AddressBar {}
 
 impl AddressBar {
-    pub fn new(theme: Theme, cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let colors = crate::input::input_colors(cx);
         let input = cx.new(|cx| {
-            InputState::new(cx).placeholder("Type a path…").with_colors(
-                theme.muted,
-                theme.accent,
-                theme.accent.opacity(0.25),
-            )
+            InputState::new(cx)
+                .placeholder("Type a path…")
+                .with_colors(colors.0, colors.1, colors.2)
         });
         let subscription = cx.subscribe(&input, Self::on_input_event);
         Self {
-            theme,
             input,
             suggestions: Vec::new(),
             selected_suggestion: 0,
@@ -255,7 +251,8 @@ impl Focusable for AddressBar {
 
 impl Render for AddressBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
+        crate::input::refresh_input_colors(&self.input, cx);
         let error = self.error.clone();
         let suggestions = self.suggestions.clone();
         let selected = self.selected_suggestion;
@@ -383,8 +380,37 @@ mod tests {
                 Arc::new(fs_core::StubPlatform::new()),
             );
         });
-        let (bar, cx) = cx.add_window_view(|_, cx| AddressBar::new(Theme::dark(), cx));
+        let (bar, cx) = cx.add_window_view(|_, cx| AddressBar::new(cx));
         (bar, cx)
+    }
+
+    /// The M7 hot-switch, end to end through a real render: the vendored
+    /// text input is the one widget that holds painted colors as *state*
+    /// rather than reading the theme per frame, so it is the one that can go
+    /// stale when the theme changes under it.
+    #[gpui::test]
+    fn switching_theme_repaints_the_field_the_user_is_typing_into(cx: &mut TestAppContext) {
+        let (bar, cx) = setup(cx);
+        cx.update(|_, cx| {
+            crate::theme::ActiveTheme::init_in(
+                std::path::PathBuf::from("/config/themes"),
+                crate::Theme::dark().name,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            bar.read_with(cx, |bar, cx| bar.input.read(cx).cursor_color),
+            crate::Theme::dark().accent,
+        );
+
+        cx.update(|_, cx| assert!(crate::theme::ActiveTheme::select("Graphite Light", cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            bar.read_with(cx, |bar, cx| bar.input.read(cx).cursor_color),
+            crate::Theme::light().accent,
+            "the field kept the old theme's cursor color"
+        );
     }
 
     fn fake_vfs(cx: &mut TestAppContext) -> Arc<dyn fs_core::Vfs> {

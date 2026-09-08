@@ -567,4 +567,50 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
 
 
 ## theme (crate)
-- Not started (interim `theme` module lives inside `crates/app`).
+
+`crates/theme` (lib name `theme`) — the theme **model and JSON loader**,
+built at M7a. Depends on gpui only for `Hsla`/`SharedString`: no windows, no
+entities, no rendering, and no I/O at all. Reading the themes folder and
+watching it belongs to the app (see
+[`as-built/app.md`](app.md) — `theme.rs`).
+
+- **A theme is a JSON document**: `{ name, appearance: light|dark, colors {…},
+  file_colors {…} }`, the shape plan §6 specifies. `ThemeColors` carries the
+  chrome palette (surface, sidebar, panel, titlebar, text, muted, accent,
+  **selection**, border, error) and `FileColors` the per-kind tints (folder,
+  image, code, archive, audio, video, document, other). `Theme` `Deref`s to
+  its `ThemeColors`, so every existing `theme.surface` call site kept working
+  unchanged through the M7a refactor. `selection` and `file_colors` are new
+  in the model and **not painted yet** — the widgets that will use them come
+  with the M7b polish, and adopting them is a visible change that moves
+  baselines, which M7a deliberately does not.
+- **The built-ins are themselves JSON** (`themes/graphite-dark.json`,
+  `themes/graphite-light.json`, `include_str!`-embedded), so the shipped
+  themes are written in exactly the language a user theme is and cannot
+  drift from it. They are parsed by a **complete** path that requires every
+  key — which is also what stops the inheritance scheme below from being
+  circular: a built-in inherits from nothing. A malformed built-in is a bug
+  in this crate and panics; two tests parse both on every build.
+- **A user theme may be partial.** Absent keys come from the built-in of the
+  declared `appearance`, so a two-line file that only re-tints the accent is
+  a legal theme. Unknown keys are collected and returned as `warnings`
+  (`LoadedTheme { theme, warnings }`) rather than silently ignored — a typo
+  like `"colours"` is reported, not swallowed. A bad *color* is an error
+  naming the key that carries it (`colors.accent: \`puce\` is not a color…`).
+- **Colors parse in two spellings** (`color.rs`): the native
+  `hsl(240, 4%, 12%)` / `hsla(…, 0.35)`, and the `#rgb`/`#rrggbb`/`#rrggbbaa`
+  hex every Zed/gpui-component theme is written in, so an existing theme can
+  be adapted by copying its colors across. Space-separated (CSS Color 4) and
+  uppercase forms are accepted; `format()` round-trips the native form. Hex
+  is converted to HSL on load, which is lossy in the last bit or two —
+  inherent to the format, and the reason the built-ins are written in HSL:
+  `hsl_parses_to_the_exact_same_bits_a_rust_literal_would_produce` plus the
+  two `…_is_bit_identical_to_the_pre_m7_palette` tests are what let the
+  built-ins move out of Rust and into JSON **without moving a single visual
+  baseline**.
+- **`ThemeRegistry`** is the picker's list: the two built-ins, plus whatever
+  loaded out of the user's folder. Name is identity (it is what
+  `settings.json` stores), so a user theme named exactly like a built-in
+  *replaces* it — the documented way to re-tint the shipped look.
+  `get_or_default` is the "the named theme is gone" path.
+- 19 tests in the crate (7 color, 12 model/registry).

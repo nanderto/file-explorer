@@ -1,0 +1,26 @@
+{
+  "name": "Graphite Light",
+  "appearance": "light",
+  "colors": {
+    "surface": "hsl(0, 0%, 100%)",
+    "sidebar": "hsl(240, 8%, 96%)",
+    "panel": "hsl(240, 8%, 97%)",
+    "titlebar": "hsl(240, 8%, 96%)",
+    "text": "hsl(0, 0%, 12%)",
+    "muted": "hsl(0, 0%, 45%)",
+    "accent": "hsl(210, 90%, 45%)",
+    "selection": "hsla(210, 90%, 45%, 0.3)",
+    "border": "hsla(0, 0%, 0%, 0.12)",
+    "error": "hsl(0, 72%, 45%)"
+  },
+  "file_colors": {
+    "folder": "hsl(210, 90%, 45%)",
+    "image": "hsl(280, 55%, 45%)",
+    "code": "hsl(150, 55%, 32%)",
+    "archive": "hsl(35, 75%, 38%)",
+    "audio": "hsl(330, 55%, 45%)",
+    "video": "hsl(15, 70%, 42%)",
+    "document": "hsl(0, 0%, 30%)",
+    "other": "hsl(0, 0%, 45%)"
+  }
+}

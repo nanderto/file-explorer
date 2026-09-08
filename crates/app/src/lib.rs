@@ -28,7 +28,8 @@ pub mod theme;
 pub mod thumbnails;
 pub mod views;
 pub mod visual_diff;
+pub(crate) mod watch_guard;
 pub mod workspace;
 
-pub use theme::Theme;
+pub use crate::theme::{ActiveTheme, Theme};
 pub use workspace::Workspace;

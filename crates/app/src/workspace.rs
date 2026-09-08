@@ -26,7 +26,6 @@ use crate::jobs_model::{JobsEvent, JobsModel};
 use crate::jobs_ui::{JobsIndicator, ToastLayer};
 use crate::pane::{Pane, PaneEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
-use crate::theme::Theme;
 
 /// Font used for all UI text. Pinned to a face that ships with macOS so
 /// visual-test screenshots are stable across machines and CI runners.
@@ -120,7 +119,6 @@ struct ModalState {
 
 pub struct Workspace {
     focus_handle: FocusHandle,
-    theme: Theme,
     sidebar: Entity<Sidebar>,
     /// One or two panes (§2 "Dual-pane readiness without PaneGroup"): a flat
     /// `Vec`, never a recursive member tree.
@@ -156,13 +154,13 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let pane = cx.new(|cx| Pane::new(theme.clone(), window, cx));
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let pane = cx.new(|cx| Pane::new(window, cx));
         // Events up (§2): a pane's watcher batches are the only news the
         // sidebar tree gets about external changes.
         let pane_subscription = cx.subscribe(&pane, Self::handle_pane_event);
         let workspace = cx.weak_entity();
-        let sidebar = cx.new(|cx| Sidebar::new(theme.clone(), workspace, cx));
+        let sidebar = cx.new(|cx| Sidebar::new(workspace, cx));
         // Events up, method calls down (§2): the sidebar reports navigation
         // and eject requests; the workspace acts on them.
         let sidebar_subscription = cx.subscribe(&sidebar, Self::handle_sidebar_event);
@@ -170,15 +168,14 @@ impl Workspace {
         // (NeedsDecision → modal); jobs_ui observes it for progress/toasts.
         let jobs = FsContext::global(cx).jobs.clone();
         let jobs_subscription = cx.subscribe_in(&jobs, window, Self::handle_jobs_event);
-        let jobs_indicator = cx.new(|cx| JobsIndicator::new(theme.clone(), jobs.clone(), cx));
-        let toast_layer = cx.new(|cx| ToastLayer::new(theme.clone(), jobs.clone(), cx));
-        let info_panel = cx.new(|_| InfoPanel::new(theme.clone()));
+        let jobs_indicator = cx.new(|cx| JobsIndicator::new(jobs.clone(), cx));
+        let toast_layer = cx.new(|cx| ToastLayer::new(jobs.clone(), cx));
+        let info_panel = cx.new(|_| InfoPanel::new());
         let dir_view_observation = Self::observe_dir_view(&pane, cx);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let mut workspace = Self {
             focus_handle,
-            theme,
             sidebar,
             panes: vec![pane],
             pane_subscriptions: vec![pane_subscription],
@@ -416,7 +413,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = cx.new(|cx| ConflictDialog::new(self.theme.clone(), conflict, cx));
+        let view = cx.new(|cx| ConflictDialog::new(conflict, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -441,8 +438,7 @@ impl Workspace {
             confirm_label,
             op,
         } = request;
-        let view =
-            cx.new(|cx| ConfirmDialog::new(self.theme.clone(), title, message, confirm_label, cx));
+        let view = cx.new(|cx| ConfirmDialog::new(title, message, confirm_label, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -586,13 +582,13 @@ impl Workspace {
 
     /// The scrim + centered dialog, painted over everything (§8 "Dialogs":
     /// `deferred` overlay + scrim).
-    fn render_modal_overlay(&self) -> Option<impl IntoElement> {
+    fn render_modal_overlay(&self, cx: &App) -> Option<impl IntoElement> {
         let state = self.modal.as_ref()?;
         let dialog: AnyElement = match &state.modal {
             Modal::Confirm { view, .. } => view.clone().into_any_element(),
             Modal::Conflict { view, .. } => view.clone().into_any_element(),
         };
-        let theme = &self.theme;
+        let theme = crate::theme::theme(cx);
         Some(
             deferred(
                 div()
@@ -684,8 +680,7 @@ impl Workspace {
             )
         };
         let show_hidden = self.show_hidden;
-        let theme = self.theme.clone();
-        let pane = cx.new(|cx| Pane::new(theme, window, cx));
+        let pane = cx.new(|cx| Pane::new(window, cx));
         let subscription = cx.subscribe(&pane, Self::handle_pane_event);
         pane.update(cx, |new_pane, cx| {
             new_pane.set_show_hidden(show_hidden, cx);
@@ -834,8 +829,8 @@ impl Workspace {
     /// The invisible grab strip straddling a region border (§8 hand-built
     /// splitters): a stateful div whose `on_drag` starts the resize; the body
     /// row's `on_drag_move` does the math.
-    fn splitter_handle(&self, side: SplitterSide) -> impl IntoElement {
-        let theme = self.theme.clone();
+    fn splitter_handle(&self, side: SplitterSide, cx: &App) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
         let name = match side {
             SplitterSide::Sidebar => "sidebar-splitter",
             SplitterSide::InfoPanel => "info-panel-splitter",
@@ -875,7 +870,7 @@ impl Workspace {
     /// answerable by looking, and a focus ring inside a pane is invisible when
     /// focus sits on a status line or a breadcrumb.
     fn render_pane_strip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let split = self.is_split();
         let mut strip = div()
             .flex()
@@ -919,7 +914,7 @@ impl Workspace {
                 )
                 .child(pane.clone());
             if first {
-                wrapper = wrapper.child(self.splitter_handle(SplitterSide::Pane));
+                wrapper = wrapper.child(self.splitter_handle(SplitterSide::Pane, cx));
             }
             strip = strip.child(wrapper);
         }
@@ -933,7 +928,7 @@ impl Workspace {
     /// *not* take focus first: whichever pane is active stays active, and the
     /// new pane inherits that pane's directory.
     fn render_split_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let active = self.is_split();
         div()
             .id("split-pane-toggle")
@@ -961,7 +956,7 @@ impl Workspace {
     /// not take focus, so the active pane the panel follows is unchanged by
     /// the click that reveals it.
     fn render_info_panel_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let active = self.show_info_panel;
         div()
             .id("info-panel-toggle")
@@ -985,11 +980,11 @@ impl Workspace {
 
     /// The right-hand column: the [`InfoPanel`] entity plus its splitter,
     /// rendered only while the panel is showing.
-    fn render_info_panel(&self) -> Option<impl IntoElement + use<>> {
+    fn render_info_panel(&self, cx: &App) -> Option<impl IntoElement + use<>> {
         if !self.show_info_panel {
             return None;
         }
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         Some(
             div()
                 .relative()
@@ -1001,7 +996,7 @@ impl Workspace {
                 .border_l_1()
                 .border_color(theme.border)
                 .child(self.info_panel.clone())
-                .child(self.splitter_handle(SplitterSide::InfoPanel)),
+                .child(self.splitter_handle(SplitterSide::InfoPanel, cx)),
         )
     }
 
@@ -1098,7 +1093,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         div()
             .track_focus(&self.focus_handle)
             .key_context("Workspace")
@@ -1158,17 +1153,17 @@ impl Render for Workspace {
                             .border_r_1()
                             .border_color(theme.border)
                             .child(self.sidebar.clone())
-                            .child(self.splitter_handle(SplitterSide::Sidebar)),
+                            .child(self.splitter_handle(SplitterSide::Sidebar, cx)),
                     )
                     // Pane strip: one pane, or two with a divider (M4)
                     .child(self.render_pane_strip(cx))
                     // Info panel (M5), resizable, hidden by `cmd-shift-i`
-                    .children(self.render_info_panel()),
+                    .children(self.render_info_panel(cx)),
             )
             // Toast overlay (renders nothing while empty)
             .child(self.toast_layer.clone())
             // Modal overlay + scrim (§8 "Dialogs")
-            .children(self.render_modal_overlay())
+            .children(self.render_modal_overlay(cx))
     }
 }
 
@@ -1213,7 +1208,7 @@ mod tests {
     }
 
     fn build_workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
-        cx.add_window_view(|window, cx| Workspace::new(Theme::dark(), window, cx))
+        cx.add_window_view(Workspace::new)
     }
 
     #[gpui::test]

@@ -23,6 +23,11 @@ pub struct SettingsContent {
     /// Sidebar favorites, in display order.
     #[serde(default)]
     pub favorites: Vec<PathBuf>,
+    /// The chosen theme, by name (M7). Absent means the built-in default —
+    /// which is also what a name that is no longer installed paints, without
+    /// the setting being rewritten (see `ActiveTheme`).
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 /// App settings global (ARCHITECTURE.md §2 `AppSettings`). Mutate via
@@ -69,6 +74,21 @@ impl AppSettings {
 
     pub fn favorites(&self) -> &[PathBuf] {
         &self.content.favorites
+    }
+
+    /// The chosen theme's name, if the user has ever picked one.
+    pub fn theme_name(&self) -> Option<&str> {
+        self.content.theme.as_deref()
+    }
+
+    /// Record the chosen theme. Returns whether anything changed.
+    pub fn set_theme_name(&mut self, name: impl Into<String>) -> bool {
+        let name = name.into();
+        if self.content.theme.as_deref() == Some(name.as_str()) {
+            return false;
+        }
+        self.content.theme = Some(name);
+        true
     }
 
     /// Append a favorite (deduplicated). Returns whether anything changed.
@@ -155,7 +175,13 @@ pub fn init_with_path(cx: &mut App, path: PathBuf) {
         cx.update(|cx| {
             // Don't clobber changes made between boot and load completion.
             if AppSettings::global(cx).content == SettingsContent::default() {
+                let theme = loaded.theme_name().map(str::to_string);
                 cx.set_global(loaded);
+                // The theme system booted on the default while this load was
+                // in flight; apply the user's choice now that it is here.
+                if let Some(theme) = theme {
+                    crate::theme::ActiveTheme::select(theme, cx);
+                }
             }
         });
     })
@@ -172,6 +198,28 @@ mod tests {
 
     fn fake_vfs() -> Arc<FakeVfs> {
         FakeVfs::new(Arc::new(TestSpawner::new()))
+    }
+
+    #[test]
+    fn the_chosen_theme_round_trips_and_old_files_still_load() {
+        let vfs = fake_vfs();
+        let path = PathBuf::from("/config/file-explorer/settings.json");
+
+        let mut settings = AppSettings::new(path.clone());
+        assert_eq!(settings.theme_name(), None, "no choice until one is made");
+        assert!(settings.set_theme_name("Midnight"));
+        assert!(!settings.set_theme_name("Midnight"), "same name, no change");
+        block_on(settings.save_future(vfs.clone())).unwrap();
+
+        let loaded = block_on(AppSettings::load(vfs.clone(), path.clone()));
+        assert_eq!(loaded.theme_name(), Some("Midnight"));
+
+        // A settings.json written before M7 has no `theme` key at all; it must
+        // keep loading, with the default theme.
+        block_on(vfs.atomic_write(&path, br#"{ "favorites": ["/home/me"] }"#.to_vec())).unwrap();
+        let old = block_on(AppSettings::load(vfs, path));
+        assert_eq!(old.theme_name(), None);
+        assert_eq!(old.favorites(), [PathBuf::from("/home/me")]);
     }
 
     #[test]

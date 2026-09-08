@@ -584,8 +584,7 @@ mod tests {
                 }),
             );
         });
-        let (pane, cx) = cx
-            .add_window_view(|window, cx| crate::pane::Pane::new(crate::Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(crate::pane::Pane::new);
         pane.update(cx, |pane, cx| {
             pane.navigate_to(Path::new("/photos"), cx);
             pane.set_view_mode(crate::pane::ViewMode::Icons, cx);

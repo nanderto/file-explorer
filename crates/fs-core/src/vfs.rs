@@ -722,6 +722,36 @@ mod fake {
             emit_locked(&mut state, path_event(&path, kind));
         }
 
+        /// Add (or overwrite) a file node **with contents** and emit
+        /// `Created`/`Changed`. [`insert_file`](Self::insert_file) sizes a
+        /// file without filling it, and [`insert_tree`](Self::insert_tree)
+        /// fills one without announcing it; a test that edits a file already
+        /// on disk and expects a watcher to notice needs both at once (the
+        /// M7 themes-folder hot reload).
+        pub fn write_file(&self, path: impl AsRef<Path>, contents: impl Into<Vec<u8>>) {
+            let path = path.as_ref().to_path_buf();
+            let contents = contents.into();
+            let mut state = self.state.lock().unwrap();
+            let existed = state.tree.contains_key(&path);
+            let modified = next_mtime(&mut state);
+            state.tree.insert(
+                path.clone(),
+                FakeNode {
+                    kind: EntryKind::File,
+                    mode: FAKE_FILE_MODE,
+                    size: contents.len() as u64,
+                    modified,
+                    contents,
+                },
+            );
+            let kind = if existed {
+                PathEventKind::Changed
+            } else {
+                PathEventKind::Created
+            };
+            emit_locked(&mut state, path_event(&path, kind));
+        }
+
         /// Add a directory node and emit `Created`.
         pub fn insert_dir(&self, path: impl AsRef<Path>) {
             let path = path.as_ref().to_path_buf();
@@ -1467,6 +1497,36 @@ mod tests {
         vfs.set_free_space(1234);
         assert_eq!(block_on(vfs.free_space(Path::new("/"))).unwrap(), 1234);
         assert!(vfs.is_fake());
+    }
+
+    #[test]
+    fn fake_vfs_write_file_sets_contents_and_announces_the_change() {
+        let (_spawner, vfs) = test_vfs();
+        vfs.insert_tree("/root", json!({}));
+        let (mut events, _guard) = vfs.watch(Path::new("/root"), Duration::ZERO);
+
+        vfs.write_file("/root/theme.json", b"{\"name\":\"x\"}".to_vec());
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/theme.json"))).unwrap(),
+            b"{\"name\":\"x\"}"
+        );
+        let batch = block_on(events.next()).expect("a created event");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].kind, PathEventKind::Created);
+
+        // An overwrite is a change, not a creation — the distinction a
+        // hot-reloading watcher acts on.
+        vfs.write_file("/root/theme.json", "hello");
+        assert_eq!(
+            block_on(vfs.load(Path::new("/root/theme.json"))).unwrap(),
+            b"hello"
+        );
+        let meta = block_on(vfs.metadata(Path::new("/root/theme.json")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.size, 5, "size follows the contents");
+        let batch = block_on(events.next()).expect("a changed event");
+        assert_eq!(batch[0].kind, PathEventKind::Changed);
     }
 
     #[test]

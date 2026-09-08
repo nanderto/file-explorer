@@ -16,17 +16,15 @@ use crate::theme::Theme;
 /// Titlebar jobs button + anchored progress popover. Renders nothing while
 /// no jobs run, so idle chrome (and its visual baselines) is unchanged.
 pub struct JobsIndicator {
-    theme: Theme,
     jobs: Entity<JobsModel>,
     popover_open: bool,
     _observe: Subscription,
 }
 
 impl JobsIndicator {
-    pub fn new(theme: Theme, jobs: Entity<JobsModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(jobs: Entity<JobsModel>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&jobs, |_, _, cx| cx.notify());
         Self {
-            theme,
             jobs,
             popover_open: false,
             _observe: observe,
@@ -38,7 +36,7 @@ impl JobsIndicator {
     }
 
     fn render_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let rows = self.jobs.read(cx).rows().to_vec();
         let jobs = self.jobs.clone();
         deferred(
@@ -129,7 +127,7 @@ impl JobsIndicator {
 
 impl Render for JobsIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let active = self.jobs.read(cx).rows().len();
         if active == 0 {
             self.popover_open = false;
@@ -168,33 +166,31 @@ impl Render for JobsIndicator {
 /// anchored to the workspace's bottom-right corner. Click dismisses early;
 /// expiry is the model's `Spawner::timer` task.
 pub struct ToastLayer {
-    theme: Theme,
     jobs: Entity<JobsModel>,
     _observe: Subscription,
 }
 
 impl ToastLayer {
-    pub fn new(theme: Theme, jobs: Entity<JobsModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(jobs: Entity<JobsModel>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&jobs, |_, _, cx| cx.notify());
         Self {
-            theme,
             jobs,
             _observe: observe,
         }
     }
 
-    fn accent_for(&self, kind: ToastKind) -> Hsla {
+    fn accent_for(kind: ToastKind, theme: &Theme) -> Hsla {
         match kind {
-            ToastKind::Success => self.theme.accent,
-            ToastKind::Error => self.theme.error,
-            ToastKind::Info => self.theme.muted,
+            ToastKind::Success => theme.accent,
+            ToastKind::Error => theme.error,
+            ToastKind::Info => theme.muted,
         }
     }
 }
 
 impl Render for ToastLayer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
+        let theme = crate::theme::theme(cx).clone();
         let toasts = self.jobs.read(cx).toasts().to_vec();
         if toasts.is_empty() {
             return div();
@@ -222,7 +218,7 @@ impl Render for ToastLayer {
                     .py(px(8.0))
                     .rounded(px(6.0))
                     .border_1()
-                    .border_color(self.accent_for(toast.kind))
+                    .border_color(Self::accent_for(toast.kind, &theme))
                     .bg(theme.panel)
                     .text_size(px(12.0))
                     .text_color(theme.text)

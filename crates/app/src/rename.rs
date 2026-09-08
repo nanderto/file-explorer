@@ -292,12 +292,10 @@ impl DirView {
         // A menu must not outlive the gesture that opened the editor.
         self.close_context_menu(window, cx);
         let prev_focus = window.focused(cx);
-        let theme = self.theme().clone();
+        let colors = crate::input::input_colors(cx);
         let name = entry.name.to_string();
         let stem_end = stem_range(&name).end;
-        let input = cx.new(|cx| {
-            InputState::new(cx).with_colors(theme.muted, theme.accent, theme.accent.opacity(0.25))
-        });
+        let input = cx.new(|cx| InputState::new(cx).with_colors(colors.0, colors.1, colors.2));
         input.update(cx, |input, cx| {
             input.set_value(name, window, cx);
             input.select_range(0..stem_end, window, cx);
@@ -530,7 +528,6 @@ mod tests {
     use crate::app_state::{GpuiSpawner, LoggingOpener};
     use crate::dir_view::RENAME_CLICK_ARM_DELAY;
     use crate::pane::Pane;
-    use crate::theme::Theme;
     use fs_core::{FakeVfs, Spawner, Vfs};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -597,7 +594,7 @@ mod tests {
         &mut VisualTestContext,
     ) {
         let vfs = init_test(cx);
-        let (pane, cx) = cx.add_window_view(|window, cx| Pane::new(Theme::dark(), window, cx));
+        let (pane, cx) = cx.add_window_view(Pane::new);
         pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
         cx.run_until_parked();
 
