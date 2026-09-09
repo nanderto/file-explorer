@@ -28,6 +28,15 @@ use crate::pane::{Pane, PaneEvent};
 use crate::settings::AppSettings;
 use crate::sidebar::{Sidebar, SidebarEvent};
 
+/// The app's name as a person reads it. `file-explorer` is the crate, the
+/// binary and the config directory; this is the product.
+pub const APP_DISPLAY_NAME: &str = "File Explorer";
+
+/// Left inset of the titlebar row. The macOS traffic lights are drawn inside
+/// this row (`main.rs` makes the system titlebar transparent) and occupy
+/// roughly x=14..66, so the app name starts clear of them.
+pub const TITLEBAR_LEFT_INSET: f32 = 100.0;
+
 /// Font used for all UI text. Pinned to a face that ships with macOS so
 /// visual-test screenshots are stable across machines and CI runners.
 pub const UI_FONT: &str = "Helvetica";
@@ -1186,12 +1195,20 @@ impl Render for Workspace {
                     .items_center()
                     .justify_between()
                     .h(px(40.0))
-                    .px(px(80.0))
+                    // Asymmetric on purpose: the traffic lights live inside
+                    // this row (see `main.rs`'s `TitlebarOptions`) and end at
+                    // about x=66, so the left inset clears them with a
+                    // comfortable gap rather than butting the app name up
+                    // against the buttons. The right inset is unchanged — it
+                    // spaces the toolbar controls, which have no such
+                    // neighbour.
+                    .pl(px(TITLEBAR_LEFT_INSET))
+                    .pr(px(80.0))
                     .bg(theme.titlebar)
                     .border_b_1()
                     .border_color(theme.border)
                     .text_size(px(13.0))
-                    .child("file-explorer")
+                    .child(APP_DISPLAY_NAME)
                     .child(
                         div()
                             .flex()

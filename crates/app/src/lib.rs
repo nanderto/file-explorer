@@ -32,4 +32,4 @@ pub(crate) mod watch_guard;
 pub mod workspace;
 
 pub use crate::theme::{ActiveTheme, Theme, ThemeSelection};
-pub use workspace::Workspace;
+pub use workspace::{APP_DISPLAY_NAME, Workspace};

@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use file_explorer_app::{ActiveTheme, ThemeSelection, Workspace, app_state, keymap, settings};
-use gpui::{App, AppContext as _, Bounds, Focusable as _, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext as _, Bounds, Focusable as _, TitlebarOptions, WindowBounds, WindowOptions,
+    point, px, size,
+};
 use gpui_platform::application;
 
 fn main() {
@@ -20,6 +23,22 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Draw our own titlebar instead of letting macOS paint a
+                    // grey one above ours. Without this the window has *two*
+                    // bars — the system's, which no theme can reach, above
+                    // the workspace's themed row — and a theme that re-tints
+                    // the frame visibly stops at the top of it.
+                    //
+                    // `appears_transparent` hides the system bar but keeps
+                    // the traffic lights, so they now sit inside the
+                    // workspace's 40px row: positioned 14px in and 14px down
+                    // to centre them in it, and cleared by the `px(80.0)`
+                    // left padding that row has always carried.
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(file_explorer_app::APP_DISPLAY_NAME.into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(14.0), px(14.0))),
+                    }),
                     ..Default::default()
                 },
                 |window, cx| cx.new(|cx| Workspace::new(window, cx)),
