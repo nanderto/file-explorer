@@ -51,7 +51,7 @@ pub const SPRING_LOAD_DELAY: Duration = Duration::from_millis(500);
 
 /// Drop-highlight alphas applied to the theme accent — the app crate never
 /// names a color. The row tint is stronger than the selection tint
-/// (`details_list::SELECTION_ALPHA`) so a drop target reads as the hotter of
+/// (the built-ins' `selection`, accent at 0.35) so a drop target reads as the hotter of
 /// the two when a selected folder is also the target.
 const DROP_ROW_ALPHA: f32 = 0.55;
 const DROP_RING_ALPHA: f32 = 0.8;

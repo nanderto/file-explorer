@@ -300,6 +300,52 @@ fn start_watching(cx: &mut App, path: PathBuf) {
     cx.update_global::<UserKeymap, _>(|keymap, _| keymap._watch = Some(task));
 }
 
+/// Apply an override document over the defaults, for tests in other modules
+/// (the settings pane's Keyboard list). Returns the diagnostics.
+#[cfg(test)]
+pub(crate) fn apply_for_test(cx: &mut App, source: &str) -> Vec<String> {
+    apply(cx, Some(source))
+}
+
+/// Every binding currently in force, as text: `(keystrokes, action,
+/// context)`. This is the keymap *after* `keymap.json` was applied, read back
+/// out of gpui rather than re-derived from the §0 table — so what the
+/// settings pane lists is what the app will actually dispatch, overrides and
+/// all, and a row the file failed to bind is visibly absent rather than
+/// listed as though it worked.
+///
+/// Sorted by context then keystrokes so the list is stable frame to frame;
+/// unbound rows (`null` in the file, gpui's `NoAction`) are dropped, since
+/// "this key does nothing" is not a binding worth a line.
+pub fn visible_bindings(cx: &App) -> Vec<(String, String, Option<String>)> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let mut rows: Vec<(String, String, Option<String>)> = keymap
+        .bindings()
+        .filter(|binding| !gpui::is_no_action(binding.action()))
+        .map(|binding| {
+            let keystrokes = binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let context = binding
+                .predicate()
+                .map(|predicate| predicate.to_string())
+                .filter(|context| !context.is_empty());
+            (keystrokes, binding.action().name().to_string(), context)
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    rows.dedup();
+    rows
+}
+
 /// The §0 table itself.
 fn bind_defaults(cx: &mut App) {
     cx.bind_keys([
@@ -404,6 +450,13 @@ fn bind_defaults(cx: &mut App) {
         // the split: the workspace owns the right-hand column, and the
         // titlebar button dispatches this action with focus on the root.
         KeyBinding::new("cmd-shift-i", ToggleInfoPanel, Some("Workspace")),
+        // §0 Settings (M7c). `cmd-,` is the Mac convention for preferences
+        // and every Mac user reaches for it; Workspace context because the
+        // pane it opens replaces the whole browsing region.
+        KeyBinding::new("cmd-,", ToggleSettings, Some("Workspace")),
+        // Escape closes the settings pane, the way it dismisses every other
+        // transient surface in the app.
+        KeyBinding::new("escape", ToggleSettings, Some("Settings")),
         // §0 Search field focus (M6a). Workspace context like `cmd-l`: the
         // field belongs to the *active* pane, and the binding has to work with
         // focus anywhere in the window (including inside the other pane's

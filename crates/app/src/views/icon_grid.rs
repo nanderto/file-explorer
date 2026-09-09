@@ -44,8 +44,6 @@ pub(crate) const TILE_HEIGHT: f32 = 88.0;
 /// size never depends on whether a preview has arrived, no tile geometry
 /// (and therefore no hit test above) changes when one does.
 pub(crate) const ICON_PX: f32 = 48.0;
-/// Selection tint alpha, matching the details list's selected row.
-const SELECTION_ALPHA: f32 = 0.35;
 /// Row opacity for cut-pending entries (plan §3: "cut items render dimmed").
 const CUT_DIM_OPACITY: f32 = 0.5;
 
@@ -327,7 +325,7 @@ fn render_tile(
         );
 
     if selected {
-        tile = tile.bg(theme.accent.opacity(SELECTION_ALPHA));
+        tile = tile.bg(theme.selection);
     }
     // §8 drag & drop: this tile is the armed folder drop target. Background
     // only, painted over the selection tint — arming a highlight never moves

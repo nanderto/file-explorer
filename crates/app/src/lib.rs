@@ -22,6 +22,7 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod settings;
+pub mod settings_ui;
 pub mod sidebar;
 pub mod tags;
 pub mod theme;

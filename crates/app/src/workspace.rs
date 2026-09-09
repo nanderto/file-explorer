@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::actions::{
     DeletePermanently, FocusAddressBar, FocusSearch, Redo, ToggleHiddenFiles, ToggleInfoPanel,
-    ToggleSplitPane, Undo,
+    ToggleSettings, ToggleSplitPane, Undo,
 };
 use crate::app_state::FsContext;
 use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
@@ -26,6 +26,7 @@ use crate::jobs_model::{JobsEvent, JobsModel};
 use crate::jobs_ui::{JobsIndicator, ToastLayer};
 use crate::pane::{Pane, PaneEvent};
 use crate::settings::AppSettings;
+use crate::settings_ui::SettingsView;
 use crate::sidebar::{Sidebar, SidebarEvent};
 
 /// The app's name as a person reads it. `file-explorer` is the crate, the
@@ -159,6 +160,10 @@ pub struct Workspace {
     jobs: Entity<JobsModel>,
     jobs_indicator: Entity<JobsIndicator>,
     toast_layer: Entity<ToastLayer>,
+    /// The settings pane (M7c), when it is open. `Some` replaces the whole
+    /// browsing region — pane strip *and* info panel — with it; the sidebar
+    /// and titlebar stay, so the app is still visibly itself underneath.
+    settings_view: Option<Entity<SettingsView>>,
     modal: Option<ModalState>,
     /// Repaints and fans out when `AppSettings` changes — see
     /// [`Workspace::settings_changed`].
@@ -219,6 +224,7 @@ impl Workspace {
             jobs,
             jobs_indicator,
             toast_layer,
+            settings_view: None,
             modal: None,
             _subscriptions: vec![sidebar_subscription, jobs_subscription],
             _settings_observer: settings_observer,
@@ -1147,6 +1153,47 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `cmd-,`: open the settings pane, or close it and go back to browsing.
+    /// Closing returns focus to the active pane, so the keyboard lands
+    /// somewhere useful rather than nowhere.
+    fn handle_toggle_settings(
+        &mut self,
+        _: &ToggleSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_settings(window, cx);
+    }
+
+    /// The one implementation behind `cmd-,` and (later) the menu bar.
+    pub fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.settings_view.take() {
+            Some(_) => {
+                let handle = self.active_pane().read(cx).dir_view().focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            None => {
+                let view = cx.new(SettingsView::new);
+                let handle = view.focus_handle(cx);
+                self.settings_view = Some(view);
+                window.focus(&handle, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Whether the settings pane is showing (tests, and the titlebar's own
+    /// affordance later).
+    pub fn settings_open(&self) -> bool {
+        self.settings_view.is_some()
+    }
+
+    /// The open settings pane, if there is one. Used by tests and by the
+    /// visual runner, which drives it to a named section before capturing.
+    pub fn settings_view(&self) -> Option<Entity<SettingsView>> {
+        self.settings_view.clone()
+    }
+
     fn handle_toggle_hidden_files(
         &mut self,
         _: &ToggleHiddenFiles,
@@ -1179,6 +1226,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
             .on_action(cx.listener(Self::handle_toggle_split_pane))
             .on_action(cx.listener(Self::handle_toggle_info_panel))
+            .on_action(cx.listener(Self::handle_toggle_settings))
             .on_action(cx.listener(Self::handle_delete_permanently))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
@@ -1240,10 +1288,19 @@ impl Render for Workspace {
                             .child(self.sidebar.clone())
                             .child(self.splitter_handle(SplitterSide::Sidebar, cx)),
                     )
-                    // Pane strip: one pane, or two with a divider (M4)
-                    .child(self.render_pane_strip(cx))
-                    // Info panel (M5), resizable, hidden by `cmd-shift-i`
-                    .children(self.render_info_panel(cx)),
+                    // The settings pane takes the whole browsing region when
+                    // it is open (M7c); otherwise the pane strip and the
+                    // info panel share it as they always have.
+                    .when_some(self.settings_view.clone(), |el, settings| {
+                        el.child(settings)
+                    })
+                    .when(self.settings_view.is_none(), |el| {
+                        el
+                            // Pane strip: one pane, or two with a divider (M4)
+                            .child(self.render_pane_strip(cx))
+                            // Info panel (M5), resizable, hidden by `cmd-shift-i`
+                            .children(self.render_info_panel(cx))
+                    }),
             )
             // Toast overlay (renders nothing while empty)
             .child(self.toast_layer.clone())

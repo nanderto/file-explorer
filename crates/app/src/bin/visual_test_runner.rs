@@ -35,6 +35,7 @@ mod macos {
     use file_explorer_app::dir_view::DirView;
     use file_explorer_app::info_panel::PermField;
     use file_explorer_app::pane::{Pane, ViewMode};
+    use file_explorer_app::settings_ui::SettingsSection;
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
     use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Tag, TagColor, Vfs};
     use gpui::{
@@ -133,6 +134,12 @@ mod macos {
         /// search flavor of the status line together. The walk is waited out
         /// before the capture — see `settle_search`.
         SearchActive(&'static str, &'static str, bool),
+        /// M7c: the settings pane, on the named section. Takes over the whole
+        /// browsing region, so the frame pins the section switcher, the rows
+        /// of that section and the diagnostics block beneath them — including
+        /// the "nothing was wrong" wording, which is a claim the pane makes
+        /// and not merely an absence.
+        SettingsPane(SettingsSection),
     }
 
     /// Every visual scenario: (name, theme, setup). Add new UI states here.
@@ -284,6 +291,22 @@ mod macos {
                 "tag_filter",
                 Theme::dark(),
                 Setup::TagFilter("/home", "Red"),
+            ),
+            // M7c: the settings pane. Two of the three sections, because
+            // they are the two that carry controls whose *state* can be
+            // wrong — the behavior toggles and the theme picker's chosen
+            // row. Keyboard is a long read-only list whose interesting
+            // property (it reflects the live keymap, overrides and all) is
+            // pinned by a unit test rather than by pixels.
+            (
+                "settings_general",
+                Theme::dark(),
+                Setup::SettingsPane(SettingsSection::General),
+            ),
+            (
+                "settings_appearance",
+                Theme::dark(),
+                Setup::SettingsPane(SettingsSection::Appearance),
             ),
         ]
     }
@@ -473,6 +496,23 @@ mod macos {
                     // Each expansion's children load before the next level.
                     cx.run_until_parked();
                 }
+            }
+            Setup::SettingsPane(section) => {
+                navigate(cx, "/home")?;
+                cx.run_until_parked();
+                cx.update_window(handle, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| workspace.toggle_settings(window, cx));
+                })
+                .map_err(|e| anyhow!("opening the settings pane failed: {e:?}"))?;
+                cx.run_until_parked();
+                let view = cx
+                    .read(|cx| workspace.read(cx).settings_view())
+                    .ok_or_else(|| anyhow!("the settings pane did not open"))?;
+                cx.update_window(handle, |_, _, cx| {
+                    view.update(cx, |view, cx| view.show_section(section, cx));
+                })
+                .map_err(|e| anyhow!("switching settings section failed: {e:?}"))?;
+                cx.run_until_parked();
             }
             Setup::SearchActive(path, query, recursive) => {
                 navigate(cx, path)?;

@@ -1300,6 +1300,12 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   * **Nothing touches the disk on the UI thread** (§5): the folder read, the
     parse and the watch registration all run on the background executor, and
     unregistration goes through the shared `BackgroundWatchGuard`.
+  * **`selection` is painted** (M7c): the details list and the icon grid take
+    the selected-row tint from `theme.selection` instead of deriving it from
+    the accent, so a theme can re-tint selection without dragging every focus
+    ring and hover state with it. The built-ins define `selection` as exactly
+    what those views painted before — the accent at 0.35 alpha — which is what
+    made the wiring baseline-neutral, and a theme-crate test pins that.
   * **Selections, not just names** (M7b): `ActiveTheme` holds a
     `ThemeSelection` — one theme, or the light/dark pair that follows macOS —
     plus the last-seen system appearance, and `resolve()` is the single place
@@ -1312,6 +1318,40 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     `settings::init` applies it when its own background load lands — but only
     if the file actually changed it (see `settings.rs`). The picker that
     *writes* it is M7c.
+- `settings_ui.rs` (M7c, plan §7's "Settings window"): the settings surface.
+  **A pane, not a window and not a modal** — it takes over the browsing
+  region (pane strip *and* info panel) while the sidebar and titlebar stay,
+  toggled by `cmd-,` and closed by `escape` or the same chord. A modal was
+  rejected outright: it would block the window, and a settings surface whose
+  job is changing how the window looks is only useful if the change can be
+  seen landing behind it.
+  * **Three sections.** *General* — the two §3 behaviors, each row carrying
+    one line of why it defaults as it does. *Appearance* — "Follow the
+    system" plus every theme in the registry, chosen with a radio dot rather
+    than a checkbox because they are one-of-many. *Keyboard* — every binding
+    currently in force.
+  * **No OK/Cancel.** A click mutates `AppSettings` and calls `save`
+    immediately, matching how a pinned favorite has behaved since M2; M7b's
+    serialized writer means three quick clicks are three saves that cannot
+    race. A theme click applies to the running app *before* it persists, so
+    the repaint is not waiting on a disk write.
+  * **Two observers, and the second one is load-bearing.** `AppSettings`
+    covers this pane's own writes and a text editor's; `ActiveTheme` covers
+    the case a test caught — a user theme dropped into the folder joins the
+    registry *without changing the painted theme*, so `ActiveTheme` does not
+    refresh the windows and the picker would go on listing the themes that
+    existed when it opened.
+  * **The Keyboard list is read back out of gpui** (`keymap::visible_bindings`)
+    rather than re-derived from the §0 table, so it shows what the app will
+    actually dispatch: a `keymap.json` override appears as the override, and a
+    row the file failed to bind is visibly *absent* rather than listed as
+    though it worked. `NoAction` rows (a `null` unbind) are dropped. Read-only
+    — chord-capture rebinding is a recorded gap.
+  * **The diagnostics finally have a home.** Both M7b channels — what was
+    wrong with `settings.json`, and with `keymap.json`/the themes folder —
+    render beneath their section, and say so explicitly when there is nothing
+    wrong, because an empty error area and a missing error area look
+    identical.
 - `watch_guard.rs` (M7a): `BackgroundWatchGuard`, lifted verbatim out of
   `pane.rs` now that the themes folder watches too. Dropping a `WatchGuard`
   is disk-touching (macOS stops and joins an FSEvents run-loop thread), so
