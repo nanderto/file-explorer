@@ -30,7 +30,18 @@ use gpui::{App, AppContext as _, BorrowAppContext as _, Global, SharedString, Ta
 use crate::app_state::FsContext;
 use crate::watch_guard::BackgroundWatchGuard;
 
-pub use ::theme::{Appearance, FileColors, LoadedTheme, Theme, ThemeColors, ThemeRegistry, color};
+pub use ::theme::{
+    Appearance, FileColors, LoadedTheme, Theme, ThemeColors, ThemeRegistry, ThemeSelection, color,
+};
+
+/// gpui reports four appearances (each has a "vibrant" variant); the theme
+/// model has two. Vibrant is the same side of the light/dark line.
+pub fn appearance_of(appearance: gpui::WindowAppearance) -> Appearance {
+    match appearance {
+        gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => Appearance::Light,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => Appearance::Dark,
+    }
+}
 
 /// Debounce for the themes folder. Editors save in bursts (write, rename,
 /// chmod); one reload per burst is enough, and the folder is tiny.
@@ -44,11 +55,16 @@ const THEME_EXTENSION: &str = "json";
 pub struct ActiveTheme {
     registry: ThemeRegistry,
     active: Theme,
-    /// The name the user *asked* for, which is not always the name of
-    /// [`Self::active`]: a settings file naming a user theme whose file is
-    /// missing paints the default, and re-adding the file must bring the
-    /// user's choice back without them re-picking it.
-    requested: SharedString,
+    /// What the user *asked* for, which is not always what is painted: a
+    /// settings file naming a user theme whose file is missing paints the
+    /// default, and re-adding the file must bring the user's choice back
+    /// without them re-picking it. A `Dynamic` selection also names two
+    /// themes at once and only one of them is active (M7b).
+    selection: ThemeSelection,
+    /// The system's light/dark state, as last reported by
+    /// `Window::observe_window_appearance`. Only a `Dynamic` selection reads
+    /// it; a `Static` one paints the same theme either way.
+    system_appearance: Appearance,
     themes_dir: PathBuf,
     /// Per-file complaints from the last folder read — bad syntax, unknown
     /// keys. Surfaced by the settings window (M7b); kept here because the
@@ -89,22 +105,24 @@ fn default_theme() -> &'static Theme {
 
 impl ActiveTheme {
     /// Install the global with the built-ins only, then read and start
-    /// watching the user's themes folder. `requested` is the theme name from
-    /// the settings file.
-    pub fn init(requested: impl Into<SharedString>, cx: &mut App) {
-        Self::init_in(Self::default_themes_dir(), requested, cx);
+    /// watching the user's themes folder. `selection` is what the settings
+    /// file asked for.
+    pub fn init(selection: ThemeSelection, cx: &mut App) {
+        Self::init_in(Self::default_themes_dir(), selection, cx);
     }
 
     /// [`init`](Self::init) against an explicit folder — what tests use, so
     /// they can point the watcher at a `FakeVfs` path.
-    pub fn init_in(themes_dir: PathBuf, requested: impl Into<SharedString>, cx: &mut App) {
-        let requested = requested.into();
+    pub fn init_in(themes_dir: PathBuf, selection: ThemeSelection, cx: &mut App) {
+        // The system's current state, before any window exists to observe it.
+        let system_appearance = appearance_of(cx.window_appearance());
         let registry = ThemeRegistry::builtins_only();
-        let active = registry.get_or_default(&requested);
+        let active = registry.get_or_default(selection.name_for(system_appearance));
         cx.set_global(ActiveTheme {
             registry,
             active,
-            requested,
+            selection,
+            system_appearance,
             themes_dir,
             diagnostics: Vec::new(),
             _reload: None,
@@ -134,11 +152,33 @@ impl ActiveTheme {
             .unwrap_or_default()
     }
 
-    /// The name the user picked, which is what the settings file stores.
+    /// What the user picked, which is what the settings file stores.
+    pub fn selection(cx: &App) -> ThemeSelection {
+        cx.try_global::<ActiveTheme>()
+            .map(|active| active.selection.clone())
+            .unwrap_or_default()
+    }
+
+    /// The theme name in force right now — the selection resolved against the
+    /// current system appearance.
     pub fn requested_name(cx: &App) -> SharedString {
         cx.try_global::<ActiveTheme>()
-            .map(|active| active.requested.clone())
+            .map(|active| {
+                SharedString::from(
+                    active
+                        .selection
+                        .name_for(active.system_appearance)
+                        .to_string(),
+                )
+            })
             .unwrap_or_else(|| Theme::dark().name)
+    }
+
+    /// The system's light/dark state as the theme system last saw it.
+    pub fn system_appearance(cx: &App) -> Appearance {
+        cx.try_global::<ActiveTheme>()
+            .map(|active| active.system_appearance)
+            .unwrap_or(Appearance::Dark)
     }
 
     pub fn diagnostics(cx: &App) -> Vec<ThemeDiagnostic> {
@@ -147,23 +187,57 @@ impl ActiveTheme {
             .unwrap_or_default()
     }
 
-    /// Switch themes. A name that is not installed is still *remembered* (see
-    /// [`Self::requested`]) but paints the default. Returns whether the
-    /// painted theme changed.
+    /// Switch to one named theme. A name that is not installed is still
+    /// *remembered* but paints the default. Returns whether the painted theme
+    /// changed.
     pub fn select(name: impl Into<SharedString>, cx: &mut App) -> bool {
-        let name = name.into();
-        let Some(active) = cx.try_global::<ActiveTheme>() else {
+        Self::set_selection(ThemeSelection::Static(name.into().to_string()), cx)
+    }
+
+    /// Switch to a whole selection — one theme, or the light/dark pair that
+    /// follows the system (plan §6's `appearance: system`).
+    pub fn set_selection(selection: ThemeSelection, cx: &mut App) -> bool {
+        if cx.try_global::<ActiveTheme>().is_none() {
             return false;
-        };
-        let next = active.registry.get_or_default(&name);
-        let changed = next != active.active;
-        cx.update_global::<ActiveTheme, _>(|active, _| {
-            active.requested = name;
-            active.active = next;
+        }
+        let changed = cx.update_global::<ActiveTheme, _>(|active, _| {
+            active.selection = selection;
+            active.resolve()
         });
         if changed {
             cx.refresh_windows();
         }
+        changed
+    }
+
+    /// The system flipped between light and dark. A no-op for a `Static`
+    /// selection, which is why the observer is cheap to leave installed.
+    pub fn set_system_appearance(appearance: Appearance, cx: &mut App) -> bool {
+        if cx.try_global::<ActiveTheme>().is_none() {
+            return false;
+        }
+        let changed = cx.update_global::<ActiveTheme, _>(|active, _| {
+            if active.system_appearance == appearance {
+                return false;
+            }
+            active.system_appearance = appearance;
+            active.resolve()
+        });
+        if changed {
+            cx.refresh_windows();
+        }
+        changed
+    }
+
+    /// Re-derive [`Self::active`] from the selection, the system appearance
+    /// and the registry — the one place that decides what is painted.
+    /// Returns whether it moved.
+    fn resolve(&mut self) -> bool {
+        let next = self
+            .registry
+            .get_or_default(self.selection.name_for(self.system_appearance));
+        let changed = next != self.active;
+        self.active = next;
         changed
     }
 
@@ -211,7 +285,7 @@ impl ActiveTheme {
                     }),
                 }
             }
-            active.active = active.registry.get_or_default(&active.requested);
+            active.resolve();
             active.active != before
         });
         if changed {
@@ -319,7 +393,7 @@ mod tests {
                 Arc::new(LoggingOpener),
                 Arc::new(StubPlatform::new()),
             );
-            ActiveTheme::init_in(PathBuf::from(THEMES), Theme::dark().name, cx);
+            ActiveTheme::init_in(PathBuf::from(THEMES), ThemeSelection::default(), cx);
             vfs
         });
         cx.run_until_parked();
@@ -461,6 +535,81 @@ mod tests {
         cx.update(|cx| {
             assert_eq!(ActiveTheme::registry(cx).len(), 3);
             assert!(ActiveTheme::diagnostics(cx).is_empty());
+        });
+    }
+
+    /// Plan §6's `appearance: system`: the selection names a theme per side
+    /// of the system's light/dark switch, and flipping the system swaps which
+    /// one is painted without the user touching anything.
+    #[gpui::test]
+    fn a_dynamic_selection_follows_the_system_appearance(cx: &mut TestAppContext) {
+        boot(cx, json!({}));
+        cx.update(|cx| {
+            ActiveTheme::set_selection(ThemeSelection::system(), cx);
+            // Whatever the test platform reports at boot, pin both sides
+            // explicitly and check each.
+            ActiveTheme::set_system_appearance(Appearance::Dark, cx);
+            assert_eq!(theme(cx), &Theme::dark());
+
+            assert!(ActiveTheme::set_system_appearance(Appearance::Light, cx));
+            assert_eq!(theme(cx), &Theme::light());
+            assert_eq!(
+                ActiveTheme::requested_name(cx),
+                SharedString::from("Graphite Light"),
+                "the name in force follows the appearance too"
+            );
+
+            // Reporting the same appearance twice is not a repaint.
+            assert!(!ActiveTheme::set_system_appearance(Appearance::Light, cx));
+        });
+    }
+
+    #[gpui::test]
+    fn a_static_selection_ignores_the_system_appearance(cx: &mut TestAppContext) {
+        boot(cx, json!({}));
+        cx.update(|cx| {
+            ActiveTheme::select("Graphite Dark", cx);
+            ActiveTheme::set_system_appearance(Appearance::Dark, cx);
+            assert!(
+                !ActiveTheme::set_system_appearance(Appearance::Light, cx),
+                "a static selection must not repaint on a system flip"
+            );
+            assert_eq!(theme(cx), &Theme::dark());
+        });
+    }
+
+    /// A dynamic selection naming a *user* theme still hot-reloads — the
+    /// resolve path is shared, so this is really a check that the folder
+    /// reload re-resolves through the selection rather than a stored name.
+    #[gpui::test]
+    fn a_dynamic_selection_picks_up_an_edited_user_theme(cx: &mut TestAppContext) {
+        let vfs = boot(
+            cx,
+            json!({ "themes": { "night.json": theme_json("Night", "hsl(0, 100%, 50%)") } }),
+        );
+        cx.update(|cx| {
+            ActiveTheme::set_selection(
+                ThemeSelection::Dynamic {
+                    light: "Graphite Light".into(),
+                    dark: "Night".into(),
+                },
+                cx,
+            );
+            ActiveTheme::set_system_appearance(Appearance::Dark, cx);
+            assert_eq!(theme(cx).name, SharedString::from("Night"));
+        });
+
+        vfs.write_file(
+            Path::new("/config/themes/night.json"),
+            theme_json("Night", "hsl(120, 100%, 50%)").into_bytes(),
+        );
+        settle_watch(cx);
+        cx.update(|cx| {
+            assert_eq!(
+                theme(cx).accent,
+                color::parse("hsl(120, 100%, 50%)").unwrap(),
+                "the dark half of the pair did not reload"
+            );
         });
     }
 

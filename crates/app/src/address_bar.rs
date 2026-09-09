@@ -394,7 +394,7 @@ mod tests {
         cx.update(|_, cx| {
             crate::theme::ActiveTheme::init_in(
                 std::path::PathBuf::from("/config/themes"),
-                crate::Theme::dark().name,
+                crate::theme::ThemeSelection::default(),
                 cx,
             )
         });

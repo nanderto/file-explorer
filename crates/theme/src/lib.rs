@@ -31,7 +31,7 @@ use std::fmt;
 
 use anyhow::{Context as _, bail};
 use gpui::{Hsla, SharedString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub mod color;
 
@@ -303,6 +303,58 @@ fn builtin(source: &str) -> Theme {
     }
 }
 
+/// What the user picked, which is not always one theme.
+///
+/// `Static` is a single named theme. `Dynamic` is the plan's
+/// `appearance: system`: a *pair*, so the app follows macOS's light/dark
+/// switch live rather than picking one and staying there. The setting is
+/// stored in `settings.json` and reads naturally in both forms:
+///
+/// ```json
+/// "theme": "Graphite Dark"
+/// "theme": { "light": "Graphite Light", "dark": "Graphite Dark" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThemeSelection {
+    /// One theme, whatever the system is doing.
+    Static(String),
+    /// One theme per system appearance.
+    Dynamic { light: String, dark: String },
+}
+
+impl ThemeSelection {
+    /// Follow the system, with the built-ins as the pair.
+    pub fn system() -> Self {
+        Self::Dynamic {
+            light: Theme::light().name.to_string(),
+            dark: Theme::dark().name.to_string(),
+        }
+    }
+
+    /// Which theme name applies right now.
+    pub fn name_for(&self, appearance: Appearance) -> &str {
+        match (self, appearance) {
+            (Self::Static(name), _) => name,
+            (Self::Dynamic { light, .. }, Appearance::Light) => light,
+            (Self::Dynamic { dark, .. }, Appearance::Dark) => dark,
+        }
+    }
+
+    /// Whether this selection tracks the system appearance — the thing the
+    /// settings window shows as a "Follow system" checkbox, and the reason
+    /// the app bothers to observe appearance changes at all.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, Self::Dynamic { .. })
+    }
+}
+
+impl Default for ThemeSelection {
+    fn default() -> Self {
+        Self::Static(Theme::dark().name.to_string())
+    }
+}
+
 /// Every theme the app can switch to: the built-ins, plus whatever loaded out
 /// of the user's themes folder.
 ///
@@ -541,6 +593,51 @@ mod tests {
         assert_eq!(
             registry.get("Graphite Dark").unwrap().accent,
             Theme::dark().accent
+        );
+    }
+
+    #[test]
+    fn a_static_selection_ignores_the_system_appearance() {
+        let selection = ThemeSelection::Static("Mine".into());
+        assert_eq!(selection.name_for(Appearance::Light), "Mine");
+        assert_eq!(selection.name_for(Appearance::Dark), "Mine");
+        assert!(!selection.is_dynamic());
+    }
+
+    #[test]
+    fn a_dynamic_selection_picks_a_side() {
+        let selection = ThemeSelection::system();
+        assert_eq!(selection.name_for(Appearance::Light), "Graphite Light");
+        assert_eq!(selection.name_for(Appearance::Dark), "Graphite Dark");
+        assert!(selection.is_dynamic());
+    }
+
+    /// Both spellings have to survive `settings.json`, and the untagged enum
+    /// is the only thing standing between them.
+    #[test]
+    fn both_selection_forms_round_trip_through_json() {
+        for selection in [
+            ThemeSelection::Static("Graphite Light".into()),
+            ThemeSelection::system(),
+        ] {
+            let json = serde_json::to_string(&selection).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ThemeSelection>(&json).unwrap(),
+                selection,
+                "{json} did not round-trip"
+            );
+        }
+        // The shapes a human would actually type.
+        assert_eq!(
+            serde_json::from_str::<ThemeSelection>(r#""Graphite Dark""#).unwrap(),
+            ThemeSelection::Static("Graphite Dark".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<ThemeSelection>(
+                r#"{ "light": "Graphite Light", "dark": "Graphite Dark" }"#
+            )
+            .unwrap(),
+            ThemeSelection::system()
         );
     }
 

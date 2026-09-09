@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use file_explorer_app::{ActiveTheme, Theme, Workspace, app_state, keymap, settings};
+use file_explorer_app::{ActiveTheme, ThemeSelection, Workspace, app_state, keymap, settings};
 use gpui::{App, AppContext as _, Bounds, Focusable as _, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
 
@@ -12,9 +12,9 @@ fn main() {
         // `settings.json` is applied by `settings::init` when its own load
         // lands (both are in flight together; the theme system starts on the
         // default and switches once).
-        ActiveTheme::init(Theme::dark().name, cx);
+        ActiveTheme::init(ThemeSelection::default(), cx);
         settings::init(cx);
-        keymap::init(cx);
+        keymap::init_with_overrides(cx, keymap::default_keymap_path());
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         let window = cx
             .open_window(

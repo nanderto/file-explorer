@@ -56,6 +56,10 @@ pub enum PaneEvent {
     /// details view's expansion children; the workspace forwards this to the
     /// sidebar, whose tree caches child listings of its own.
     DirsChanged(Vec<Arc<Path>>),
+    /// The active view asked for a trash delete to be confirmed first (plan
+    /// §3's optional confirmation, off by default). Forwarded from
+    /// `DirViewEvent::ConfirmTrash`; the workspace owns the dialog.
+    ConfirmTrash(Vec<PathBuf>),
     /// Focus entered this pane — its own node or any descendant (the details
     /// view or icon grid, the address-bar editor, the rename editor). The
     /// workspace makes the emitting pane the **active** one, so every
@@ -260,6 +264,9 @@ impl Pane {
         // folders; the pane navigates.
         let subscription = cx.subscribe(&dir_view, |this, _, event, cx| match event {
             DirViewEvent::NavigateTo(path) => this.navigate_to(path, cx),
+            // Straight through: the pane has nothing to add, but the
+            // workspace owns the dialog and only hears from panes.
+            DirViewEvent::ConfirmTrash(paths) => cx.emit(PaneEvent::ConfirmTrash(paths.clone())),
         });
         let address_bar_view = cx.new(AddressBar::new);
         // §8 address bar: confirmed paths navigate; escape/cancel restores the
@@ -321,7 +328,13 @@ impl Pane {
             pending_restore: None,
             address_bar: AddressBarMode::Breadcrumb,
             view_mode: ViewMode::default(),
-            sort: SortSpec::default(),
+            sort: SortSpec {
+                // Plan §3's "folders always grouped first (setting)" — read
+                // once here and fanned out by the workspace when it changes,
+                // exactly like the hidden-files toggle.
+                folders_first: crate::settings::AppSettings::folders_first_or_default(cx),
+                ..SortSpec::default()
+            },
             show_hidden: false,
             cache: ListingCache::default(),
             generation: 0,
@@ -407,6 +420,19 @@ impl Pane {
             self.sort.key = key;
             self.sort.direction = SortDirection::Ascending;
         }
+        self.reload_in_place(cx);
+    }
+
+    /// Group folders before files, or sort them together (plan §3). The
+    /// workspace fans this out from `AppSettings` when the setting changes.
+    /// A sort flip is *not* an argument to a running search — the walk's
+    /// output is sorted at projection time — so unlike `set_show_hidden`
+    /// this reloads in place without restarting anything.
+    pub fn set_folders_first(&mut self, folders_first: bool, cx: &mut Context<Self>) {
+        if self.sort.folders_first == folders_first {
+            return;
+        }
+        self.sort.folders_first = folders_first;
         self.reload_in_place(cx);
     }
 

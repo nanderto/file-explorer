@@ -25,6 +25,7 @@ use crate::info_panel::InfoPanel;
 use crate::jobs_model::{JobsEvent, JobsModel};
 use crate::jobs_ui::{JobsIndicator, ToastLayer};
 use crate::pane::{Pane, PaneEvent};
+use crate::settings::AppSettings;
 use crate::sidebar::{Sidebar, SidebarEvent};
 
 /// Font used for all UI text. Pinned to a face that ships with macOS so
@@ -150,6 +151,11 @@ pub struct Workspace {
     jobs_indicator: Entity<JobsIndicator>,
     toast_layer: Entity<ToastLayer>,
     modal: Option<ModalState>,
+    /// Repaints and fans out when `AppSettings` changes — see
+    /// [`Workspace::settings_changed`].
+    _settings_observer: Subscription,
+    /// The system light/dark switch, for `appearance: system` themes.
+    _appearance_observer: Subscription,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -158,7 +164,7 @@ impl Workspace {
         let pane = cx.new(|cx| Pane::new(window, cx));
         // Events up (§2): a pane's watcher batches are the only news the
         // sidebar tree gets about external changes.
-        let pane_subscription = cx.subscribe(&pane, Self::handle_pane_event);
+        let pane_subscription = cx.subscribe_in(&pane, window, Self::handle_pane_event);
         let workspace = cx.weak_entity();
         let sidebar = cx.new(|cx| Sidebar::new(workspace, cx));
         // Events up, method calls down (§2): the sidebar reports navigation
@@ -172,6 +178,20 @@ impl Workspace {
         let toast_layer = cx.new(|cx| ToastLayer::new(jobs.clone(), cx));
         let info_panel = cx.new(|_| InfoPanel::new());
         let dir_view_observation = Self::observe_dir_view(&pane, cx);
+        // Settings the panes act on (plan §3's `folders_first`) arrive both
+        // from the settings window and from a text editor via the store's
+        // watcher; one observer covers both, and fans out like
+        // `ToggleHiddenFiles` does.
+        let settings_observer = cx.observe_global::<AppSettings>(Self::settings_changed);
+        // The system's light/dark switch, for a theme selection that follows
+        // it (plan §6 `appearance: system`). Cheap to leave installed: a
+        // static selection makes `set_system_appearance` a no-op.
+        let appearance_observer = window.observe_window_appearance(|_, cx| {
+            crate::theme::ActiveTheme::set_system_appearance(
+                crate::theme::appearance_of(cx.window_appearance()),
+                cx,
+            );
+        });
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let mut workspace = Self {
@@ -192,6 +212,8 @@ impl Workspace {
             toast_layer,
             modal: None,
             _subscriptions: vec![sidebar_subscription, jobs_subscription],
+            _settings_observer: settings_observer,
+            _appearance_observer: appearance_observer,
         };
         // The panel opens describing the pane's state, not a stale default.
         workspace.sync_info_panel(cx);
@@ -201,7 +223,13 @@ impl Workspace {
     /// The sidebar tree caches child listings of its own, so an external
     /// change a pane's watcher reported has to reach it too (§6: cached child
     /// listings must not survive a change to the folder they came from).
-    fn handle_pane_event(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
+    fn handle_pane_event(
+        &mut self,
+        pane: &Entity<Pane>,
+        event: &PaneEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             PaneEvent::DirsChanged(dirs) => {
                 let dirs = dirs.clone();
@@ -211,12 +239,41 @@ impl Workspace {
             // Focus landed anywhere inside a pane, so that pane becomes the
             // one every workspace-level command targets (M4 dual pane).
             PaneEvent::FocusIn => {
-                if let Some(ix) = self.panes.iter().position(|p| p == &pane) {
+                if let Some(ix) = self.panes.iter().position(|p| p == pane) {
                     self.active_pane_ix = ix;
                     // "Whose selection does the info panel describe" is
                     // answered by focus, exactly as `cmd-z`'s target is.
                     self.sync_info_panel(cx);
                 }
+            }
+            // Plan §3's optional trash confirmation. The trash is undoable,
+            // so this asks rather than warning: no "can't be undone" line,
+            // and the default label is the affirmative one.
+            PaneEvent::ConfirmTrash(paths) => {
+                if paths.is_empty() {
+                    return;
+                }
+                let message = match paths.as_slice() {
+                    [only] => format!(
+                        "Move \u{201c}{}\u{201d} to the Trash?",
+                        only.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| only.display().to_string())
+                    ),
+                    many => format!("Move {} items to the Trash?", many.len()),
+                };
+                self.show_confirm(
+                    ConfirmRequest {
+                        title: "Move to Trash".into(),
+                        message: message.into(),
+                        confirm_label: "Move to Trash".into(),
+                        op: FileOp::TrashOp {
+                            paths: paths.clone(),
+                        },
+                    },
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -681,7 +738,7 @@ impl Workspace {
         };
         let show_hidden = self.show_hidden;
         let pane = cx.new(|cx| Pane::new(window, cx));
-        let subscription = cx.subscribe(&pane, Self::handle_pane_event);
+        let subscription = cx.subscribe_in(&pane, window, Self::handle_pane_event);
         pane.update(cx, |new_pane, cx| {
             new_pane.set_show_hidden(show_hidden, cx);
             new_pane.set_view_mode(view_mode, cx);
@@ -1068,6 +1125,17 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    /// `AppSettings` changed — from the settings window, or from someone
+    /// editing `settings.json` in a text editor. Push the settings the panes
+    /// hold copies of; everything else is read at the point of use.
+    fn settings_changed(&mut self, cx: &mut Context<Self>) {
+        let folders_first = AppSettings::global(cx).folders_first();
+        for pane in self.panes.clone() {
+            pane.update(cx, |pane, cx| pane.set_folders_first(folders_first, cx));
+        }
+        cx.notify();
     }
 
     fn handle_toggle_hidden_files(
@@ -1696,6 +1764,140 @@ mod tests {
             assert!(workspace.active_modal().is_none());
         });
         assert!(!exists(&vfs, "/root/a.txt"), "confirmed, so it is gone");
+    }
+
+    // ------------------------------------------------------------------
+    // M7b: the §3 behaviors that are settings
+    // ------------------------------------------------------------------
+
+    /// Plan §3: "Folders always grouped first (setting)". The setting reaches
+    /// every pane — including one the user is not looking at — and re-sorts
+    /// in place, exactly as the hidden-files toggle does.
+    #[gpui::test]
+    fn folders_first_reaches_every_pane_when_the_setting_changes(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        // Named so the two orders differ: alphabetically the file comes
+        // first, grouped the folder does.
+        vfs.insert_tree("/sorted", json!({ "a.txt": "a", "z-folder": {} }));
+        let (workspace, cx) = build_workspace(cx);
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/sorted"), cx));
+        cx.run_until_parked();
+
+        let names = |cx: &mut VisualTestContext| {
+            let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+            cx.update(|_, cx| {
+                dir_view
+                    .read(cx)
+                    .projected_rows(cx)
+                    .iter()
+                    .map(|row| row.entry.name.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(names(cx), ["z-folder", "a.txt"], "grouped by default");
+
+        cx.update(|_, cx| {
+            cx.update_global::<AppSettings, _>(|settings, _| {
+                assert!(settings.set_folders_first(false));
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            names(cx),
+            ["a.txt", "z-folder"],
+            "the setting did not reach the pane"
+        );
+        pane.read_with(cx, |pane, _| assert!(!pane.sort().folders_first));
+    }
+
+    /// Plan §3: the trash confirmation is a setting, and **off** by default —
+    /// the trash is undoable, so Explorer does not ask.
+    #[gpui::test]
+    fn the_trash_confirmation_is_off_by_default(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        select_and_press_delete(&workspace, cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.active_modal().is_none(),
+                "nothing should have asked"
+            );
+        });
+        assert!(
+            !exists(&vfs, "/root/a.txt"),
+            "it went straight to the trash"
+        );
+    }
+
+    /// With the setting on, the same keystroke asks first and queues nothing
+    /// until the dialog is confirmed.
+    #[gpui::test]
+    fn the_trash_confirmation_asks_first_when_it_is_on(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        cx.update(|_, cx| {
+            cx.update_global::<AppSettings, _>(|settings, _| {
+                assert!(settings.set_confirm_delete_to_trash(true));
+            });
+        });
+        select_and_press_delete(&workspace, cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                matches!(workspace.active_modal(), Some(Modal::Confirm { .. })),
+                "the setting is on, so it must ask"
+            );
+        });
+        assert!(exists(&vfs, "/root/a.txt"), "nothing submitted yet");
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none())
+        });
+        assert!(!exists(&vfs, "/root/a.txt"), "confirmed, so it is trashed");
+    }
+
+    /// Cancelling leaves the file exactly where it was — the point of asking.
+    #[gpui::test]
+    fn cancelling_the_trash_confirmation_deletes_nothing(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        cx.update(|_, cx| {
+            cx.update_global::<AppSettings, _>(|settings, _| {
+                settings.set_confirm_delete_to_trash(true);
+            });
+        });
+        select_and_press_delete(&workspace, cx);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.active_modal().is_none())
+        });
+        assert!(exists(&vfs, "/root/a.txt"), "cancelled, so it survives");
+    }
+
+    /// Select `/root/a.txt` in the active pane and press the bare `delete`
+    /// key with the list focused — the §3 "Delete to trash" gesture.
+    fn select_and_press_delete(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        let dir_view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        dir_view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/a.txt")], cx);
+        });
+        cx.update(|window, cx| {
+            let handle = dir_view.read(cx).focus_handle_ref().clone();
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
     }
 
     // ------------------------------------------------------------------

@@ -886,7 +886,7 @@ mod macos {
         cx.update(|cx| {
             file_explorer_app::ActiveTheme::init_in(
                 PathBuf::from("/config/themes"),
-                theme.name.clone(),
+                file_explorer_app::ThemeSelection::Static(theme.name.to_string()),
                 cx,
             )
         });
