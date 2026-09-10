@@ -33,9 +33,6 @@ const DATE_COL_WIDTH: f32 = 150.0;
 /// Width of the disclosure-triangle slot (also the per-depth indent), part
 /// of the Name column.
 const DISCLOSURE_WIDTH: f32 = 16.0;
-/// Selection tint: the theme accent at partial alpha, so selected-row text
-/// keeps its normal contrast in both appearances.
-const SELECTION_ALPHA: f32 = 0.35;
 /// Row opacity for cut-pending entries (plan §3: "cut items render dimmed").
 const CUT_DIM_OPACITY: f32 = 0.5;
 /// The Name column never shrinks past this. `Size` and `Date Modified` are
@@ -255,9 +252,9 @@ fn render_row(
                 this.toggle_expanded(&toggle_path, cx);
             }))
             .child(SharedString::new_static(if row.expanded {
-                "▾"
+                crate::theme::DISCLOSURE_EXPANDED
             } else {
-                "▸"
+                crate::theme::DISCLOSURE_COLLAPSED
             }))
             .into_any_element()
     } else {
@@ -520,13 +517,12 @@ fn render_rename_row(
     styled_row
 }
 
-/// The selection background, derived from the active theme's accent (no
-/// color literals in the app crate).
+/// The selection background. A theme token of its own since M7c: it used to
+/// be the accent at 0.35 alpha, and the built-ins still define it as
+/// exactly that, so nothing moved — but a theme can now tint selection
+/// without dragging every focus ring and toolbar highlight with it.
 fn selection_color(theme: &Theme) -> Hsla {
-    Hsla {
-        a: SELECTION_ALPHA,
-        ..theme.accent
-    }
+    theme.selection
 }
 
 /// Format a modification time as a fixed-width UTC timestamp

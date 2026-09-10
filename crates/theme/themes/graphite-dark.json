@@ -9,7 +9,7 @@
     "text": "hsl(0, 0%, 92%)",
     "muted": "hsl(0, 0%, 55%)",
     "accent": "hsl(210, 90%, 55%)",
-    "selection": "hsla(210, 90%, 55%, 0.3)",
+    "selection": "hsla(210, 90%, 55%, 0.35)",
     "border": "hsla(0, 0%, 0%, 0.35)",
     "error": "hsl(0, 75%, 58%)"
   },

@@ -253,6 +253,11 @@ pub fn reload(cx: &mut App) {
             }
             let diagnostics = apply(cx, source.as_deref());
             cx.update_global::<UserKeymap, _>(|keymap, _| keymap.diagnostics = diagnostics);
+            // The menu bar caches each item's key equivalent from the keymap
+            // it was built against, and on macOS the menu is what makes a
+            // Command chord reach the app at all — so a reload that does not
+            // rebuild it leaves the old chords live and the new ones dead.
+            crate::menus::rebuild(cx);
         });
     });
     cx.update_global::<UserKeymap, _>(|keymap, _| keymap._load = Some(task));
@@ -298,6 +303,80 @@ fn start_watching(cx: &mut App, path: PathBuf) {
         }
     });
     cx.update_global::<UserKeymap, _>(|keymap, _| keymap._watch = Some(task));
+}
+
+/// Apply an override document over the defaults, for tests in other modules
+/// (the settings pane's Keyboard list). Returns the diagnostics.
+#[cfg(test)]
+pub(crate) fn apply_for_test(cx: &mut App, source: &str) -> Vec<String> {
+    apply(cx, Some(source))
+}
+
+/// Every binding currently in force. This is the keymap *after*
+/// `keymap.json` was applied, read back
+/// out of gpui rather than re-derived from the §0 table — so what the
+/// settings pane lists is what the app will actually dispatch, overrides and
+/// all, and a row the file failed to bind is visibly absent rather than
+/// listed as though it worked.
+///
+/// Sorted by context then keystrokes so the list is stable frame to frame;
+/// unbound rows (`null` in the file, gpui's `NoAction`) are dropped, since
+/// "this key does nothing" is not a binding worth a line.
+pub fn visible_bindings(cx: &App) -> Vec<BindingRow> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let mut rows: Vec<BindingRow> = keymap
+        .bindings()
+        .filter(|binding| !gpui::is_no_action(binding.action()))
+        .map(|binding| {
+            let keystrokes = binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Whether this chord needs the platform modifier (Command on
+            // macOS) — asked of the modifier flags rather than of the
+            // rendered text, which is `⌘` on macOS and `⊞`/`❖` elsewhere.
+            let uses_platform_modifier = binding
+                .keystrokes()
+                .iter()
+                .any(|keystroke| keystroke.modifiers().platform);
+            let context = binding
+                .predicate()
+                .map(|predicate| predicate.to_string())
+                .filter(|context| !context.is_empty());
+            BindingRow {
+                keystrokes,
+                action: binding.action().name().to_string(),
+                context,
+                uses_platform_modifier,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.context
+            .cmp(&b.context)
+            .then_with(|| a.keystrokes.cmp(&b.keystrokes))
+            .then_with(|| a.action.cmp(&b.action))
+    });
+    rows.dedup();
+    rows
+}
+
+/// One row of [`visible_bindings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingRow {
+    /// As a person reads it — `⌘F` on macOS.
+    pub keystrokes: String,
+    /// The action's registered name.
+    pub action: String,
+    /// The key context it applies in, if it is scoped to one.
+    pub context: Option<String>,
+    /// Whether the chord uses the platform modifier. Load-bearing: on macOS
+    /// such a chord is offered to the menu bar before the window sees it, so
+    /// one without a menu item never fires (see [`crate::menus`]).
+    pub uses_platform_modifier: bool,
 }
 
 /// The §0 table itself.
@@ -404,6 +483,17 @@ fn bind_defaults(cx: &mut App) {
         // the split: the workspace owns the right-hand column, and the
         // titlebar button dispatches this action with focus on the root.
         KeyBinding::new("cmd-shift-i", ToggleInfoPanel, Some("Workspace")),
+        // §0 Settings (M7c). `cmd-,` is the Mac convention for preferences
+        // and every Mac user reaches for it; Workspace context because the
+        // pane it opens replaces the whole browsing region.
+        KeyBinding::new("cmd-,", ToggleSettings, Some("Workspace")),
+        // §0 Quit. Bound at the root rather than in a view context: the menu
+        // bar item takes its equivalent from this row, and quitting must
+        // work with focus anywhere.
+        KeyBinding::new("cmd-q", Quit, None),
+        // Escape closes the settings pane, the way it dismisses every other
+        // transient surface in the app.
+        KeyBinding::new("escape", ToggleSettings, Some("Settings")),
         // §0 Search field focus (M6a). Workspace context like `cmd-l`: the
         // field belongs to the *active* pane, and the binding has to work with
         // focus anywhere in the window (including inside the other pane's

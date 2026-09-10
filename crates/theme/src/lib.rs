@@ -431,7 +431,7 @@ impl ThemeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::hsla;
+    use gpui::{Hsla, hsla};
 
     #[test]
     fn built_in_themes_parse_and_keep_their_appearances() {
@@ -482,6 +482,25 @@ mod tests {
         assert_eq!(light.accent, hsla(210.0 / 360.0, 0.90, 0.45, 1.0));
         assert_eq!(light.border, hsla(0.0, 0.0, 0.0, 0.12));
         assert_eq!(light.error, hsla(0.0, 0.72, 0.45, 1.0));
+    }
+
+    /// M7c gave `selection` a real consumer (the details list and the icon
+    /// grid). The built-ins define it as exactly what those two painted
+    /// before — the accent at 0.35 alpha — which is what made that wiring
+    /// baseline-neutral. If this ever needs changing, the baselines move.
+    #[test]
+    fn the_built_in_selection_is_the_accent_at_the_alpha_the_views_used() {
+        for theme in [Theme::dark(), Theme::light()] {
+            assert_eq!(
+                theme.selection,
+                Hsla {
+                    a: 0.35,
+                    ..theme.accent
+                },
+                "{} moved its selection tint",
+                theme.name
+            );
+        }
     }
 
     #[test]

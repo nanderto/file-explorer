@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::actions::{
     DeletePermanently, FocusAddressBar, FocusSearch, Redo, ToggleHiddenFiles, ToggleInfoPanel,
-    ToggleSplitPane, Undo,
+    ToggleSettings, ToggleSplitPane, Undo,
 };
 use crate::app_state::FsContext;
 use crate::dialogs::{ConfirmDialog, ConfirmDialogEvent, ConflictDialog, ConflictDialogEvent};
@@ -26,7 +26,17 @@ use crate::jobs_model::{JobsEvent, JobsModel};
 use crate::jobs_ui::{JobsIndicator, ToastLayer};
 use crate::pane::{Pane, PaneEvent};
 use crate::settings::AppSettings;
+use crate::settings_ui::SettingsView;
 use crate::sidebar::{Sidebar, SidebarEvent};
+
+/// The app's name as a person reads it. `file-explorer` is the crate, the
+/// binary and the config directory; this is the product.
+pub const APP_DISPLAY_NAME: &str = "File Explorer";
+
+/// Left inset of the titlebar row. The macOS traffic lights are drawn inside
+/// this row (`main.rs` makes the system titlebar transparent) and occupy
+/// roughly x=14..66, so the app name starts clear of them.
+pub const TITLEBAR_LEFT_INSET: f32 = 100.0;
 
 /// Font used for all UI text. Pinned to a face that ships with macOS so
 /// visual-test screenshots are stable across machines and CI runners.
@@ -150,6 +160,10 @@ pub struct Workspace {
     jobs: Entity<JobsModel>,
     jobs_indicator: Entity<JobsIndicator>,
     toast_layer: Entity<ToastLayer>,
+    /// The settings pane (M7c), when it is open. `Some` replaces the whole
+    /// browsing region — pane strip *and* info panel — with it; the sidebar
+    /// and titlebar stay, so the app is still visibly itself underneath.
+    settings_view: Option<Entity<SettingsView>>,
     modal: Option<ModalState>,
     /// Repaints and fans out when `AppSettings` changes — see
     /// [`Workspace::settings_changed`].
@@ -194,6 +208,7 @@ impl Workspace {
         });
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+
         let mut workspace = Self {
             focus_handle,
             sidebar,
@@ -210,6 +225,7 @@ impl Workspace {
             jobs,
             jobs_indicator,
             toast_layer,
+            settings_view: None,
             modal: None,
             _subscriptions: vec![sidebar_subscription, jobs_subscription],
             _settings_observer: settings_observer,
@@ -1035,6 +1051,33 @@ impl Workspace {
             .child(SharedString::new_static("ⓘ"))
     }
 
+    /// The titlebar's settings affordance. `cmd-,` opens the same pane, but a
+    /// surface reachable only by a chord is a surface nobody finds — the
+    /// first person shown this app asked where the tabs were supposed to be,
+    /// which is the whole argument for this button.
+    fn render_settings_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
+        let active = self.settings_open();
+        div()
+            .id("settings-toggle")
+            .debug_selector(|| "settings-toggle".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.0))
+            .h(px(20.0))
+            .rounded(px(3.0))
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .when(active, |el| el.bg(theme.accent.opacity(0.30)))
+            .text_color(if active { theme.text } else { theme.muted })
+            .hover(|s| s.bg(theme.accent.opacity(0.15)))
+            .on_click(cx.listener(|_, _, window: &mut Window, cx| {
+                window.dispatch_action(Box::new(ToggleSettings), cx);
+            }))
+            .child(SharedString::new_static("⚙"))
+    }
+
     /// The right-hand column: the [`InfoPanel`] entity plus its splitter,
     /// rendered only while the panel is showing.
     fn render_info_panel(&self, cx: &App) -> Option<impl IntoElement + use<>> {
@@ -1138,6 +1181,47 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `cmd-,`: open the settings pane, or close it and go back to browsing.
+    /// Closing returns focus to the active pane, so the keyboard lands
+    /// somewhere useful rather than nowhere.
+    fn handle_toggle_settings(
+        &mut self,
+        _: &ToggleSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_settings(window, cx);
+    }
+
+    /// The one implementation behind `cmd-,` and (later) the menu bar.
+    pub fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.settings_view.take() {
+            Some(_) => {
+                let handle = self.active_pane().read(cx).dir_view().focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            None => {
+                let view = cx.new(SettingsView::new);
+                let handle = view.focus_handle(cx);
+                self.settings_view = Some(view);
+                window.focus(&handle, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Whether the settings pane is showing (tests, and the titlebar's own
+    /// affordance later).
+    pub fn settings_open(&self) -> bool {
+        self.settings_view.is_some()
+    }
+
+    /// The open settings pane, if there is one. Used by tests and by the
+    /// visual runner, which drives it to a named section before capturing.
+    pub fn settings_view(&self) -> Option<Entity<SettingsView>> {
+        self.settings_view.clone()
+    }
+
     fn handle_toggle_hidden_files(
         &mut self,
         _: &ToggleHiddenFiles,
@@ -1170,6 +1254,25 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::handle_toggle_hidden_files))
             .on_action(cx.listener(Self::handle_toggle_split_pane))
             .on_action(cx.listener(Self::handle_toggle_info_panel))
+            .on_action(cx.listener(Self::handle_toggle_settings))
+            // Diagnostic escape hatch (`FE_LOG_KEYS=1`): print every key the
+            // window sees, as gpui names it. A binding that "does nothing"
+            // either is not matching the keystroke the OS actually delivers
+            // or is not reaching a node in the right context, and those two
+            // are indistinguishable from the outside.
+            .when(std::env::var_os("FE_LOG_KEYS").is_some(), |el| {
+                // **Capture** phase: a chord consumed by a binding never
+                // bubbles, so a bubble-phase listener cannot tell "the OS
+                // never delivered it" from "a binding handled it" — which is
+                // exactly the ambiguity being chased here.
+                el.capture_key_down(|event: &gpui::KeyDownEvent, _window, _cx| {
+                    eprintln!(
+                        "key: {:<12} modifiers: {:?}",
+                        event.keystroke.unparse(),
+                        event.keystroke.modifiers
+                    );
+                })
+            })
             .on_action(cx.listener(Self::handle_delete_permanently))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
@@ -1186,17 +1289,26 @@ impl Render for Workspace {
                     .items_center()
                     .justify_between()
                     .h(px(40.0))
-                    .px(px(80.0))
+                    // Asymmetric on purpose: the traffic lights live inside
+                    // this row (see `main.rs`'s `TitlebarOptions`) and end at
+                    // about x=66, so the left inset clears them with a
+                    // comfortable gap rather than butting the app name up
+                    // against the buttons. The right inset is unchanged — it
+                    // spaces the toolbar controls, which have no such
+                    // neighbour.
+                    .pl(px(TITLEBAR_LEFT_INSET))
+                    .pr(px(80.0))
                     .bg(theme.titlebar)
                     .border_b_1()
                     .border_color(theme.border)
                     .text_size(px(13.0))
-                    .child("file-explorer")
+                    .child(APP_DISPLAY_NAME)
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(8.0))
+                            .child(self.render_settings_toggle(cx))
                             .child(self.render_split_toggle(cx))
                             .child(self.render_info_panel_toggle(cx))
                             .child(self.jobs_indicator.clone()),
@@ -1223,10 +1335,19 @@ impl Render for Workspace {
                             .child(self.sidebar.clone())
                             .child(self.splitter_handle(SplitterSide::Sidebar, cx)),
                     )
-                    // Pane strip: one pane, or two with a divider (M4)
-                    .child(self.render_pane_strip(cx))
-                    // Info panel (M5), resizable, hidden by `cmd-shift-i`
-                    .children(self.render_info_panel(cx)),
+                    // The settings pane takes the whole browsing region when
+                    // it is open (M7c); otherwise the pane strip and the
+                    // info panel share it as they always have.
+                    .when_some(self.settings_view.clone(), |el, settings| {
+                        el.child(settings)
+                    })
+                    .when(self.settings_view.is_none(), |el| {
+                        el
+                            // Pane strip: one pane, or two with a divider (M4)
+                            .child(self.render_pane_strip(cx))
+                            // Info panel (M5), resizable, hidden by `cmd-shift-i`
+                            .children(self.render_info_panel(cx))
+                    }),
             )
             // Toast overlay (renders nothing while empty)
             .child(self.toast_layer.clone())

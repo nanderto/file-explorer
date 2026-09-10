@@ -506,9 +506,9 @@ impl Sidebar {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
             .child(SharedString::new_static(if collapsed {
-                "▸"
+                crate::theme::DISCLOSURE_COLLAPSED
             } else {
-                "▾"
+                crate::theme::DISCLOSURE_EXPANDED
             }))
             .child(div().flex_1().child(SharedString::new_static(title)));
         if with_add {
@@ -843,9 +843,9 @@ fn render_tree_row(
                     this.toggle_expanded(&toggle_path, cx);
                 }))
                 .child(SharedString::new_static(if row.expanded {
-                    "▾"
+                    crate::theme::DISCLOSURE_EXPANDED
                 } else {
-                    "▸"
+                    crate::theme::DISCLOSURE_COLLAPSED
                 })),
         )
         .child(div().flex_1().truncate().child(row.name.clone()))
@@ -870,13 +870,18 @@ impl Render for Sidebar {
             root = root.child(self.render_devices(cx));
         }
         root = root.child(self.favorites_section(&favorites, cx));
-        root = root.child(self.section_header(Section::Tags, "Tags", false, cx));
-        if !self.collapsed_tags {
-            root = root.child(self.render_tags(cx));
-        }
         root = root.child(self.section_header(Section::Tree, "Folders", false, cx));
         if !self.collapsed_tree {
             root = root.child(self.render_tree(cx));
+        }
+        // **Tags last** (M7c), as Finder and ForkLift both place them. The
+        // section above it is the browsable tree, which is unbounded and the
+        // thing a user scrolls; a fixed-length list of tag colours sitting
+        // between Favorites and the tree pushed the tree down the sidebar
+        // for no reason.
+        root = root.child(self.section_header(Section::Tags, "Tags", false, cx));
+        if !self.collapsed_tags {
+            root = root.child(self.render_tags(cx));
         }
         root
     }
