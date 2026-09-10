@@ -58,9 +58,11 @@ guard is `menus::tests::every_command_chord_in_the_keymap_has_a_menu_item`,
 which fails when a platform-modifier binding has no menu item; the only
 instrument for actual key *delivery* is the running app (`FE_LOG_KEYS=1`).
 
-**Baselines**: the titlebar name and inset move all 21 committed baselines,
-and there are two new scenarios (`settings_general`, `settings_appearance`)
-with none. One runner run closes both — still to do.
+**Baselines**: regenerated on the runner and **opened** — 21 updated (the
+titlebar name and inset, the disclosure chevrons, Tags moving below Folders)
+and 2 new (`settings_general`, `settings_appearance`). The light-theme frame
+is the one worth naming: it renders genuinely light, which is M7b's
+theme-clobbering fix holding on the runner and not only in a unit test.
 
 M6 remains as built — search (M6a) and tags + permission editing (M6b), on
 top of M1–M5. M6's acceptance criterion ("tagging a file here shows
@@ -222,6 +224,12 @@ component sections; this list is the scannable index.
   platform-modifier chord — which is what makes those chords reach the app —
   plus Quit. Items with no keyboard equivalent (tags, sort, view columns)
   are absent, and there is no Window or Help menu. M8 owns the full set.
+- **M7c: the sidebar cannot scroll as a whole, and Tags is now last.** The
+  folder tree is `flex_1`, so Tags sits pinned to the bottom edge rather than
+  contiguous with the tree as in Finder. With the eight tags the fixture
+  seeds it fits to within ~14px of the window bottom; a user with more tags
+  would overflow with nothing to scroll. *M7d, which rebuilds the sidebar's
+  sections and makes it one scroll region.*
 - **M7c: the Keyboard section is read-only.** It lists what the keymap
   actually dispatches, but rebinding still means editing `keymap.json` by
   hand. Chord capture needs conflict detection and a write path for a file
