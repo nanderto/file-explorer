@@ -252,9 +252,9 @@ fn render_row(
                 this.toggle_expanded(&toggle_path, cx);
             }))
             .child(SharedString::new_static(if row.expanded {
-                "▾"
+                crate::theme::DISCLOSURE_EXPANDED
             } else {
-                "▸"
+                crate::theme::DISCLOSURE_COLLAPSED
             }))
             .into_any_element()
     } else {

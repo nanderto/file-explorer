@@ -57,11 +57,17 @@ impl SettingsSection {
 /// The settings pane.
 pub struct SettingsView {
     section: SettingsSection,
+    /// The Keyboard section's filter field. ~70 bindings is a reference
+    /// list, not something anyone reads top to bottom — the question people
+    /// actually arrive with is "what does F2 do" or "how do I paste".
+    key_filter: gpui::Entity<crate::input::InputState>,
     focus_handle: FocusHandle,
     /// Repaint when anything changes the settings — this pane's own writes,
     /// or a text editor (M7b's file watcher). The pane must never show a
     /// value the store disagrees with.
     _settings_observer: Subscription,
+    /// Repaint as the Keyboard filter is typed into.
+    _filter_observer: Subscription,
     /// Repaint when the *theme system* changes, which is not the same thing
     /// as the painted theme changing: a user theme dropped into the folder
     /// joins the registry without altering what is on screen, so
@@ -73,12 +79,41 @@ pub struct SettingsView {
 
 impl SettingsView {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let colors = crate::input::input_colors(cx);
+        let key_filter = cx.new(|cx| {
+            crate::input::InputState::new(cx)
+                .input_type(crate::input::text_input::InputType::Search)
+                .placeholder("Filter by key or command")
+                .with_colors(colors.0, colors.1, colors.2)
+        });
+        let filter_observer = cx.subscribe(&key_filter, |_, _, event, cx| {
+            if matches!(event, crate::input::InputEvent::Change) {
+                cx.notify();
+            }
+        });
         Self {
             section: SettingsSection::General,
+            key_filter,
             focus_handle: cx.focus_handle(),
             _settings_observer: cx.observe_global::<AppSettings>(|_, cx| cx.notify()),
+            _filter_observer: filter_observer,
             _theme_observer: cx.observe_global::<ActiveTheme>(|_, cx| cx.notify()),
         }
+    }
+
+    /// Type into the Keyboard filter, for tests (the real path is the user
+    /// typing into the vendored field).
+    #[cfg(test)]
+    pub(crate) fn set_key_filter_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.key_filter.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx)
+        });
+        cx.notify();
     }
 
     pub fn section(&self) -> SettingsSection {
@@ -181,6 +216,47 @@ impl Render for SettingsView {
 }
 
 impl SettingsView {
+    /// The Keyboard filter field. Wired through the shared
+    /// [`crate::rename::with_editor_actions`] so it gets the same dispatch
+    /// node every other text field in the app has — including `track_focus`
+    /// of the *input's own* handle, without which every binding in its
+    /// `TextInput` context is silently dead (§9's named failure mode).
+    fn render_key_filter(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        crate::input::refresh_input_colors(&self.key_filter, cx);
+        let field = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .w(px(220.0))
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(12.0))
+            .child(
+                div()
+                    .text_color(theme.muted)
+                    .child(SharedString::new_static("\u{2315}")),
+            )
+            .child(div().flex_1().min_w(px(0.0)).child(self.key_filter.clone()));
+        crate::rename::with_editor_actions(
+            field,
+            &self.key_filter,
+            cx,
+            |_, _, _| {},
+            |this, window, cx| {
+                // Escape clears the filter rather than closing the pane: the
+                // field is the innermost focused thing, so it has first claim
+                // on the key.
+                this.key_filter
+                    .update(cx, |input, cx| input.set_value(String::new(), window, cx));
+                cx.notify();
+            },
+        )
+        .into_any_element()
+    }
+
     /// The section switcher, in the same chrome row position a pane's
     /// breadcrumb occupies — so the region's top edge stays put when the
     /// settings pane replaces a browsing pane.
@@ -321,13 +397,22 @@ impl SettingsView {
     /// could not.
     fn render_keyboard(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let diagnostics = crate::keymap::UserKeymap::diagnostics(cx);
-        let bindings = crate::keymap::visible_bindings(cx);
-        let rows = bindings
+        let query = self.key_filter.read(cx).content().to_string();
+        let all = crate::keymap::visible_bindings(cx);
+        let total = all.len();
+        let matched: Vec<_> = all
+            .into_iter()
+            .filter(|row| binding_matches(row, &query))
+            .collect();
+        let shown = matched.len();
+        let rows = matched
             .into_iter()
             .map(|row| binding_row(theme, row.keystrokes, row.action, row.context))
             .collect();
 
-        section(theme, "Keys", rows)
+        let field = self.render_key_filter(theme, cx);
+        section_with_control(theme, "Keys", field, rows)
+            .child(filter_summary(theme, &query, shown, total))
             .child(hint(
                 theme,
                 "Edit keymap.json beside settings.json to override any of these; changes apply without a restart.",
@@ -346,6 +431,75 @@ impl SettingsView {
 // Row/section widgets. Local to this module: the info panel's look is a
 // two-column "label — value" list for *facts*, and these are controls.
 // ----------------------------------------------------------------------
+
+/// Does this binding match the filter? Matched against the chord, the action
+/// and the context together, because all three are things a person would
+/// type: "cmd", "paste", "DirView". Terms are AND-ed, so "cmd paste" narrows.
+fn binding_matches(row: &crate::keymap::BindingRow, query: &str) -> bool {
+    // Normalized here rather than by the caller: a matcher that silently
+    // requires a pre-lowercased query is a trap for the next call site.
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {}",
+        row.keystrokes,
+        row.action,
+        row.context.as_deref().unwrap_or_default()
+    )
+    .to_lowercase();
+    query.split_whitespace().all(|term| haystack.contains(term))
+}
+
+/// "12 of 71" while filtering — so a query matching nothing reads as a query
+/// that matched nothing, rather than as an empty keymap.
+fn filter_summary(theme: &Theme, query: &str, shown: usize, total: usize) -> gpui::Div {
+    let text = if query.is_empty() {
+        format!("{total} bindings")
+    } else if shown == 0 {
+        format!("No binding matches \u{201c}{query}\u{201d} — {total} in total")
+    } else {
+        format!("{shown} of {total} bindings")
+    };
+    div()
+        .px(px(16.0))
+        .pt(px(8.0))
+        .text_size(px(11.0))
+        .text_color(theme.muted)
+        .child(SharedString::from(text))
+}
+
+/// A section whose header carries a control on the right (the Keyboard
+/// filter). Same header as [`section`], so the two read as one family.
+fn section_with_control(
+    theme: &Theme,
+    title: &'static str,
+    control: gpui::AnyElement,
+    rows: Vec<gpui::AnyElement>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .px(px(16.0))
+                .pt(px(14.0))
+                .pb(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted)
+                        .child(SharedString::new_static(title)),
+                )
+                .child(control),
+        )
+        .children(rows)
+}
 
 fn section(theme: &Theme, title: &'static str, rows: Vec<gpui::AnyElement>) -> gpui::Div {
     div()
@@ -837,6 +991,64 @@ mod tests {
         );
         click("settings-theme-Midnight", cx);
         cx.update(|_, cx| assert_eq!(crate::theme::theme(cx).name, SharedString::from("Midnight")));
+    }
+
+    /// The filter is the difference between a reference list and a wall of
+    /// ~70 rows. Matched against chord, action *and* context, because all
+    /// three are things a person would type.
+    #[gpui::test]
+    fn the_keyboard_filter_narrows_the_list(cx: &mut TestAppContext) {
+        let (_vfs, workspace, cx) = boot(cx);
+        open_settings(&workspace, cx);
+        click("settings-tab-Keyboard", cx);
+        let view = settings_view(&workspace, cx);
+
+        let all = cx.update(|_, cx| crate::keymap::visible_bindings(cx).len());
+        assert!(all > 20, "the fixture keymap should be substantial");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_key_filter_for_test("rename", window, cx)
+            })
+        });
+        cx.run_until_parked();
+
+        let shown = cx.update(|_, cx| {
+            crate::keymap::visible_bindings(cx)
+                .into_iter()
+                .filter(|row| binding_matches(row, "rename"))
+                .collect::<Vec<_>>()
+        });
+        assert!(!shown.is_empty(), "`rename` should match something");
+        assert!(shown.len() < all, "the filter should narrow the list");
+        assert!(
+            shown
+                .iter()
+                .all(|row| row.action.to_lowercase().contains("rename")
+                    || row
+                        .context
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains("rename")),
+            "{shown:?}"
+        );
+    }
+
+    /// Every term has to match, so a second word narrows rather than widens.
+    #[test]
+    fn filter_terms_are_and_ed() {
+        let row = crate::keymap::BindingRow {
+            keystrokes: "\u{2318}V".to_string(),
+            action: "file_explorer::Paste".to_string(),
+            context: Some("DirView".to_string()),
+            uses_platform_modifier: true,
+        };
+        assert!(binding_matches(&row, ""), "an empty filter matches all");
+        assert!(binding_matches(&row, "paste"));
+        assert!(binding_matches(&row, "paste dirview"), "both terms match");
+        assert!(!binding_matches(&row, "paste sidebar"), "one term does not");
+        assert!(binding_matches(&row, "PASTE"), "case-insensitive");
     }
 
     /// The point of `selection` being its own token: a theme can re-tint the
