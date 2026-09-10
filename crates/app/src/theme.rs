@@ -47,16 +47,6 @@ pub fn appearance_of(appearance: gpui::WindowAppearance) -> Appearance {
 /// chmod); one reload per burst is enough, and the folder is tiny.
 pub const THEME_WATCH_LATENCY: Duration = Duration::from_millis(150);
 
-/// The disclosure glyphs, in one place so the sidebar's sections, the
-/// sidebar's tree and the details list cannot drift apart.
-///
-/// Chevrons rather than the filled triangles the app used through M7b:
-/// triangles read as a heavier, more "structural" control than a disclosure
-/// wants to be, and both Finder and ForkLift use chevrons. Still Unicode
-/// glyphs rather than an icon set — see the M7d gap.
-pub const DISCLOSURE_COLLAPSED: &str = "\u{203a}";
-pub const DISCLOSURE_EXPANDED: &str = "\u{2304}";
-
 /// Only `.json` files are themes. Anything else in the folder — a README, an
 /// editor's swap file — is ignored without comment.
 const THEME_EXTENSION: &str = "json";

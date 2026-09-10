@@ -305,8 +305,13 @@ impl Render for SearchBar {
             .child(
                 div()
                     .flex_none()
-                    .text_color(theme.muted)
-                    .child(SharedString::new_static("⌕")),
+                    .flex()
+                    .items_center()
+                    .child(crate::icons::sized_icon(
+                        crate::icons::Icon::Search,
+                        px(crate::icons::SMALL_ICON_PX),
+                        theme.muted,
+                    )),
             )
             .child(div().flex_1().min_w(px(0.0)).child(self.input.clone()))
             .when(has_query, |el| {
@@ -315,13 +320,22 @@ impl Render for SearchBar {
                         .id("search-clear")
                         .debug_selector(|| "search-clear".to_string())
                         .flex_none()
+                        .flex()
+                        .items_center()
                         .cursor_pointer()
-                        .text_color(theme.muted)
-                        .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.emit(SearchBarEvent::Dismissed);
                         }))
-                        .child(SharedString::new_static("✕")),
+                        // Hover on the `svg`, not the wrapper: an icon is
+                        // tinted from its own `text_color` (`icons`).
+                        .child(
+                            crate::icons::sized_icon(
+                                crate::icons::Icon::Close,
+                                px(crate::icons::SMALL_ICON_PX),
+                                theme.muted,
+                            )
+                            .hover(|s| s.text_color(theme.text)),
+                        ),
                 )
             });
 
@@ -348,15 +362,24 @@ impl Render for SearchBar {
                         .id("search-subfolders")
                         .debug_selector(|| "search-subfolders".to_string())
                         .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
                         .cursor_pointer()
                         .text_size(px(11.0))
                         .text_color(if recursive { theme.text } else { theme.muted })
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_recursive(cx)))
-                        .child(SharedString::new_static(if recursive {
-                            "☑ Subfolders"
-                        } else {
-                            "☐ Subfolders"
-                        })),
+                        // The same control the settings pane and the info panel
+                        // draw, rather than the `☐`/`☑` characters this used
+                        // through M7c — which rendered visibly lighter and
+                        // smaller than a real checkbox two panels over.
+                        .child(crate::icons::check_box(
+                            recursive,
+                            theme.border,
+                            theme.accent,
+                            theme.text,
+                        ))
+                        .child(SharedString::new_static("Subfolders")),
                 )
             })
     }

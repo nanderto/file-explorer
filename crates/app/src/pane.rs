@@ -1093,13 +1093,13 @@ impl Pane {
         for (id, label, mode, action) in [
             (
                 "view-mode-list",
-                "☰",
+                crate::icons::Icon::ViewList,
                 ViewMode::List,
                 Box::new(SetViewList) as Box<dyn gpui::Action>,
             ),
             (
                 "view-mode-icons",
-                "▦",
+                crate::icons::Icon::ViewGrid,
                 ViewMode::Icons,
                 Box::new(SetViewIcons) as Box<dyn gpui::Action>,
             ),
@@ -1116,16 +1116,18 @@ impl Pane {
                     .w(px(22.0))
                     .h(px(20.0))
                     .rounded(px(3.0))
-                    .text_size(px(12.0))
                     .cursor_pointer()
                     .when(active, |el| el.bg(theme.accent.opacity(0.30)))
-                    .text_color(if active { theme.text } else { theme.muted })
                     .hover(|s| s.bg(theme.accent.opacity(0.15)))
                     .on_click(cx.listener(move |this, _, window: &mut Window, cx| {
                         window.focus(&this.focus_handle, cx);
                         window.dispatch_action(boxed.boxed_clone(), cx);
                     }))
-                    .child(SharedString::new_static(label)),
+                    .child(crate::icons::sized_icon(
+                        label,
+                        px(crate::icons::SMALL_ICON_PX),
+                        if active { theme.text } else { theme.muted },
+                    )),
             );
         }
         switcher

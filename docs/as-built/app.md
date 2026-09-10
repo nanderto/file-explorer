@@ -1452,3 +1452,44 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   editing keys via `TextInput`-context bindings in `keymap.rs` forwarding to
   `input_state`-namespace actions; `set_value` replaces the whole content
   (VENDORED.md mods 5–7).
+
+- `icons.rs` (M7d) + `assets/icons/*.svg`: the bundled icon set that replaces
+  every Unicode glyph the app was drawing as a control. Through M7c an "icon"
+  here was a character in a string — `▸ ⏏ ⌕ ✕ ▣ ▢ ⓘ ⚙ ☰ ▦ ☐ ☑ ▲ ▼` — which is
+  *text*: resolved by the font stack, so it arrives at whatever optical weight
+  and baseline that face happens to give it, and (`ⓘ`, `▣`, `⏏`) sometimes as
+  a fallback box.
+  - **Fifteen vendored Lucide SVGs** (ISC; `VENDORED.md` records the version
+    and that they are unmodified), one per variant of `icons::Icon`.
+  - **Loaded with `include_bytes!`, painted via `gpui::svg().data(..)` — not a
+    `gpui::AssetSource`.** An asset source is installed on the `Application`,
+    which no `#[gpui::test]` context and no visual-runner frame ever builds, so
+    path-addressed icons would be present in the shipped app and silently
+    absent from every captured baseline. Bytes in the binary are the same bytes
+    everywhere. It also leaves `Cargo.toml` untouched (no `rust-embed`), which
+    matters only because a manifest change forces a full workspace rebuild.
+  - **Colour is explicit at every call site.** gpui rasterizes an SVG to an
+    alpha mask and tints it from the element's *own* `text_color`; unlike a
+    string child it does **not** inherit the ambient text style. So
+    `icon`/`sized_icon` take an `Hsla`, there is no way to spell an untinted
+    icon, and the two places whose glyph used to recolour on hover (the
+    favorites unpin, the search clear) now carry `.hover()` on the `svg`
+    itself rather than on the wrapper — a parent's hovered colour never
+    reaches an icon.
+  - **`disclosure(expanded)` and `entry_icon(is_dir_like)`** are the shared
+    seams that `theme::DISCLOSURE_*` held before (those consts are gone). The
+    details view's sort caret joins them: an ascending/descending chevron
+    instead of the one filled triangle left in the UI.
+  - **`check_box`** collapses three independent checkbox drawings into one —
+    the settings pane's behavior toggles, the info panel's attribute rows, and
+    the search field's "Subfolders", which was not a box at all but the
+    characters `☐`/`☑` and so rendered visibly lighter and smaller than a real
+    checkbox two panels over. Colours are parameters rather than theme reads
+    so the info panel can still pass `DISABLED_ALPHA`-dimmed ones for an
+    attribute it has not loaded.
+  - **Tests** walk `Icon::ALL` and assert each file is present, non-empty, on
+    the 24×24 grid, and stroked in `currentColor`, and that no two variants
+    share artwork (a `Close` that draws a `Plus` is a control, just the wrong
+    one — nothing downstream would fail). What they cannot assert is that a
+    file *rasterizes* to visible pixels; that is the baselines' job, and it is
+    why every scenario was opened and looked at rather than diffed.

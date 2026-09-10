@@ -35,3 +35,27 @@ of a dependency update.
      private.
   Everything else (actions, `EntityInputHandler` impl, `InputTextElement`
   shaping/paint, validation, masking, IME marked-range handling) is unmodified.
+
+## assets/icons/*.svg
+
+- **Source**: https://github.com/lucide-icons/lucide — the `lucide-static` npm
+  package's `icons/` folder, fetched from
+  `https://unpkg.com/lucide-static@1.44.0/icons/<name>.svg`
+- **Revision**: `lucide-static@1.44.0` (fetched 2026-09-11)
+- **License**: ISC — `assets/icons/LICENSE` is the upstream text, fetched from
+  the same package. (Plan §7's M7d entry says "MIT-licensed (Lucide/Feather)";
+  Lucide is ISC, which is the same permissive shape — attribution retained,
+  no copyleft — so it was taken as written rather than swapped for Feather.)
+- **Local modifications**: **none.** The fourteen SVGs are byte-for-byte as
+  published, so re-vendoring is a re-download and never a merge. Each carries
+  its own `<!-- @license lucide-static v1.44.0 - ISC -->` header, which is how
+  a stale copy is spotted.
+- **Which files**: only the icons the app actually draws. Every one is named
+  by a variant of `icons::Icon`, and `icons::Icon::ALL` is walked by unit
+  tests that assert each file is present, non-empty, on the 24×24 grid, and
+  stroked in `currentColor` — so an icon added to the folder but not to the
+  enum (or the reverse) does not survive `cargo test`.
+- **How they are loaded**: `include_bytes!` into the binary, painted through
+  `gpui::svg().data(..)` — deliberately *not* a `gpui::AssetSource`, which is
+  installed on the `Application` that no `#[gpui::test]` and no visual-runner
+  frame ever builds. See the module docs in `src/icons.rs`.

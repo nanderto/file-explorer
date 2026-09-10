@@ -42,6 +42,7 @@ use gpui::{
 
 use crate::app_state::FsContext;
 use crate::drag::{self, DraggedEntries, DraggedFavorite};
+use crate::icons::{self, Icon};
 use crate::pane::format_bytes;
 use crate::settings::AppSettings;
 use crate::workspace::Workspace;
@@ -505,11 +506,7 @@ impl Sidebar {
             .text_color(theme.muted)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
-            .child(SharedString::new_static(if collapsed {
-                crate::theme::DISCLOSURE_COLLAPSED
-            } else {
-                crate::theme::DISCLOSURE_EXPANDED
-            }))
+            .child(icons::icon(icons::disclosure(!collapsed), theme.muted))
             .child(div().flex_1().child(SharedString::new_static(title)));
         if with_add {
             header = header.child(
@@ -523,7 +520,9 @@ impl Sidebar {
                         cx.stop_propagation();
                         this.add_current_folder(cx);
                     }))
-                    .child(SharedString::new_static("+")),
+                    .flex()
+                    .items_center()
+                    .child(icons::icon(Icon::Plus, theme.muted)),
             );
         }
         header
@@ -578,7 +577,13 @@ impl Sidebar {
                                 cx.stop_propagation();
                                 this.request_eject(eject_id.clone(), cx);
                             }))
-                            .child(SharedString::new_static("⏏")),
+                            .flex()
+                            .items_center()
+                            .child(icons::sized_icon(
+                                Icon::Eject,
+                                px(icons::SMALL_ICON_PX),
+                                theme.muted,
+                            )),
                     );
                 }
                 row
@@ -702,13 +707,24 @@ impl Sidebar {
                             .debug_selector(|| format!("sidebar-favorite-remove-{ix}"))
                             .px(px(4.0))
                             .rounded(px(3.0))
-                            .text_color(theme.muted)
-                            .hover(|s| s.text_color(theme.error))
+                            .flex()
+                            .items_center()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.remove_favorite(&remove_path, cx);
                             }))
-                            .child(SharedString::new_static("✕")),
+                            // The hover recolour lives on the `svg` and not on
+                            // this wrapper: gpui tints an icon from the
+                            // element's *own* `text_color`, so a parent's
+                            // hovered colour never reaches it (`icons`).
+                            .child(
+                                icons::sized_icon(
+                                    Icon::Close,
+                                    px(icons::SMALL_ICON_PX),
+                                    theme.muted,
+                                )
+                                .hover(|s| s.text_color(theme.error)),
+                            ),
                     )
             })
             .collect();
@@ -842,11 +858,9 @@ fn render_tree_row(
                     cx.stop_propagation();
                     this.toggle_expanded(&toggle_path, cx);
                 }))
-                .child(SharedString::new_static(if row.expanded {
-                    crate::theme::DISCLOSURE_EXPANDED
-                } else {
-                    crate::theme::DISCLOSURE_COLLAPSED
-                })),
+                .flex()
+                .items_center()
+                .child(icons::icon(icons::disclosure(row.expanded), theme.muted)),
         )
         .child(div().flex_1().truncate().child(row.name.clone()))
 }

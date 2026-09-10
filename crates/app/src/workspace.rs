@@ -1012,15 +1012,17 @@ impl Workspace {
             .w(px(22.0))
             .h(px(20.0))
             .rounded(px(3.0))
-            .text_size(px(12.0))
             .cursor_pointer()
             .when(active, |el| el.bg(theme.accent.opacity(0.30)))
-            .text_color(if active { theme.text } else { theme.muted })
             .hover(|s| s.bg(theme.accent.opacity(0.15)))
             .on_click(cx.listener(|_, _, window: &mut Window, cx| {
                 window.dispatch_action(Box::new(ToggleSplitPane), cx);
             }))
-            .child(SharedString::new_static("◫"))
+            .child(crate::icons::sized_icon(
+                crate::icons::Icon::SplitPane,
+                px(crate::icons::SMALL_ICON_PX),
+                if active { theme.text } else { theme.muted },
+            ))
     }
 
     /// The §0 toolbar affordance for `ToggleInfoPanel`, beside the split
@@ -1040,15 +1042,17 @@ impl Workspace {
             .w(px(22.0))
             .h(px(20.0))
             .rounded(px(3.0))
-            .text_size(px(12.0))
             .cursor_pointer()
             .when(active, |el| el.bg(theme.accent.opacity(0.30)))
-            .text_color(if active { theme.text } else { theme.muted })
             .hover(|s| s.bg(theme.accent.opacity(0.15)))
             .on_click(cx.listener(|_, _, window: &mut Window, cx| {
                 window.dispatch_action(Box::new(ToggleInfoPanel), cx);
             }))
-            .child(SharedString::new_static("ⓘ"))
+            .child(crate::icons::sized_icon(
+                crate::icons::Icon::Info,
+                px(crate::icons::SMALL_ICON_PX),
+                if active { theme.text } else { theme.muted },
+            ))
     }
 
     /// The titlebar's settings affordance. `cmd-,` opens the same pane, but a
@@ -1067,15 +1071,17 @@ impl Workspace {
             .w(px(22.0))
             .h(px(20.0))
             .rounded(px(3.0))
-            .text_size(px(12.0))
             .cursor_pointer()
             .when(active, |el| el.bg(theme.accent.opacity(0.30)))
-            .text_color(if active { theme.text } else { theme.muted })
             .hover(|s| s.bg(theme.accent.opacity(0.15)))
             .on_click(cx.listener(|_, _, window: &mut Window, cx| {
                 window.dispatch_action(Box::new(ToggleSettings), cx);
             }))
-            .child(SharedString::new_static("⚙"))
+            .child(crate::icons::sized_icon(
+                crate::icons::Icon::Settings,
+                px(crate::icons::SMALL_ICON_PX),
+                if active { theme.text } else { theme.muted },
+            ))
     }
 
     /// The right-hand column: the [`InfoPanel`] entity plus its splitter,

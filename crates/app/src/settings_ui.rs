@@ -234,11 +234,11 @@ impl SettingsView {
             .border_1()
             .border_color(theme.border)
             .text_size(px(12.0))
-            .child(
-                div()
-                    .text_color(theme.muted)
-                    .child(SharedString::new_static("\u{2315}")),
-            )
+            .child(div().flex().items_center().child(crate::icons::sized_icon(
+                crate::icons::Icon::Search,
+                px(crate::icons::SMALL_ICON_PX),
+                theme.muted,
+            )))
             .child(div().flex_1().min_w(px(0.0)).child(self.key_filter.clone()));
         crate::rename::with_editor_actions(
             field,
@@ -629,24 +629,7 @@ fn row_shell(
 }
 
 fn check_box(theme: &Theme, checked: bool) -> gpui::Div {
-    let mut box_ = div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .w(px(13.0))
-        .h(px(13.0))
-        .rounded(px(3.0))
-        .border_1()
-        .border_color(theme.border);
-    if checked {
-        box_ = box_
-            .bg(theme.accent)
-            .text_size(px(9.0))
-            .text_color(theme.text)
-            .child(SharedString::new_static("✓"));
-    }
-    box_
+    crate::icons::check_box(checked, theme.border, theme.accent, theme.text)
 }
 
 /// One key binding, as the keymap actually resolved it.

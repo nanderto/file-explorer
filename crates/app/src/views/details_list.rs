@@ -138,14 +138,19 @@ fn header_cell(
     grow: bool,
     cx: &mut Context<DirView>,
 ) -> Stateful<gpui::Div> {
-    let arrow = if sort.key == key {
-        match sort.direction {
-            SortDirection::Ascending => " ▲",
-            SortDirection::Descending => " ▼",
-        }
-    } else {
-        ""
-    };
+    // The sorted column's direction caret — a chevron from the icon set, so it
+    // matches the disclosures three pixels away rather than being the one
+    // filled triangle left in the UI (M7d).
+    let caret = (sort.key == key).then(|| {
+        crate::icons::sized_icon(
+            match sort.direction {
+                SortDirection::Ascending => crate::icons::Icon::ChevronUp,
+                SortDirection::Descending => crate::icons::Icon::ChevronDown,
+            },
+            px(crate::icons::SMALL_ICON_PX),
+            crate::theme::theme(cx).muted,
+        )
+    });
     let mut cell = div()
         .id(label)
         .debug_selector(|| format!("sort-header-{label}"))
@@ -158,7 +163,9 @@ fn header_cell(
             window.focus(this.focus_handle_ref(), cx);
             window.dispatch_action(Box::new(SortBy { key }), cx);
         }))
-        .child(format!("{label}{arrow}"));
+        .gap(px(3.0))
+        .child(SharedString::new_static(label))
+        .children(caret);
     if grow {
         cell = cell.flex_1();
     } else {
@@ -251,11 +258,12 @@ fn render_row(
                 window.focus(this.focus_handle_ref(), cx);
                 this.toggle_expanded(&toggle_path, cx);
             }))
-            .child(SharedString::new_static(if row.expanded {
-                crate::theme::DISCLOSURE_EXPANDED
-            } else {
-                crate::theme::DISCLOSURE_COLLAPSED
-            }))
+            .flex()
+            .items_center()
+            .child(crate::icons::icon(
+                crate::icons::disclosure(row.expanded),
+                theme.muted,
+            ))
             .into_any_element()
     } else {
         div().w(px(DISCLOSURE_WIDTH)).flex_none().into_any_element()
