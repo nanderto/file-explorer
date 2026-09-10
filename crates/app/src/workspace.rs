@@ -208,6 +208,7 @@ impl Workspace {
         });
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+
         let mut workspace = Self {
             focus_handle,
             sidebar,
@@ -1050,6 +1051,33 @@ impl Workspace {
             .child(SharedString::new_static("ⓘ"))
     }
 
+    /// The titlebar's settings affordance. `cmd-,` opens the same pane, but a
+    /// surface reachable only by a chord is a surface nobody finds — the
+    /// first person shown this app asked where the tabs were supposed to be,
+    /// which is the whole argument for this button.
+    fn render_settings_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
+        let active = self.settings_open();
+        div()
+            .id("settings-toggle")
+            .debug_selector(|| "settings-toggle".to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.0))
+            .h(px(20.0))
+            .rounded(px(3.0))
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .when(active, |el| el.bg(theme.accent.opacity(0.30)))
+            .text_color(if active { theme.text } else { theme.muted })
+            .hover(|s| s.bg(theme.accent.opacity(0.15)))
+            .on_click(cx.listener(|_, _, window: &mut Window, cx| {
+                window.dispatch_action(Box::new(ToggleSettings), cx);
+            }))
+            .child(SharedString::new_static("⚙"))
+    }
+
     /// The right-hand column: the [`InfoPanel`] entity plus its splitter,
     /// rendered only while the panel is showing.
     fn render_info_panel(&self, cx: &App) -> Option<impl IntoElement + use<>> {
@@ -1227,6 +1255,24 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::handle_toggle_split_pane))
             .on_action(cx.listener(Self::handle_toggle_info_panel))
             .on_action(cx.listener(Self::handle_toggle_settings))
+            // Diagnostic escape hatch (`FE_LOG_KEYS=1`): print every key the
+            // window sees, as gpui names it. A binding that "does nothing"
+            // either is not matching the keystroke the OS actually delivers
+            // or is not reaching a node in the right context, and those two
+            // are indistinguishable from the outside.
+            .when(std::env::var_os("FE_LOG_KEYS").is_some(), |el| {
+                // **Capture** phase: a chord consumed by a binding never
+                // bubbles, so a bubble-phase listener cannot tell "the OS
+                // never delivered it" from "a binding handled it" — which is
+                // exactly the ambiguity being chased here.
+                el.capture_key_down(|event: &gpui::KeyDownEvent, _window, _cx| {
+                    eprintln!(
+                        "key: {:<12} modifiers: {:?}",
+                        event.keystroke.unparse(),
+                        event.keystroke.modifiers
+                    );
+                })
+            })
             .on_action(cx.listener(Self::handle_delete_permanently))
             .on_action(cx.listener(Self::handle_undo))
             .on_action(cx.listener(Self::handle_redo))
@@ -1262,6 +1308,7 @@ impl Render for Workspace {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
+                            .child(self.render_settings_toggle(cx))
                             .child(self.render_split_toggle(cx))
                             .child(self.render_info_panel_toggle(cx))
                             .child(self.jobs_indicator.clone()),

@@ -16,6 +16,7 @@ pub mod jobs_model;
 pub mod jobs_ui;
 pub mod keymap;
 pub mod marquee;
+pub mod menus;
 pub mod pane;
 pub mod rename;
 pub mod scrollbar;

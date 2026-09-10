@@ -1318,6 +1318,42 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     `settings::init` applies it when its own background load lands — but only
     if the file actually changed it (see `settings.rs`). The picker that
     *writes* it is M7c.
+- `menus.rs` (M7c, ARCHITECTURE.md's M8 "menu bar with full action set" —
+  **pulled forward, because without it the keyboard did not work at all**):
+  the macOS menu bar. File Explorer / File / Edit / View / Go, every item
+  dispatching the *same boxed action* the keymap and the context menus do
+  (§3: one command, one implementation).
+  * **The bug it fixes.** macOS offers every Command chord to the main menu
+    before anything else sees it, and an app with no main menu never gets
+    those events back. So *every* `cmd-` binding in the §0 table had been
+    dead in the real app since M1 — `cmd-l`, `cmd-f`, `cmd-z`, `cmd-a`,
+    `cmd-x/c/v`, `cmd-1/2`, `cmd-r`, `cmd-[`/`]`, `cmd-shift-n/o/i/.` —
+    while every unmodified key (Enter, F2, Delete, arrows, type-ahead)
+    worked. Five milestones of mouse-driven demos never tripped over it.
+  * **Why no test caught it, and still cannot.** gpui's test platform
+    dispatches keystrokes straight into the keymap and never involves
+    AppKit, so `keymap.rs`'s dispatch guards — which exist precisely to
+    catch dead bindings — pass on chords the OS never delivers. This class
+    of bug is structurally invisible to the suite. The standing guard is
+    instead `menus::tests::every_command_chord_in_the_keymap_has_a_menu_item`,
+    which reads the **live keymap** and fails if any platform-modifier chord
+    lacks a menu item; `keymap::BindingRow::uses_platform_modifier` asks the
+    modifier flags rather than the rendered text, which is `⌘` on macOS and
+    `⊞`/`❖` elsewhere.
+  * **The six editing commands are declared with their `OsAction`.** A plain
+    menu item binds a chord to one fixed action whatever has focus, so
+    `cmd-c` inside the rename editor or the address bar would copy the
+    selected *files* instead of the selected text. Declaring Undo/Redo/Cut/
+    Copy/Paste/Select All as OS actions wires them to AppKit's standard
+    selectors, so a focused text field handles them natively.
+  * `Quit` (`cmd-q`) is new with it — the app previously could not be quit
+    from the keyboard at all.
+  * **`FE_LOG_KEYS=1`** prints every key the window receives, in the
+    **capture** phase (a chord consumed by a binding never bubbles, so a
+    bubble-phase listener cannot tell "the OS never delivered it" from "a
+    binding handled it" — the exact ambiguity that made this bug hard to
+    pin). Kept deliberately: the suite cannot see key delivery, so the only
+    instrument for it is the running app.
 - `settings_ui.rs` (M7c, plan §7's "Settings window"): the settings surface.
   **A pane, not a window and not a modal** — it takes over the browsing
   region (pane strip *and* info panel) while the sidebar and titlebar stay,

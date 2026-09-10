@@ -67,6 +67,9 @@ actions!(
         // settings pane takes over, so the action is handled there beside
         // the split and the info panel)
         ToggleSettings,
+        // quit (M7c) — needed by the macOS menu bar, which is what makes
+        // every `cmd-` chord reach the app at all (see `menus.rs`)
+        Quit,
         // editing-mode (address bar / rename editor / dialogs)
         Confirm,
         Cancel,

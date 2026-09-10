@@ -307,8 +307,8 @@ pub(crate) fn apply_for_test(cx: &mut App, source: &str) -> Vec<String> {
     apply(cx, Some(source))
 }
 
-/// Every binding currently in force, as text: `(keystrokes, action,
-/// context)`. This is the keymap *after* `keymap.json` was applied, read back
+/// Every binding currently in force. This is the keymap *after*
+/// `keymap.json` was applied, read back
 /// out of gpui rather than re-derived from the §0 table — so what the
 /// settings pane lists is what the app will actually dispatch, overrides and
 /// all, and a row the file failed to bind is visibly absent rather than
@@ -317,10 +317,10 @@ pub(crate) fn apply_for_test(cx: &mut App, source: &str) -> Vec<String> {
 /// Sorted by context then keystrokes so the list is stable frame to frame;
 /// unbound rows (`null` in the file, gpui's `NoAction`) are dropped, since
 /// "this key does nothing" is not a binding worth a line.
-pub fn visible_bindings(cx: &App) -> Vec<(String, String, Option<String>)> {
+pub fn visible_bindings(cx: &App) -> Vec<BindingRow> {
     let keymap = cx.key_bindings();
     let keymap = keymap.borrow();
-    let mut rows: Vec<(String, String, Option<String>)> = keymap
+    let mut rows: Vec<BindingRow> = keymap
         .bindings()
         .filter(|binding| !gpui::is_no_action(binding.action()))
         .map(|binding| {
@@ -330,20 +330,48 @@ pub fn visible_bindings(cx: &App) -> Vec<(String, String, Option<String>)> {
                 .map(|keystroke| keystroke.to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
+            // Whether this chord needs the platform modifier (Command on
+            // macOS) — asked of the modifier flags rather than of the
+            // rendered text, which is `⌘` on macOS and `⊞`/`❖` elsewhere.
+            let uses_platform_modifier = binding
+                .keystrokes()
+                .iter()
+                .any(|keystroke| keystroke.modifiers().platform);
             let context = binding
                 .predicate()
                 .map(|predicate| predicate.to_string())
                 .filter(|context| !context.is_empty());
-            (keystrokes, binding.action().name().to_string(), context)
+            BindingRow {
+                keystrokes,
+                action: binding.action().name().to_string(),
+                context,
+                uses_platform_modifier,
+            }
         })
         .collect();
     rows.sort_by(|a, b| {
-        a.2.cmp(&b.2)
-            .then_with(|| a.0.cmp(&b.0))
-            .then_with(|| a.1.cmp(&b.1))
+        a.context
+            .cmp(&b.context)
+            .then_with(|| a.keystrokes.cmp(&b.keystrokes))
+            .then_with(|| a.action.cmp(&b.action))
     });
     rows.dedup();
     rows
+}
+
+/// One row of [`visible_bindings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingRow {
+    /// As a person reads it — `⌘F` on macOS.
+    pub keystrokes: String,
+    /// The action's registered name.
+    pub action: String,
+    /// The key context it applies in, if it is scoped to one.
+    pub context: Option<String>,
+    /// Whether the chord uses the platform modifier. Load-bearing: on macOS
+    /// such a chord is offered to the menu bar before the window sees it, so
+    /// one without a menu item never fires (see [`crate::menus`]).
+    pub uses_platform_modifier: bool,
 }
 
 /// The §0 table itself.
@@ -454,6 +482,10 @@ fn bind_defaults(cx: &mut App) {
         // and every Mac user reaches for it; Workspace context because the
         // pane it opens replaces the whole browsing region.
         KeyBinding::new("cmd-,", ToggleSettings, Some("Workspace")),
+        // §0 Quit. Bound at the root rather than in a view context: the menu
+        // bar item takes its equivalent from this row, and quitting must
+        // work with focus anywhere.
+        KeyBinding::new("cmd-q", Quit, None),
         // Escape closes the settings pane, the way it dismisses every other
         // transient surface in the app.
         KeyBinding::new("escape", ToggleSettings, Some("Settings")),

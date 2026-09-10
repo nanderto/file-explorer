@@ -26,6 +26,12 @@ use gpui::{
 use crate::settings::AppSettings;
 use crate::theme::{ActiveTheme, Theme, ThemeSelection};
 
+/// How wide the content column is allowed to get. The pane spans the whole
+/// browsing region, which at 1200px is far wider than a settings form should
+/// be — a label on the left and its checkbox against the right edge read as
+/// unrelated.
+const CONTENT_MAX_WIDTH: f32 = 560.0;
+
 /// Which section is showing. Three, matching the three things a user came
 /// here to do: change a behavior, change how it looks, find out what a key
 /// does.
@@ -151,11 +157,25 @@ impl Render for SettingsView {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .child(match self.section {
-                        SettingsSection::General => self.render_general(&theme, cx),
-                        SettingsSection::Appearance => self.render_appearance(&theme, cx),
-                        SettingsSection::Keyboard => self.render_keyboard(&theme, cx),
-                    }),
+                    // Content is capped at a readable width rather than
+                    // stretched across the whole region: a checkbox 950px
+                    // from the label it belongs to is not a control, it is
+                    // two unrelated things on one line. The cap is what a
+                    // settings surface does everywhere; the pane is wide
+                    // because it inherited the file list's width, not
+                    // because this content wants to be.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .max_w(px(CONTENT_MAX_WIDTH))
+                            .child(match self.section {
+                                SettingsSection::General => self.render_general(&theme, cx),
+                                SettingsSection::Appearance => self.render_appearance(&theme, cx),
+                                SettingsSection::Keyboard => self.render_keyboard(&theme, cx),
+                            }),
+                    ),
             )
     }
 }
@@ -304,7 +324,7 @@ impl SettingsView {
         let bindings = crate::keymap::visible_bindings(cx);
         let rows = bindings
             .into_iter()
-            .map(|(keystrokes, action, context)| binding_row(theme, keystrokes, action, context))
+            .map(|row| binding_row(theme, row.keystrokes, row.action, row.context))
             .collect();
 
         section(theme, "Keys", rows)
@@ -661,6 +681,33 @@ mod tests {
         );
     }
 
+    /// The realistic path: focus is in the **file list**, not on the
+    /// workspace root, which is where it actually sits when a user reaches
+    /// for `cmd-,`. The binding lives in the `Workspace` context, so this
+    /// only works if the list's node really is a descendant of the node
+    /// carrying that context — the failure gpui reports by silently doing
+    /// nothing (§9's named hazard).
+    #[gpui::test]
+    fn cmd_comma_works_with_focus_in_the_file_list(cx: &mut TestAppContext) {
+        let (_vfs, workspace, cx) = boot(cx);
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        cx.update(|window, cx| {
+            window.activate_window();
+            let handle = pane.read(cx).dir_view().focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-,");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.settings_open(),
+                "cmd-, did nothing with focus where it actually lives"
+            );
+        });
+    }
+
     #[gpui::test]
     fn the_tabs_switch_sections(cx: &mut TestAppContext) {
         let (_vfs, workspace, cx) = boot(cx);
@@ -860,7 +907,7 @@ mod tests {
         assert!(
             default_rows
                 .iter()
-                .any(|(keys, action, _)| keys == "f2" && action.ends_with("RenameSelected")),
+                .any(|row| row.keystrokes == "f2" && row.action.ends_with("RenameSelected")),
             "the §0 default is missing from the list"
         );
 
@@ -874,7 +921,7 @@ mod tests {
         assert!(
             overridden
                 .iter()
-                .any(|(keys, action, _)| keys == "f2" && action.ends_with("Duplicate")),
+                .any(|row| row.keystrokes == "f2" && row.action.ends_with("Duplicate")),
             "the override is missing from the list"
         );
     }

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use file_explorer_app::{ActiveTheme, ThemeSelection, Workspace, app_state, keymap, settings};
+use file_explorer_app::{
+    ActiveTheme, ThemeSelection, Workspace, app_state, keymap, menus, settings,
+};
 use gpui::{
     App, AppContext as _, Bounds, Focusable as _, TitlebarOptions, WindowBounds, WindowOptions,
     point, px, size,
@@ -18,6 +20,11 @@ fn main() {
         ActiveTheme::init(ThemeSelection::default(), cx);
         settings::init(cx);
         keymap::init_with_overrides(cx, keymap::default_keymap_path());
+        // After the keymap: macOS offers every `cmd-` chord to the main menu
+        // before the window sees it, so without this the whole modified half
+        // of the §0 table is dead. gpui also reads each item's key
+        // equivalent out of the keymap as it builds the menu.
+        menus::init(cx);
         let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
         let window = cx
             .open_window(
