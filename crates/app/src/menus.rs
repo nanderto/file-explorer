@@ -26,6 +26,15 @@ use crate::actions::*;
 /// reads each item's key equivalent out of the keymap as it builds the menu.
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    rebuild(cx);
+}
+
+/// Rebuild the menu from the current keymap. Called again whenever
+/// `keymap.json` is reloaded: the key equivalents are baked into the menu
+/// when it is built, so without this a rebound chord leaves the **old** one
+/// beside the item — and, because macOS resolves Command chords through the
+/// menu, the old chord keeps working while the new one does not.
+pub fn rebuild(cx: &mut App) {
     cx.set_menus(menus());
 }
 

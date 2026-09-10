@@ -253,6 +253,11 @@ pub fn reload(cx: &mut App) {
             }
             let diagnostics = apply(cx, source.as_deref());
             cx.update_global::<UserKeymap, _>(|keymap, _| keymap.diagnostics = diagnostics);
+            // The menu bar caches each item's key equivalent from the keymap
+            // it was built against, and on macOS the menu is what makes a
+            // Command chord reach the app at all — so a reload that does not
+            // rebuild it leaves the old chords live and the new ones dead.
+            crate::menus::rebuild(cx);
         });
     });
     cx.update_global::<UserKeymap, _>(|keymap, _| keymap._load = Some(task));
