@@ -47,6 +47,28 @@ pub const SETTINGS_WATCH_LATENCY: Duration = Duration::from_millis(150);
 /// not a history browser (that is what `cmd-[` is for).
 pub const MAX_RECENTS: usize = 10;
 
+/// Which fields the running app has explicitly changed since boot.
+///
+/// This is what makes the initial load a **merge** instead of all-or-nothing
+/// (M7d-c). The boot sequence puts defaults in the global immediately so the
+/// first frame has something to paint, then reads the file in the background.
+/// If anything changed a setting in between, the file must not simply
+/// overwrite it — but neither may the file be *discarded*, which is what the
+/// original guard did and how a user's saved theme was destroyed.
+///
+/// So: for each field, if the app changed it since boot, keep the app's value;
+/// otherwise take the file's. Nothing is thrown away, and no in-flight change
+/// is clobbered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChangedSinceBoot {
+    favorites: bool,
+    favorites_seeded: bool,
+    recents: bool,
+    theme: bool,
+    confirm_delete_to_trash: bool,
+    folders_first: bool,
+}
+
 /// The complete document. Compiled in, so a setting always has a value.
 const DEFAULTS_JSON: &str = include_str!("../settings/defaults.json");
 
@@ -150,6 +172,8 @@ pub struct AppSettings {
     /// destroyed a user's saved theme the first time it ran on a real
     /// profile.
     loaded: bool,
+    /// See [`ChangedSinceBoot`] — drives the merge in [`apply_loaded`].
+    changed: ChangedSinceBoot,
     content: SettingsContent,
     path: PathBuf,
     /// Complaints about the last file read (unknown or malformed keys),
@@ -176,6 +200,7 @@ impl AppSettings {
     pub fn new(path: PathBuf) -> Self {
         Self {
             loaded: false,
+            changed: ChangedSinceBoot::default(),
             content: SettingsContent::default(),
             path,
             warnings: Vec::new(),
@@ -247,6 +272,7 @@ impl AppSettings {
             return false;
         }
         self.content.theme = selection;
+        self.changed.theme = true;
         true
     }
 
@@ -260,6 +286,7 @@ impl AppSettings {
             return false;
         }
         self.content.confirm_delete_to_trash = confirm;
+        self.changed.confirm_delete_to_trash = true;
         true
     }
 
@@ -273,6 +300,7 @@ impl AppSettings {
             return false;
         }
         self.content.folders_first = folders_first;
+        self.changed.folders_first = true;
         true
     }
 
@@ -297,6 +325,7 @@ impl AppSettings {
             return false;
         }
         self.content.favorites.push(path);
+        self.changed.favorites = true;
         true
     }
 
@@ -316,9 +345,11 @@ impl AppSettings {
             return false;
         }
         self.content.favorites_seeded = true;
+        self.changed.favorites_seeded = true;
         for candidate in candidates {
             if !self.content.favorites.contains(candidate) {
                 self.content.favorites.push(candidate.clone());
+                self.changed.favorites = true;
             }
         }
         // Always a change, even when every candidate was already pinned or
@@ -351,6 +382,7 @@ impl AppSettings {
         self.content.recents.retain(|p| p != &path);
         self.content.recents.insert(0, path);
         self.content.recents.truncate(MAX_RECENTS);
+        self.changed.recents = true;
         true
     }
 
@@ -379,6 +411,7 @@ impl AppSettings {
         }
         let moved = self.content.favorites.remove(from);
         self.content.favorites.insert(insert_at, moved);
+        self.changed.favorites = true;
         true
     }
 
@@ -386,7 +419,9 @@ impl AppSettings {
     pub fn remove_favorite(&mut self, path: &Path) -> bool {
         let before = self.content.favorites.len();
         self.content.favorites.retain(|p| p != path);
-        self.content.favorites.len() != before
+        let removed = self.content.favorites.len() != before;
+        self.changed.favorites |= removed;
+        removed
     }
 
     /// The serialize-and-persist future. [`save`](Self::save) drives it on the
@@ -500,10 +535,11 @@ pub fn init_with_path(cx: &mut App, path: PathBuf) {
     cx.spawn(async move |cx| {
         let loaded = AppSettings::load(load_vfs, load_path).await;
         cx.update(|cx| {
-            // Don't clobber changes made between boot and load completion.
-            if AppSettings::global(cx).content == SettingsContent::default() {
-                apply_loaded(loaded, cx);
-            }
+            // A merge, not a gamble: `apply_loaded` takes the file's value for
+            // every field the app has not touched since boot, and keeps the
+            // app's for the ones it has. There is no longer a case in which
+            // the loaded file is discarded.
+            apply_loaded(loaded, cx);
             // Resolved either way — including when the guard above declined to
             // apply it, and including "there was no file". Startup writers
             // gate on this, so it must be set on every path or they would
@@ -524,15 +560,45 @@ pub fn init_with_path(cx: &mut App, path: PathBuf) {
 /// The store's own machinery — the writer slot, the watch task and its guard —
 /// belongs to the *store*, not to the content it is holding, so only the
 /// content and its warnings are replaced here.
+/// Apply the loaded file by **merging** it, field by field, over whatever the
+/// running app has (M7d-c).
+///
+/// A field the app has not touched since boot takes the file's value. A field
+/// the app *has* touched keeps the app's — because the user (or a startup
+/// task) meant it, and the file is older news for that one key.
+///
+/// This replaces an all-or-nothing guard that asked only "is the whole content
+/// still exactly the defaults?" and, if not, **threw the loaded file away**.
+/// That made any write during the load window destroy every setting the user
+/// had — their theme, their favorites, all of it — and then persist defaults
+/// over the top. See the change log for the day it did exactly that.
 fn apply_loaded(loaded: AppSettings, cx: &mut App) {
     let AppSettings {
         content, warnings, ..
     } = loaded;
     let theme_changed = cx.update_global::<AppSettings, _>(|settings, _| {
-        let theme_changed = settings.content.theme != content.theme;
-        settings.content = content;
+        let changed = settings.changed;
+        let before = settings.content.theme.clone();
+        if !changed.favorites {
+            settings.content.favorites = content.favorites;
+        }
+        if !changed.favorites_seeded {
+            settings.content.favorites_seeded = content.favorites_seeded;
+        }
+        if !changed.recents {
+            settings.content.recents = content.recents;
+        }
+        if !changed.theme {
+            settings.content.theme = content.theme;
+        }
+        if !changed.confirm_delete_to_trash {
+            settings.content.confirm_delete_to_trash = content.confirm_delete_to_trash;
+        }
+        if !changed.folders_first {
+            settings.content.folders_first = content.folders_first;
+        }
         settings.warnings = warnings;
-        theme_changed
+        settings.content.theme != before
     });
     // **Only** when the file actually moved it. Pushing unconditionally would
     // mean every settings load overrides whatever the theme system was told
@@ -1141,25 +1207,84 @@ mod tests {
         );
     }
 
-    /// The sharp edge `is_loaded` exists to let callers avoid, pinned so it
-    /// is a known property rather than a surprise (M7d-b).
+    /// **The merge (M7d-c), and the bug it retires.**
     ///
-    /// `init_with_path` seeds the global with defaults, loads the file in the
-    /// background, and **declines to apply that load if the content changed
-    /// meanwhile** — the "don't clobber a deliberate change" guard. The cost
-    /// is that a write inside that window does not merely race the load: it
-    /// makes the entire on-disk file be discarded, and a `save` right after
-    /// persists the defaults over it. That is how M7d-b's favorites seeding
-    /// destroyed a real profile's saved theme.
+    /// This used to assert the opposite. `init_with_path` seeds the global
+    /// with defaults, loads the file in the background, and previously asked
+    /// one all-or-nothing question — "is the content still exactly the
+    /// defaults?" — and if not, **threw the loaded file away**. So a write in
+    /// that window destroyed every setting the user had and then persisted
+    /// defaults over them. It did precisely that to a real profile's saved
+    /// theme.
     ///
-    /// This test asserts the *unfixed* layer honestly — mutate during the
-    /// window and the file's theme is indeed lost — so nobody mistakes
-    /// `is_loaded` for something the settings module enforces on its own. The
-    /// enforcement is at the call sites, and
-    /// `sidebar::tests::startup_writes_do_not_destroy_a_saved_theme` is what
-    /// proves those hold.
+    /// Now the load is merged field by field: the write inside the window
+    /// survives, and *everything it did not touch* still comes from the file.
     #[gpui::test]
-    async fn a_write_inside_the_load_window_discards_the_file(cx: &mut TestAppContext) {
+    async fn a_write_inside_the_load_window_keeps_both_it_and_the_file(cx: &mut TestAppContext) {
+        let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
+        let vfs = FakeVfs::new(spawner.clone());
+        let path = PathBuf::from("/config/file-explorer/settings.json");
+        cx.update(|cx| {
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
+        });
+        vfs.atomic_write(
+            &path,
+            br#"{ "favorites": ["/home/me"], "theme": "Graphite Light", "folders_first": false }"#
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+
+        cx.update(|cx| init_with_path(cx, path.clone()));
+
+        // The window: defaults in the global, load still in flight. Change one
+        // field, exactly as a startup task would.
+        cx.update(|cx| {
+            assert!(!AppSettings::global(cx).is_loaded());
+            cx.update_global::<AppSettings, ()>(|settings, _| {
+                settings.push_recent(PathBuf::from("/home/me/Documents"));
+            });
+        });
+
+        cx.background_executor.run_until_parked();
+
+        cx.update(|cx| {
+            let settings = AppSettings::global(cx);
+            // The field written in the window survives...
+            assert_eq!(
+                settings.recents(),
+                [PathBuf::from("/home/me/Documents")],
+                "the in-flight change must not be clobbered by the file"
+            );
+            // ...and every field it did not touch still came from the file.
+            // This is the half that used to be lost entirely.
+            assert_eq!(
+                settings.theme_selection(),
+                &ThemeSelection::Static("Graphite Light".into()),
+                "the saved theme must survive a write during the load window"
+            );
+            assert_eq!(settings.favorites(), [PathBuf::from("/home/me")]);
+            assert!(!settings.folders_first());
+        });
+    }
+
+    /// A save triggered by one field must carry **every other** field with it.
+    ///
+    /// `save` serializes the whole document, so a Recents write persists the
+    /// theme, the favorites and the rest alongside it. That is exactly the
+    /// path that destroyed a real profile's theme before the merge landed —
+    /// not because the write was wrong, but because the *content* it wrote had
+    /// already been reduced to defaults by the discarded load. Worth pinning
+    /// directly, because "a small change writes the whole file" is the
+    /// property that makes the merge matter.
+    #[gpui::test]
+    async fn a_recents_save_carries_the_rest_of_the_document(cx: &mut TestAppContext) {
         let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
         let vfs = FakeVfs::new(spawner.clone());
         let path = PathBuf::from("/config/file-explorer/settings.json");
@@ -1180,33 +1305,28 @@ mod tests {
         .unwrap();
 
         cx.update(|cx| init_with_path(cx, path.clone()));
-
-        // The window: the global exists, holds defaults, and the load has not
-        // landed. This is where boot navigation and the sidebar's seeding ran.
-        cx.update(|cx| {
-            assert!(
-                !AppSettings::global(cx).is_loaded(),
-                "precondition: the load has not resolved yet"
-            );
-            // Exactly what the ungated seeding did.
-            cx.update_global::<AppSettings, ()>(|settings, _| {
-                settings.seed_favorites(&[PathBuf::from("/home/me/Desktop")]);
-            });
-        });
-
         cx.background_executor.run_until_parked();
 
+        // Now the only change is a Recent — the commonest write there is.
         cx.update(|cx| {
-            let settings = AppSettings::global(cx);
-            assert!(settings.is_loaded(), "the load resolved either way");
-            assert_eq!(
-                settings.theme_selection(),
-                &ThemeSelection::default(),
-                "the documented cost: writing inside the window discards the \
-                 loaded file, so the user's saved theme is gone. Callers must \
-                 gate on is_loaded() — see the sidebar and workspace tests."
-            );
+            cx.update_global::<AppSettings, ()>(|settings, _| {
+                settings.push_recent(PathBuf::from("/home/me/Documents"));
+            });
+            AppSettings::global(cx).save(cx);
         });
+        cx.background_executor.run_until_parked();
+
+        let bytes = vfs.load(&path).await.expect("settings file");
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "favorites": ["/home/me"],
+                "theme": "Graphite Light",
+                "recents": ["/home/me/Documents"],
+            }),
+            "a Recents write must not drop the theme or the favorites"
+        );
     }
 
     /// The other half of the contract: `is_loaded` must become true even when
