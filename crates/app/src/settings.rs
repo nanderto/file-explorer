@@ -136,6 +136,20 @@ impl SettingsPartial {
 /// `cx.update_global::<AppSettings, _>(...)` and call [`AppSettings::save`]
 /// afterwards to persist.
 pub struct AppSettings {
+    /// Whether the initial on-disk load has **resolved** — file read, file
+    /// missing, or file corrupt; all three are resolutions (M7d-b).
+    ///
+    /// Anything that writes settings during startup must wait for this. The
+    /// boot sequence sets the global to defaults immediately so readers never
+    /// find it missing, then swaps the disk content in from a background task
+    /// — and [`init_with_path`] deliberately *discards* that load if the
+    /// content has changed in the meantime, to avoid clobbering a deliberate
+    /// change. A writer that fires in that window therefore does not merely
+    /// race the load: it makes the whole file be thrown away, and then
+    /// persists the defaults over it. That is how M7d-b's favorites-seeding
+    /// destroyed a user's saved theme the first time it ran on a real
+    /// profile.
+    loaded: bool,
     content: SettingsContent,
     path: PathBuf,
     /// Complaints about the last file read (unknown or malformed keys),
@@ -161,6 +175,7 @@ impl AppSettings {
     /// Defaults, persisted at `path`.
     pub fn new(path: PathBuf) -> Self {
         Self {
+            loaded: false,
             content: SettingsContent::default(),
             path,
             warnings: Vec::new(),
@@ -207,6 +222,12 @@ impl AppSettings {
     }
 
     /// Complaints about the file as last read.
+    /// Whether the initial on-disk load has resolved. Startup writers must
+    /// check this before persisting anything — see the field's docs.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -483,6 +504,12 @@ pub fn init_with_path(cx: &mut App, path: PathBuf) {
             if AppSettings::global(cx).content == SettingsContent::default() {
                 apply_loaded(loaded, cx);
             }
+            // Resolved either way — including when the guard above declined to
+            // apply it, and including "there was no file". Startup writers
+            // gate on this, so it must be set on every path or they would
+            // wait forever.
+            cx.update_global::<AppSettings, ()>(|settings, _| settings.loaded = true);
+            cx.refresh_windows();
         });
     })
     .detach();
@@ -1112,5 +1139,99 @@ mod tests {
                 "recents": ["/Users/me/Desktop"],
             }),
         );
+    }
+
+    /// The sharp edge `is_loaded` exists to let callers avoid, pinned so it
+    /// is a known property rather than a surprise (M7d-b).
+    ///
+    /// `init_with_path` seeds the global with defaults, loads the file in the
+    /// background, and **declines to apply that load if the content changed
+    /// meanwhile** — the "don't clobber a deliberate change" guard. The cost
+    /// is that a write inside that window does not merely race the load: it
+    /// makes the entire on-disk file be discarded, and a `save` right after
+    /// persists the defaults over it. That is how M7d-b's favorites seeding
+    /// destroyed a real profile's saved theme.
+    ///
+    /// This test asserts the *unfixed* layer honestly — mutate during the
+    /// window and the file's theme is indeed lost — so nobody mistakes
+    /// `is_loaded` for something the settings module enforces on its own. The
+    /// enforcement is at the call sites, and
+    /// `sidebar::tests::startup_writes_do_not_destroy_a_saved_theme` is what
+    /// proves those hold.
+    #[gpui::test]
+    async fn a_write_inside_the_load_window_discards_the_file(cx: &mut TestAppContext) {
+        let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
+        let vfs = FakeVfs::new(spawner.clone());
+        let path = PathBuf::from("/config/file-explorer/settings.json");
+        cx.update(|cx| {
+            crate::app_state::install(
+                cx,
+                vfs.clone(),
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
+        });
+        vfs.atomic_write(
+            &path,
+            br#"{ "favorites": ["/home/me"], "theme": "Graphite Light" }"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        cx.update(|cx| init_with_path(cx, path.clone()));
+
+        // The window: the global exists, holds defaults, and the load has not
+        // landed. This is where boot navigation and the sidebar's seeding ran.
+        cx.update(|cx| {
+            assert!(
+                !AppSettings::global(cx).is_loaded(),
+                "precondition: the load has not resolved yet"
+            );
+            // Exactly what the ungated seeding did.
+            cx.update_global::<AppSettings, ()>(|settings, _| {
+                settings.seed_favorites(&[PathBuf::from("/home/me/Desktop")]);
+            });
+        });
+
+        cx.background_executor.run_until_parked();
+
+        cx.update(|cx| {
+            let settings = AppSettings::global(cx);
+            assert!(settings.is_loaded(), "the load resolved either way");
+            assert_eq!(
+                settings.theme_selection(),
+                &ThemeSelection::default(),
+                "the documented cost: writing inside the window discards the \
+                 loaded file, so the user's saved theme is gone. Callers must \
+                 gate on is_loaded() — see the sidebar and workspace tests."
+            );
+        });
+    }
+
+    /// The other half of the contract: `is_loaded` must become true even when
+    /// there is **no file**, or a startup writer gated on it would wait
+    /// forever and a fresh profile would never get seeded.
+    #[gpui::test]
+    async fn is_loaded_resolves_even_when_there_is_no_file(cx: &mut TestAppContext) {
+        let spawner: Arc<dyn Spawner> = Arc::new(GpuiSpawner::new(cx.background_executor.clone()));
+        let vfs = FakeVfs::new(spawner.clone());
+        cx.update(|cx| {
+            crate::app_state::install(
+                cx,
+                vfs,
+                spawner,
+                Arc::new(LoggingOpener),
+                Arc::new(StubPlatform::new()),
+            );
+        });
+        cx.update(|cx| init_with_path(cx, PathBuf::from("/config/absent.json")));
+        cx.background_executor.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                AppSettings::global(cx).is_loaded(),
+                "a missing file is a resolved load, not a pending one"
+            );
+        });
     }
 }

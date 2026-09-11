@@ -119,6 +119,10 @@ pub struct Sidebar {
     /// The one-shot locations resolve **and** favorites seeding; a field,
     /// never detached (§5).
     _startup: Option<Task<()>>,
+    /// Which of [`DEFAULT_FAVORITES`] this machine actually has, once the
+    /// startup probe has answered. `None` until then — which is *not* the same
+    /// as "none of them exist", and seeding must not confuse the two.
+    default_favorites: Option<Vec<PathBuf>>,
     /// The tags the **Tags** section lists: the palette plus whatever the user
     /// has, loaded once off the UI thread. Seeded with
     /// [`fs_core::standard_tags`] so the section is never empty and the first
@@ -160,7 +164,12 @@ impl Sidebar {
                 }
             }
         });
-        let settings_observer = cx.observe_global::<AppSettings>(|_, cx| cx.notify());
+        let settings_observer = cx.observe_global::<AppSettings>(|this: &mut Self, cx| {
+            // The settings load landing is one of the two things seeding waits
+            // for (the other is the startup probe above).
+            this.maybe_seed_favorites(cx);
+            cx.notify();
+        });
         // M6b: the Tags section's rows. One `known_tags` call, on the
         // background executor — the sidebar never touches the OS on the UI
         // thread (§5), and the palette is already painted while it runs.
@@ -201,26 +210,15 @@ impl Sidebar {
                     (locations, present)
                 })
                 .await;
-            if this
-                .update(cx, |this, cx| {
-                    this.locations = locations;
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return; // sidebar dropped
-            }
-            // Seeding is a settings write, so it goes through the global and
-            // persists exactly once — `seed_favorites` is the guard, not this
-            // call site.
-            cx.update(|cx| {
-                let changed = cx.update_global::<AppSettings, bool>(|settings, _| {
-                    settings.seed_favorites(&present_defaults)
-                });
-                if changed {
-                    AppSettings::global(cx).save(cx);
-                }
-            });
+            this.update(cx, |this, cx| {
+                this.locations = locations;
+                this.default_favorites = Some(present_defaults);
+                // Whichever finishes last — this probe or the settings load —
+                // does the seeding. See `maybe_seed_favorites`.
+                this.maybe_seed_favorites(cx);
+                cx.notify();
+            })
+            .ok();
         });
         Self {
             workspace,
@@ -232,6 +230,7 @@ impl Sidebar {
             collapsed_tags: false,
             locations: Vec::new(),
             _startup: Some(startup),
+            default_favorites: None,
             tags: fs_core::standard_tags(),
             _tags_load: Some(tags_load),
             pending_favorite_drops: Vec::new(),
@@ -656,6 +655,43 @@ impl Sidebar {
     // ------------------------------------------------------------------
     // Locations (M7d-b) and Recents (M7d-b)
     // ------------------------------------------------------------------
+
+    /// Seed the default Favorites, **but only once the settings load has
+    /// landed** (M7d-b).
+    ///
+    /// This gate is not a nicety. `settings::init_with_path` seeds the global
+    /// with defaults, loads the file in the background, and then *discards*
+    /// that load if the content changed in the meantime — so a write during
+    /// that window does not merely race, it throws the user's whole file away
+    /// and persists defaults over it. Seeding without this gate destroyed a
+    /// real profile's saved theme the first time it ran outside a fixture.
+    ///
+    /// Called from both things it waits on — the startup probe and the
+    /// settings observer — so whichever resolves last performs the seed.
+    /// `AppSettings::seed_favorites` is idempotent, so being called twice is
+    /// harmless.
+    fn maybe_seed_favorites(&mut self, cx: &mut Context<Self>) {
+        let Some(candidates) = self.default_favorites.clone() else {
+            return; // the probe has not answered yet
+        };
+        let settings = AppSettings::global(cx);
+        if !settings.is_loaded() {
+            return; // the file has not landed yet
+        }
+        // Read before write. This runs from `observe_global::<AppSettings>`,
+        // and `update_global` notifies that observer — so calling it
+        // unconditionally re-enters here forever, even though
+        // `seed_favorites` itself is idempotent. The cheap read is what makes
+        // the recursion terminate.
+        if settings.favorites_seeded() {
+            return;
+        }
+        let changed = cx
+            .update_global::<AppSettings, bool>(|settings, _| settings.seed_favorites(&candidates));
+        if changed {
+            AppSettings::global(cx).save(cx);
+        }
+    }
 
     /// What this machine has, as last resolved.
     pub fn locations(&self) -> &[Location] {
@@ -1618,5 +1654,85 @@ mod tests {
             after < before,
             "Tags should rise when Devices collapses, but went {before:?} -> {after:?}"
         );
+    }
+
+    /// **Regression (M7d-b).** Neither startup writer may touch settings
+    /// before the initial load has landed.
+    ///
+    /// Why this matters is documented on `AppSettings::loaded` and pinned by
+    /// `settings::tests::a_write_inside_the_load_window_discards_the_file`:
+    /// a write inside that window makes `init_with_path` discard the entire
+    /// on-disk file, and the following `save` persists defaults over it. On a
+    /// real profile that silently deleted a saved `Graphite Light`.
+    ///
+    /// The window cannot be reproduced through `build_workspace` — it parks
+    /// the executor, so the load has always landed by the time a test can
+    /// navigate. So this puts the global *back* into the not-yet-loaded state
+    /// and drives both writers at it: the sidebar's seeding (via the settings
+    /// observer) and the workspace's Recents (via a real navigation).
+    #[gpui::test]
+    fn neither_startup_writer_touches_settings_before_the_load_lands(cx: &mut TestAppContext) {
+        let _vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        // Back into the boot window: a fresh global holds defaults and has not
+        // loaded. Replacing it also notifies the sidebar's observer, which is
+        // one of the two writers under test.
+        cx.update(|_, cx| {
+            cx.set_global(AppSettings::new(PathBuf::from(SETTINGS_PATH)));
+            assert!(!AppSettings::global(cx).is_loaded());
+        });
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let settings = AppSettings::global(cx);
+            assert!(
+                settings.recents().is_empty(),
+                "Recents must not be recorded before the load lands: {:?}",
+                settings.recents(),
+            );
+            assert!(
+                !settings.favorites_seeded(),
+                "seeding must wait for the load too"
+            );
+            assert_eq!(
+                settings.content(),
+                &crate::settings::SettingsContent::default(),
+                "nothing at all was written into the load window"
+            );
+        });
+    }
+
+    /// And the gates delay the work rather than cancelling it: once the load
+    /// has landed, a fresh profile still gets seeded and navigation still
+    /// records.
+    #[gpui::test]
+    fn both_writers_resume_once_the_load_has_landed(cx: &mut TestAppContext) {
+        let _vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let settings = AppSettings::global(cx);
+            assert!(settings.favorites_seeded(), "seeding ran, just later");
+            assert_eq!(
+                settings.favorites(),
+                [
+                    PathBuf::from("/home/me/Desktop"),
+                    PathBuf::from("/home/me/Documents"),
+                ],
+            );
+            assert_eq!(settings.recents(), [PathBuf::from("/root")]);
+        });
     }
 }

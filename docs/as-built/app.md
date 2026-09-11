@@ -1548,3 +1548,9 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
 - `settings.rs` (M7d-b): `favorites_seeded: bool` and `recents: Vec<PathBuf>`
   (`MAX_RECENTS` = 10), with `seed_favorites`, `push_recent` and their
   override-writer entries.
+
+- `settings.rs` (M7d-b fix): `AppSettings::loaded` / `is_loaded()`. Startup
+  writers must gate on it. `init_with_path` sets it once the load **resolves**
+  — including when the file is missing and including when the clobber guard
+  declined to apply the load — because a writer waiting on it would otherwise
+  wait forever. See the change log entry for what went wrong without it.

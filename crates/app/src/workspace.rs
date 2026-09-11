@@ -256,6 +256,16 @@ impl Workspace {
             // pane because the list is one per *app*, not one per pane — a
             // split workspace has two panes navigating into a single history.
             PaneEvent::Navigated(path) => {
+                // Same gate as the sidebar's seeding, for the same reason: a
+                // settings write before the initial load lands makes
+                // `settings::init_with_path` discard the user's whole file and
+                // then persist defaults over it. `main` navigates to home
+                // immediately at boot, so this fires squarely inside that
+                // window — it is how the bug was found, on a real profile with
+                // a saved theme.
+                if !AppSettings::global(cx).is_loaded() {
+                    return;
+                }
                 let path = path.clone();
                 let changed =
                     cx.update_global::<AppSettings, bool>(|settings, _| settings.push_recent(path));
