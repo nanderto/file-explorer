@@ -1,5 +1,7 @@
 {
   "favorites": [],
+  "favorites_seeded": false,
+  "recents": [],
   "theme": "Graphite Dark",
   "confirm_delete_to_trash": false,
   "folders_first": true

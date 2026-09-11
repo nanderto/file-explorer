@@ -36,6 +36,7 @@ mod macos {
     use file_explorer_app::info_panel::PermField;
     use file_explorer_app::pane::{Pane, ViewMode};
     use file_explorer_app::settings_ui::SettingsSection;
+    use file_explorer_app::sidebar::Section;
     use file_explorer_app::{Theme, Workspace, keymap, visual_diff};
     use fs_core::{FakeVfs, FileOp, SortKey, Spawner, Tag, TagColor, Vfs};
     use gpui::{
@@ -76,8 +77,13 @@ mod macos {
         /// Navigate, then swap the breadcrumb for the path editor
         /// (prefilled + autocomplete popup from the fixture).
         AddressBarEditing(&'static str),
-        /// Navigate, then expand sidebar folder-tree nodes (M2).
-        SidebarTreeExpanded(&'static str, &'static [&'static str]),
+        /// Navigate, then collapse the named sidebar sections (M7d-b).
+        ///
+        /// Replaces M2's `SidebarTreeExpanded`: there is no tree to expand any
+        /// more, and the state worth pinning instead is the one the M7d brief
+        /// asked for — a collapsed section with everything below it moved
+        /// **up**, contiguous, no pinned footer.
+        SidebarSectionsCollapsed(&'static str, &'static [Section]),
         /// Navigate, then expand folders in place in the details view (M2).
         DetailsFolderExpanded(&'static str, &'static [&'static str]),
         /// Navigate, then submit a copy that parks on a conflict so the
@@ -160,10 +166,16 @@ mod macos {
                 Theme::dark(),
                 Setup::AddressBarEditing("/home/Documents"),
             ),
+            // M7d-b: the sidebar's five sections with two of them shut. The
+            // point is what happens *below* the collapsed ones — Favorites,
+            // Recents and Tags move up and stay contiguous. Through M7c the
+            // folder tree was `flex_1`, so Tags sat pinned to the bottom edge
+            // with a gap above it however much was collapsed; a frame is the
+            // only honest way to pin "the column reflows".
             (
-                "sidebar_tree_expanded",
+                "sidebar_sections_collapsed",
                 Theme::dark(),
-                Setup::SidebarTreeExpanded("/home", &["/", "/home"]),
+                Setup::SidebarSectionsCollapsed("/home", &[Section::Devices, Section::Locations]),
             ),
             (
                 "details_folder_expanded",
@@ -340,7 +352,13 @@ mod macos {
                     },
                     "config": {
                         // Deterministic sidebar favorites for every scenario.
-                        "settings.json": r#"{"favorites": ["/home/Documents", "/home/Downloads"]}"#,
+                        // `favorites_seeded` is **true** (M7d-b): these frames
+                        // show an established profile, which is what a user
+                        // sees on every launch but the first. A fixture that
+                        // left it false would capture the one-time seeding
+                        // pass instead, and the seeded rows would arrive
+                        // asynchronously — a race in a screenshot.
+                        "settings.json": r#"{"favorites": ["/home/Desktop", "/home/Documents", "/home/Downloads"], "favorites_seeded": true}"#,
                     }
                 }),
             );
@@ -352,6 +370,24 @@ mod macos {
             // literal body, so "24 KB" in the panel is a number this file
             // states outright.
             vfs.insert_file("/home/Pictures/photo.jpg", 24_576);
+            // M7d-b: the Mac-shaped bits the sidebar's **Locations** resolves
+            // against. Inserted after the main tree for the same reason
+            // `photo.jpg` is — `FakeVfs` hands out mtimes from an insertion
+            // counter, so a new key inside the object above would shift the
+            // modified date of every entry declared after it and move rows in
+            // frames that have nothing to do with this change.
+            //
+            // `Library` and the OneDrive root are ordinary visible folders, so
+            // they do show up in `/home`'s listing. That is correct — a real
+            // home folder has them — and it is the same home the Locations
+            // rows point at, so the two halves of the frame agree.
+            vfs.insert_tree(
+                "/home/Library/Mobile Documents/com~apple~CloudDocs",
+                json!({ "synced.txt": "in the cloud" }),
+            );
+            vfs.insert_tree("/home/OneDrive - Test Ltd", json!({ "shared.docx": "x" }));
+            vfs.insert_tree("/home/.Trash", json!({}));
+            vfs.insert_tree("/Network", json!({ "Servers": {} }));
             let vfs: Arc<dyn Vfs> = vfs;
             // M6b: two tagged entries, seeded rather than written — the dots
             // have to render for tags Finder (or a previous session) left
@@ -374,6 +410,12 @@ mod macos {
                 cx,
                 PathBuf::from("/config/settings.json"),
             );
+            // The fixture's home, so Locations and the seeded Favorites
+            // resolve inside the FakeVfs rather than against the real
+            // machine's `/Users/<someone>` — which is not in this tree, and
+            // would render an empty Locations section into every baseline.
+            file_explorer_app::app_state::FsContext::global_mut(cx).home =
+                PathBuf::from("/home");
         });
     }
 
@@ -466,20 +508,20 @@ mod macos {
                 })
                 .map_err(|e| anyhow!("focus_address_bar failed: {e:?}"))?;
             }
-            Setup::SidebarTreeExpanded(path, expand) => {
+            Setup::SidebarSectionsCollapsed(path, sections) => {
                 navigate(cx, path)?;
                 cx.run_until_parked();
                 let sidebar = cx.read(|cx| workspace.read(cx).sidebar().clone());
-                for node in expand {
+                for section in sections {
+                    let section = *section;
                     cx.update_window(handle, |_, _, cx| {
                         sidebar.update(cx, |sidebar, cx| {
-                            sidebar.toggle_expanded(Path::new(node), cx);
+                            sidebar.toggle_section(section, cx);
                         });
                     })
-                    .map_err(|e| anyhow!("tree expand failed: {e:?}"))?;
-                    // Each expansion's children load before the next level.
-                    cx.run_until_parked();
+                    .map_err(|e| anyhow!("section collapse failed: {e:?}"))?;
                 }
+                cx.run_until_parked();
             }
             Setup::DetailsFolderExpanded(path, expand) => {
                 navigate(cx, path)?;

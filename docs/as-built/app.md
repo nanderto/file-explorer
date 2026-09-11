@@ -1493,3 +1493,64 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
     one — nothing downstream would fail). What they cannot assert is that a
     file *rasterizes* to visible pixels; that is the baselines' job, and it is
     why every scenario was opened and looked at rather than diffed.
+
+- `sidebar.rs` **rebuilt at M7d-b**. Five sections, in order — **Devices**,
+  **Locations**, **Favorites**, **Recents**, **Tags** — and only two levels of
+  hierarchy anywhere: a section header, then its rows.
+  - **The folder tree is gone.** M2's Explorer-style tree could expand to
+    arbitrary depth (`Macintosh HD › dev › fd › 3 › …`), which made the
+    sidebar a second, worse file browser beside the real one. Deleted with it:
+    `TreeRow`, the `expanded` set, the per-node `children` cache, the
+    `_child_loads` tasks, `flat`/`reflatten`/`flatten_into`, `toggle_expanded`
+    and `invalidate_children` — and, in `workspace.rs`, the
+    `PaneEvent::DirsChanged` forward that existed solely to invalidate that
+    cache (now a documented no-op arm). Depth is navigated in the file pane.
+  - **Collapsing reflows.** Every section is an ordinary block inside one
+    `overflow_y_scroll` column; nothing is `flex_1`. Collapsing a section moves
+    everything below it *up*. Through M7c the tree was `flex_1`, ate the spare
+    height, and pinned Tags to the bottom edge with a gap above it — the
+    "sidebar cannot scroll as a whole" gap, closed here without the
+    heterogeneous-`uniform_list` refactor it was expected to need, because
+    removing the tree removed the only unbounded content.
+  - **Section chevrons sit at the far right** of the header row (Finder and
+    ForkLift both put them there), so every section title starts on one left
+    margin instead of being pushed in by a control.
+  - **Locations** comes from `fs_core::resolve_locations`, resolved once on
+    the background executor: iCloud Drive, every OneDrive tenant root, home,
+    `/Network`, Trash. The section renders **only when non-empty** — absent,
+    not an empty header.
+  - **Favorites are seeded once** with Desktop/Documents/Downloads, filtered
+    to what exists. Guarded by the `favorites_seeded` flag rather than by the
+    list being empty, so unpinning them all stays unpinned.
+    **Applications is deliberately excluded**: Finder's Applications favorite
+    points at `/Applications`, which is not under home, and a Mac also has a
+    separate `~/Applications` — one name, two folders.
+  - **Recents** is workspace-level, not per-pane: `Pane::load` emits
+    `PaneEvent::Navigated` (guarded on the same `path_changed` that tears down
+    a rename, so an in-place reload does not re-record), and `Workspace`
+    pushes it onto `AppSettings`. A split workspace's two panes feed one list.
+  - **Row icons everywhere**, keyed off `LocationKind` rather than the display
+    name — which is localized ("iCloud Drive"), tenant-suffixed
+    ("OneDrive - BidOne Ltd") or the user's own login name. One `sidebar_row`
+    helper now draws the shared shape all five sections had been drifting
+    apart on.
+- `views/details_list.rs` (M7d-b): rows carry a **type icon**. The list view
+  had none — the only thing distinguishing a folder row from a file row was
+  the disclosure chevron, which a folder among *search results* does not get
+  (M6a), so in search results the two were indistinguishable.
+- `app_state.rs` (M7d-b): `FsContext` gained `home: PathBuf`. A field rather
+  than an `env::home_dir()` call at each use site, because everything that
+  reads it — Locations, the seeded Favorites — must resolve *inside the
+  fixture tree* under `#[gpui::test]` and in the visual runner. With the env
+  call inline, those would look for `/Users/<someone>` in a `FakeVfs`
+  containing only `/home`, find nothing, and render an empty Locations section
+  into a baseline that looks perfectly plausible.
+- `settings.rs` (M7d-b): `favorites_seeded: bool` and `recents: Vec<PathBuf>`
+  (`MAX_RECENTS` = 10), with `seed_favorites`, `push_recent` and their
+  override-writer entries.
+
+- `settings.rs` (M7d-b fix): `AppSettings::loaded` / `is_loaded()`. Startup
+  writers must gate on it. `init_with_path` sets it once the load **resolves**
+  — including when the file is missing and including when the clobber guard
+  declined to apply the load — because a writer waiting on it would otherwise
+  wait forever. See the change log entry for what went wrong without it.

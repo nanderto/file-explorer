@@ -620,3 +620,26 @@ watching it belongs to the app (see
   resolves it. Serde-`untagged`, so `settings.json` reads naturally in both
   spellings and both round-trip.
 - 22 tests in the crate (7 color, 15 model/registry/selection).
+
+- `locations.rs` (M7d-b): the sidebar's **Locations**, GPUI-free and
+  `Vfs`-driven. `LocationKind` / `Location`, the pure `fixed_candidates` and
+  `onedrive_candidates`, and the async `resolve_locations` that stats the
+  fixed candidates and reads home once for OneDrive roots.
+  - **Only what exists is returned** — a Mac with iCloud Drive switched off
+    has no `com~apple~CloudDocs` folder, and a row pointing at a missing
+    directory is a row that navigates to an error.
+  - **`/Network` is a real path**, contrary to plan §7's note that it "is not
+    a path at all": it is an autofs mount (`/Network -> /System/Volumes/Data/
+    Network`, containing `Servers`), verified on the development Mac. It needs
+    no platform work and is an ordinary path row.
+  - **AirDrop is deliberately absent** — no filesystem presence at all, a
+    Finder-only view over a private sharing service. There is no path to
+    navigate to, so there is no honest row to draw.
+  - **OneDrive is matched, not fixed**: the sync root is tenant-suffixed
+    (`OneDrive - BidOne Ltd`), so it is found by scanning home for `OneDrive`
+    or `OneDrive - <anything>` — deliberately not "starts with OneDrive",
+    which would claim a user's own `OneDriveBackups`. Every tenant gets a row.
+  - **Known limit: Trash is the boot volume's only.** `~/.Trash` does not
+    include `/Volumes/<name>/.Trashes/<uid>`, which Finder's single Trash icon
+    unions in. Pinned by `trash_is_the_boot_volumes_only` so it stays a
+    recorded limit rather than a surprise.

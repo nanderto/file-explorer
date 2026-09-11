@@ -1,43 +1,58 @@
 //! The sidebar (ARCHITECTURE.md §2 `Sidebar` entity, §8 "Sidebar tree",
-//! plan §2 sidebar blueprint) — M2 surface.
+//! plan §2 sidebar blueprint) — M2 surface, rebuilt at M7d-b.
 //!
-//! Three collapsible sections:
+//! **Two levels, always.** A section header, and its rows. Nothing in the
+//! sidebar expands: depth is navigated in the file pane(s), which is how both
+//! Finder and ForkLift behave and what M7c's Explorer-style folder *tree*
+//! got wrong. That tree could open to arbitrary depth (`Macintosh HD › dev ›
+//! fd › 3 › …`), which made the sidebar a second, worse file browser beside
+//! the real one — and made it the only unbounded thing in the column.
+//!
+//! Five sections, in this order:
+//!
 //! - **Devices**: mounted volumes from the [`fs_core::Platform`] seam (name,
 //!   free space, an eject affordance on ejectable volumes), kept current by
 //!   the polling [`watch_volumes`] stream (fake time under `#[gpui::test]`).
+//! - **Locations** (M7d-b): what [`fs_core::resolve_locations`] finds on this
+//!   machine — iCloud Drive, every OneDrive tenant root, home, `/Network`,
+//!   Trash. Resolved once on the background executor; only what exists is
+//!   listed, so no row navigates to nothing.
 //! - **Favorites**: user-pinned folders from [`AppSettings`] — click
 //!   navigates, `+` in the header pins the active pane's folder, `✕` on a row
-//!   unpins; every change persists immediately through `Vfs::atomic_write` on
-//!   the background executor. (Drag-to-add, context menus, and reordering
-//!   arrive at M3 with the drag infrastructure.)
-//! - **Tags** (M6b): the Finder tags [`fs_core::Platform::known_tags`] reports,
-//!   each with its fixed macOS palette dot. Clicking one filters the active
-//!   pane to the items in the open folder carrying it; clicking the lit one
-//!   again clears the filter. **Deliberate deviation:** Finder's tag click is a
-//!   volume-wide Spotlight query — see [`crate::tags`] and
+//!   unpins, rows reorder by drag; every change persists immediately through
+//!   `Vfs::atomic_write` on the background executor. Seeded once with
+//!   Desktop/Documents/Downloads (M7d-b), guarded by a flag rather than by
+//!   emptiness so unpinning them all stays unpinned.
+//! - **Recents** (M7d-b): the folders the panes have opened, most recent
+//!   first, from [`AppSettings::recents`].
+//! - **Tags** (M6b): the Finder tags [`fs_core::Platform::known_tags`]
+//!   reports, each with its fixed macOS palette dot. Clicking one filters the
+//!   active pane to the items in the open folder carrying it; clicking the lit
+//!   one again clears the filter. **Deliberate deviation:** Finder's tag click
+//!   is a volume-wide Spotlight query — see [`crate::tags`] and
 //!   `docs/AS_BUILT.md`.
-//! - **Folders**: an Explorer-style tree. Expanded nodes are flattened into a
-//!   `Vec<TreeRow>` rendered by `uniform_list`; disclosure triangles mutate
-//!   the expansion set and re-flatten (§8 flat-projection technique, shared
-//!   with the details view's in-place expansion).
+//!
+//! **Collapsing reflows.** Every section is an ordinary block in a single
+//! scrolling column — no `flex_1`, no pinned footer. Collapsing one moves
+//! everything below it *up*, which is what Finder and ForkLift do and what
+//! M7c could not do while the tree ate the leftover height and pinned Tags to
+//! the bottom edge.
 //!
 //! Events up, method calls down (§2): the sidebar only emits
 //! [`SidebarEvent`]s; the owning [`Workspace`] navigates the active pane and
 //! runs `Platform::eject` on the background executor.
 
-use std::collections::{BTreeSet, HashMap};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fs_core::{
-    FileEntry, SortSpec, Tag, VolumeId, VolumeInfo, WatchGuard, list_dir, watch_volumes,
+    Location, LocationKind, Tag, VolumeId, VolumeInfo, WatchGuard, resolve_locations, watch_volumes,
 };
 use futures::StreamExt as _;
 use gpui::{
     Context, EventEmitter, ExternalPaths, IntoElement, Render, SharedString, Subscription, Task,
-    WeakEntity, Window, div, prelude::*, px, uniform_list,
+    WeakEntity, Window, div, prelude::*, px,
 };
 
 use crate::app_state::FsContext;
@@ -46,17 +61,27 @@ use crate::icons::{self, Icon};
 use crate::pane::format_bytes;
 use crate::settings::AppSettings;
 use crate::workspace::Workspace;
+use ::theme::Theme;
 
 /// How often the volume list is re-polled (ARCHITECTURE.md §6: change
 /// detection is a poller on `Spawner::timer`, so tests advance a fake clock).
 pub const VOLUME_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Fixed tree row height (uniform_list requirement).
-const TREE_ROW_HEIGHT: f32 = 22.0;
+/// The folders a fresh profile gets pinned, in display order (M7d-b).
+///
+/// Relative to home and filtered to what exists, so a machine without one of
+/// them simply does not get that row. **Applications is deliberately absent**:
+/// Finder's Applications favorite points at `/Applications`, which is not
+/// under home at all, and this Mac also has a separate `~/Applications` — two
+/// different folders with one name is a row that means the wrong thing half
+/// the time.
+const DEFAULT_FAVORITES: [&str; 3] = ["Desktop", "Documents", "Downloads"];
+
+/// The height a sidebar row occupies. Also the unit the Favorites drop zone's
+/// minimum height is expressed in.
+const ROW_HEIGHT: f32 = 22.0;
 /// Favorites reorder drop-target tint (the "insert before this row" cue).
 const FAVORITE_REORDER_ALPHA: f32 = 0.35;
-/// Horizontal indent per tree depth level.
-const TREE_INDENT: f32 = 12.0;
 
 /// Events up (ARCHITECTURE.md §2): the workspace subscribes and acts.
 pub enum SidebarEvent {
@@ -73,27 +98,31 @@ pub enum SidebarEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Devices,
+    Locations,
     Favorites,
+    Recents,
     Tags,
-    Tree,
-}
-
-/// One visible row of the flattened folder tree (§8 flat projection).
-#[derive(Clone, Debug, PartialEq)]
-pub struct TreeRow {
-    pub path: Arc<Path>,
-    pub name: SharedString,
-    pub depth: usize,
-    pub expanded: bool,
 }
 
 pub struct Sidebar {
     workspace: WeakEntity<Workspace>,
     volumes: Vec<VolumeInfo>,
     collapsed_devices: bool,
+    collapsed_locations: bool,
     collapsed_favorites: bool,
+    collapsed_recents: bool,
     collapsed_tags: bool,
-    collapsed_tree: bool,
+    /// What this machine actually has (M7d-b). Empty until the one-shot
+    /// resolve lands, so the first paint does no I/O and the section simply
+    /// is not there yet rather than showing rows that might not exist.
+    locations: Vec<Location>,
+    /// The one-shot locations resolve **and** favorites seeding; a field,
+    /// never detached (§5).
+    _startup: Option<Task<()>>,
+    /// Which of [`DEFAULT_FAVORITES`] this machine actually has, once the
+    /// startup probe has answered. `None` until then — which is *not* the same
+    /// as "none of them exist", and seeding must not confuse the two.
+    default_favorites: Option<Vec<PathBuf>>,
     /// The tags the **Tags** section lists: the palette plus whatever the user
     /// has, loaded once off the UI thread. Seeded with
     /// [`fs_core::standard_tags`] so the section is never empty and the first
@@ -101,14 +130,6 @@ pub struct Sidebar {
     tags: Vec<Tag>,
     /// The one-shot `known_tags` load; a field, never detached (§5).
     _tags_load: Option<Task<()>>,
-    /// Expanded tree nodes, path-keyed so expansion survives re-flattening.
-    expanded: BTreeSet<Arc<Path>>,
-    /// Background-loaded, sorted, dirs-only child listings per tree node.
-    children: HashMap<Arc<Path>, Vec<FileEntry>>,
-    /// The flat projection rendered by `uniform_list`.
-    flat: Vec<TreeRow>,
-    /// In-flight child loads, held so dropping the sidebar cancels them.
-    _child_loads: HashMap<Arc<Path>, Task<()>>,
     /// Paths dropped on Favorites that still need their "is this a folder?"
     /// probe. A **queue**, because a second drop must not cancel the first:
     /// while it is non-empty the task below is alive and will drain it.
@@ -131,6 +152,8 @@ impl Sidebar {
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let fs = FsContext::global(cx);
         let platform = fs.platform.clone();
+        let startup_vfs = fs.vfs.clone();
+        let startup_home = fs.home.clone();
         let (mut stream, guard) =
             watch_volumes(fs.platform.clone(), &fs.spawner, VOLUME_POLL_INTERVAL);
         let pump = cx.spawn(async move |this, cx| {
@@ -141,7 +164,12 @@ impl Sidebar {
                 }
             }
         });
-        let settings_observer = cx.observe_global::<AppSettings>(|_, cx| cx.notify());
+        let settings_observer = cx.observe_global::<AppSettings>(|this: &mut Self, cx| {
+            // The settings load landing is one of the two things seeding waits
+            // for (the other is the startup probe above).
+            this.maybe_seed_favorites(cx);
+            cx.notify();
+        });
         // M6b: the Tags section's rows. One `known_tags` call, on the
         // background executor — the sidebar never touches the OS on the UI
         // thread (§5), and the palette is already painted while it runs.
@@ -160,19 +188,51 @@ impl Sidebar {
                 .ok();
             }
         });
+        // M7d-b: Locations and the seeded Favorites, in one background pass —
+        // both want the same home directory and the same `Vfs`, and both are
+        // startup-only. Captured before the spawn (the `tags_load` shape just
+        // above), because the globals are not reachable from the async
+        // context. Off the UI thread, like every other disk read (§5).
+        let startup = cx.spawn(async move |this, cx| {
+            let seed_vfs = startup_vfs.clone();
+            let seed_home = startup_home.clone();
+            let (locations, present_defaults) = cx
+                .background_executor()
+                .spawn(async move {
+                    let locations = resolve_locations(seed_vfs.as_ref(), &seed_home).await;
+                    let mut present: Vec<PathBuf> = Vec::new();
+                    for name in DEFAULT_FAVORITES {
+                        let path = seed_home.join(name);
+                        if matches!(seed_vfs.metadata(&path).await, Ok(Some(_))) {
+                            present.push(path);
+                        }
+                    }
+                    (locations, present)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.locations = locations;
+                this.default_favorites = Some(present_defaults);
+                // Whichever finishes last — this probe or the settings load —
+                // does the seeding. See `maybe_seed_favorites`.
+                this.maybe_seed_favorites(cx);
+                cx.notify();
+            })
+            .ok();
+        });
         Self {
             workspace,
             volumes: Vec::new(),
             collapsed_devices: false,
+            collapsed_locations: false,
             collapsed_favorites: false,
+            collapsed_recents: false,
             collapsed_tags: false,
-            collapsed_tree: false,
+            locations: Vec::new(),
+            _startup: Some(startup),
+            default_favorites: None,
             tags: fs_core::standard_tags(),
             _tags_load: Some(tags_load),
-            expanded: BTreeSet::new(),
-            children: HashMap::new(),
-            flat: Vec::new(),
-            _child_loads: HashMap::new(),
             pending_favorite_drops: Vec::new(),
             _favorite_drop: None,
             _volumes_pump: pump,
@@ -191,7 +251,6 @@ impl Sidebar {
 
     fn set_volumes(&mut self, volumes: Vec<VolumeInfo>, cx: &mut Context<Self>) {
         self.volumes = volumes;
-        self.reflatten();
         cx.notify();
     }
 
@@ -333,7 +392,8 @@ impl Sidebar {
             Section::Devices => self.collapsed_devices,
             Section::Favorites => self.collapsed_favorites,
             Section::Tags => self.collapsed_tags,
-            Section::Tree => self.collapsed_tree,
+            Section::Locations => self.collapsed_locations,
+            Section::Recents => self.collapsed_recents,
         }
     }
 
@@ -342,142 +402,11 @@ impl Sidebar {
             Section::Devices => &mut self.collapsed_devices,
             Section::Favorites => &mut self.collapsed_favorites,
             Section::Tags => &mut self.collapsed_tags,
-            Section::Tree => &mut self.collapsed_tree,
+            Section::Locations => &mut self.collapsed_locations,
+            Section::Recents => &mut self.collapsed_recents,
         };
         *flag = !*flag;
         cx.notify();
-    }
-
-    // ------------------------------------------------------------------
-    // Folder tree (§8 flat projection)
-    // ------------------------------------------------------------------
-
-    /// The current flat projection (test observability).
-    pub fn flat_rows(&self) -> &[TreeRow] {
-        &self.flat
-    }
-
-    /// Disclosure triangle: expand (loading children in the background on
-    /// first expansion) or collapse, then re-flatten.
-    pub fn toggle_expanded(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let key: Arc<Path> = Arc::from(path);
-        if !self.expanded.remove(&key) {
-            self.expanded.insert(key.clone());
-            self.load_children(key, cx);
-        }
-        self.reflatten();
-        cx.notify();
-    }
-
-    /// An external change (a pane's watcher batch, forwarded by the
-    /// workspace) landed in folders the tree caches child listings for: those
-    /// listings are stale. A collapsed node just loses its cache (re-listed on
-    /// the next expansion); an expanded one keeps its rows painted while a
-    /// fresh listing loads over the top.
-    pub fn invalidate_children(&mut self, dirs: &[Arc<Path>], cx: &mut Context<Self>) {
-        for dir in dirs {
-            // An in-flight load would otherwise satisfy `load_children`'s
-            // staleness check and never re-run.
-            let was_loading = self._child_loads.remove(dir).is_some();
-            if self.expanded.contains(dir) {
-                if was_loading || self.children.contains_key(dir) {
-                    self.start_child_load(dir.clone(), cx);
-                }
-            } else {
-                self.children.remove(dir);
-            }
-        }
-    }
-
-    /// Background-list a node's children (dirs only, default sort). Results
-    /// are cached; collapsing keeps them so re-expanding paints instantly.
-    fn load_children(&mut self, path: Arc<Path>, cx: &mut Context<Self>) {
-        if self.children.contains_key(&path) || self._child_loads.contains_key(&path) {
-            return;
-        }
-        self.start_child_load(path, cx);
-    }
-
-    /// Unconditional (re)list of a node's children — the invalidation path,
-    /// where a cached listing exists but is known stale.
-    fn start_child_load(&mut self, path: Arc<Path>, cx: &mut Context<Self>) {
-        let vfs = FsContext::global(cx).vfs.clone();
-        let load_path = path.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(list_dir(
-                    vfs,
-                    load_path.clone(),
-                    SortSpec::default(),
-                    false,
-                    0,
-                ))
-                .await;
-            this.update(cx, |this, cx| {
-                // An unreadable directory simply has no children in the tree.
-                let dirs = match result {
-                    Ok(snapshot) => snapshot
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.is_dir_like())
-                        .cloned()
-                        .collect(),
-                    Err(_) => Vec::new(),
-                };
-                this.children.insert(load_path, dirs);
-                this.reflatten();
-                cx.notify();
-            })
-            .ok();
-        });
-        self._child_loads.insert(path, task);
-    }
-
-    /// Rebuild the flat projection: volume roots at depth 0, each expanded
-    /// node's cached children spliced beneath it with `depth + 1`.
-    fn reflatten(&mut self) {
-        let mut flat = Vec::new();
-        for volume in &self.volumes {
-            let path: Arc<Path> = Arc::from(volume.path.as_path());
-            Self::flatten_into(
-                &self.expanded,
-                &self.children,
-                &mut flat,
-                path,
-                SharedString::from(volume.name.clone()),
-                0,
-            );
-        }
-        self.flat = flat;
-    }
-
-    fn flatten_into(
-        expanded: &BTreeSet<Arc<Path>>,
-        children: &HashMap<Arc<Path>, Vec<FileEntry>>,
-        flat: &mut Vec<TreeRow>,
-        path: Arc<Path>,
-        name: SharedString,
-        depth: usize,
-    ) {
-        let is_expanded = expanded.contains(&path);
-        flat.push(TreeRow {
-            path: path.clone(),
-            name,
-            depth,
-            expanded: is_expanded,
-        });
-        if is_expanded && let Some(kids) = children.get(&path) {
-            for kid in kids {
-                Self::flatten_into(
-                    expanded,
-                    children,
-                    flat,
-                    kid.path.clone(),
-                    SharedString::new(kid.name.clone()),
-                    depth + 1,
-                );
-            }
-        }
     }
 
     // ------------------------------------------------------------------
@@ -506,7 +435,10 @@ impl Sidebar {
             .text_color(theme.muted)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
-            .child(icons::icon(icons::disclosure(!collapsed), theme.muted))
+            // Label first, chevron last: the disclosure sits at the **far
+            // right** of the header (Finder and ForkLift both put it there),
+            // so the section titles all start on one left margin instead of
+            // being pushed in by a control.
             .child(div().flex_1().child(SharedString::new_static(title)));
         if with_add {
             header = header.child(
@@ -525,7 +457,13 @@ impl Sidebar {
                     .child(icons::icon(Icon::Plus, theme.muted)),
             );
         }
-        header
+        header.child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .child(icons::icon(icons::disclosure(!collapsed), theme.muted)),
+        )
     }
 
     fn render_devices(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -538,19 +476,12 @@ impl Sidebar {
                 let navigate_path = volume.path.clone();
                 let eject_id = volume.volume_id.clone();
                 let volume_name = volume.name.clone();
-                let mut row = div()
-                    .id(("sidebar-volume", ix))
-                    .debug_selector(|| format!("sidebar-volume-{volume_name}"))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(16.0))
-                    .py(px(2.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.accent.opacity(0.15)))
+                let mut row = sidebar_row(("sidebar-volume", ix), &theme)
+                    .debug_selector(move || format!("sidebar-volume-{volume_name}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
+                    .child(icons::icon(Icon::Drive, theme.muted))
                     .child(
                         div()
                             .flex_1()
@@ -615,7 +546,7 @@ impl Sidebar {
             .debug_selector(|| "sidebar-favorites-drop-zone".into())
             .flex()
             .flex_col()
-            .min_h(px(TREE_ROW_HEIGHT * 3.0))
+            .min_h(px(ROW_HEIGHT * 3.0))
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style.bg(external_theme.accent.opacity(drag::FAVORITES_DROP_ALPHA))
             })
@@ -656,30 +587,19 @@ impl Sidebar {
             .iter()
             .enumerate()
             .map(|(ix, path)| {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
+                let name = display_name(path);
                 let navigate_path = path.clone();
                 let remove_path = path.clone();
                 let drag_path = path.clone();
                 let insert_before = path.clone();
                 let ghost_label = SharedString::from(name.clone());
-                div()
-                    // Path-keyed, not index-keyed: this row is a drag source,
-                    // and gpui persists a stateful element's pending press by
-                    // element id across frames — an index would let a press on
-                    // one favorite start a drag carrying whichever favorite the
-                    // list has since shuffled into that slot (invariant #2).
-                    .id(gpui::ElementId::Path(Arc::from(path.as_path())))
-                    .debug_selector(|| format!("sidebar-favorite-{ix}"))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(16.0))
-                    .py(px(2.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.accent.opacity(0.15)))
+                // Path-keyed, not index-keyed: this row is a drag source, and
+                // gpui persists a stateful element's pending press by element
+                // id across frames — an index would let a press on one
+                // favorite start a drag carrying whichever favorite the list
+                // has since shuffled into that slot (invariant #2).
+                sidebar_row(gpui::ElementId::Path(Arc::from(path.as_path())), &theme)
+                    .debug_selector(move || format!("sidebar-favorite-{ix}"))
                     // §8 reordering: a row is both a drag source and the
                     // "insert before me" target. Highlighted as a background
                     // tint rather than an insertion rule, so arming a target
@@ -697,6 +617,7 @@ impl Sidebar {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
+                    .child(icons::icon(Icon::Folder, theme.muted))
                     .child(div().flex_1().truncate().child(SharedString::from(name)))
                     .child(
                         div()
@@ -726,6 +647,106 @@ impl Sidebar {
                                 .hover(|s| s.text_color(theme.error)),
                             ),
                     )
+            })
+            .collect();
+        div().flex().flex_col().children(rows)
+    }
+
+    // ------------------------------------------------------------------
+    // Locations (M7d-b) and Recents (M7d-b)
+    // ------------------------------------------------------------------
+
+    /// Seed the default Favorites, **but only once the settings load has
+    /// landed** (M7d-b).
+    ///
+    /// This gate is not a nicety. `settings::init_with_path` seeds the global
+    /// with defaults, loads the file in the background, and then *discards*
+    /// that load if the content changed in the meantime — so a write during
+    /// that window does not merely race, it throws the user's whole file away
+    /// and persists defaults over it. Seeding without this gate destroyed a
+    /// real profile's saved theme the first time it ran outside a fixture.
+    ///
+    /// Called from both things it waits on — the startup probe and the
+    /// settings observer — so whichever resolves last performs the seed.
+    /// `AppSettings::seed_favorites` is idempotent, so being called twice is
+    /// harmless.
+    fn maybe_seed_favorites(&mut self, cx: &mut Context<Self>) {
+        let Some(candidates) = self.default_favorites.clone() else {
+            return; // the probe has not answered yet
+        };
+        let settings = AppSettings::global(cx);
+        if !settings.is_loaded() {
+            return; // the file has not landed yet
+        }
+        // Read before write. This runs from `observe_global::<AppSettings>`,
+        // and `update_global` notifies that observer — so calling it
+        // unconditionally re-enters here forever, even though
+        // `seed_favorites` itself is idempotent. The cheap read is what makes
+        // the recursion terminate.
+        if settings.favorites_seeded() {
+            return;
+        }
+        let changed = cx
+            .update_global::<AppSettings, bool>(|settings, _| settings.seed_favorites(&candidates));
+        if changed {
+            AppSettings::global(cx).save(cx);
+        }
+    }
+
+    /// What this machine has, as last resolved.
+    pub fn locations(&self) -> &[Location] {
+        &self.locations
+    }
+
+    /// The **Locations** rows. Icon keyed off [`LocationKind`] rather than off
+    /// the name, which is localized ("iCloud Drive"), tenant-suffixed
+    /// ("OneDrive - BidOne Ltd") or the user's own login name.
+    fn render_locations(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
+        let rows: Vec<_> = self
+            .locations
+            .iter()
+            .enumerate()
+            .map(|(ix, location)| {
+                let navigate_path = location.path.clone();
+                let name = SharedString::from(location.name.clone());
+                sidebar_row(("sidebar-location", ix), &theme)
+                    .debug_selector(move || format!("sidebar-location-{ix}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_path(navigate_path.clone(), cx);
+                    }))
+                    .child(icons::icon(location_icon(location.kind), theme.muted))
+                    .child(div().flex_1().truncate().child(name))
+            })
+            .collect();
+        div().flex().flex_col().children(rows)
+    }
+
+    /// The **Recents** rows: folders the panes have opened, most recent first.
+    ///
+    /// Read straight from [`AppSettings`] rather than mirrored on the sidebar,
+    /// for the same reason the Favorites rows are: the list is written by the
+    /// workspace on every navigation, and a mirror would be one repaint behind
+    /// the folder the user is standing in.
+    fn render_recents(
+        &self,
+        recents: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
+        let rows: Vec<_> = recents
+            .iter()
+            .enumerate()
+            .map(|(ix, path)| {
+                let navigate_path = path.clone();
+                let name = SharedString::from(display_name(path));
+                sidebar_row(("sidebar-recent", ix), &theme)
+                    .debug_selector(move || format!("sidebar-recent-{ix}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_path(navigate_path.clone(), cx);
+                    }))
+                    .child(icons::icon(Icon::Folder, theme.muted))
+                    .child(div().flex_1().truncate().child(name))
             })
             .collect();
         div().flex().flex_col().children(rows)
@@ -775,16 +796,8 @@ impl Sidebar {
                 let is_active = active.as_ref() == Some(tag);
                 let clicked = tag.clone();
                 let name = SharedString::new(&tag.name);
-                let mut row = div()
-                    .id(("sidebar-tag", ix))
-                    .debug_selector(|| format!("sidebar-tag-{ix}"))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(16.0))
-                    .py(px(2.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.accent.opacity(0.15)))
+                let mut row = sidebar_row(("sidebar-tag", ix), &theme)
+                    .debug_selector(move || format!("sidebar-tag-{ix}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_tag_filter(&clicked, cx);
                     }))
@@ -811,58 +824,43 @@ impl Sidebar {
             .collect();
         div().flex().flex_col().children(rows)
     }
+}
 
-    fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        uniform_list(
-            "sidebar-tree",
-            self.flat.len(),
-            cx.processor(|this, range: Range<usize>, _window, cx| {
-                range
-                    .map(|ix| render_tree_row(this, ix, cx))
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .flex_1()
+/// The shared shape of every clickable sidebar row: one line, an icon gutter,
+/// a truncating label. Factored out because five sections draw it and they
+/// drifted apart before M7d-b (different paddings, different hover tints).
+fn sidebar_row(id: impl Into<gpui::ElementId>, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    let hover = theme.accent.opacity(0.15);
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .h(px(ROW_HEIGHT))
+        .px(px(16.0))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+}
+
+/// The icon for a location, by kind.
+fn location_icon(kind: LocationKind) -> Icon {
+    match kind {
+        // Both cloud roots get the same glyph: they are the same *idea*, and
+        // the row is labelled with which one it is.
+        LocationKind::ICloudDrive | LocationKind::OneDrive => Icon::Cloud,
+        LocationKind::Home => Icon::Home,
+        LocationKind::Network => Icon::Network,
+        LocationKind::Trash => Icon::Trash,
     }
 }
 
-fn render_tree_row(
-    this: &mut Sidebar,
-    ix: usize,
-    cx: &mut Context<Sidebar>,
-) -> gpui::Stateful<gpui::Div> {
-    let theme = crate::theme::theme(cx).clone();
-    let row = this.flat[ix].clone();
-    let toggle_path = row.path.clone();
-    let navigate_path = row.path.to_path_buf();
-    div()
-        .id(("sidebar-tree-row", ix))
-        .debug_selector(|| format!("sidebar-tree-row-{ix}"))
-        .flex()
-        .items_center()
-        .h(px(TREE_ROW_HEIGHT))
-        .pl(px(TREE_INDENT + row.depth as f32 * TREE_INDENT))
-        .pr(px(8.0))
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.accent.opacity(0.15)))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.open_path(navigate_path.clone(), cx);
-        }))
-        .child(
-            div()
-                .id(("sidebar-tree-toggle", ix))
-                .debug_selector(|| format!("sidebar-tree-toggle-{ix}"))
-                .w(px(14.0))
-                .text_color(theme.muted)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_expanded(&toggle_path, cx);
-                }))
-                .flex()
-                .items_center()
-                .child(icons::icon(icons::disclosure(row.expanded), theme.muted)),
-        )
-        .child(div().flex_1().truncate().child(row.name.clone()))
+/// A path's last component, or the path itself when it has none (`/`). Shared
+/// by Favorites and Recents so a row is never labelled with the empty string.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -870,34 +868,57 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx).clone();
-        let favorites: Vec<PathBuf> = AppSettings::global(cx).favorites().to_vec();
+        let settings = AppSettings::global(cx);
+        let favorites: Vec<PathBuf> = settings.favorites().to_vec();
+        let recents: Vec<PathBuf> = settings.recents().to_vec();
 
+        // **One scrolling column, every section an ordinary block.** No
+        // `flex_1` anywhere: that is what pinned Tags to the bottom edge
+        // through M7c and left a gap above it. With every section sized by its
+        // own content, collapsing one moves everything below it up — the
+        // Finder/ForkLift behavior — and the column as a whole scrolls when
+        // the sections together outgrow it.
         let mut root = div()
+            .id("sidebar-scroll")
+            .debug_selector(|| "sidebar-scroll".into())
             .flex()
             .flex_col()
             .size_full()
             .min_h(px(0.0))
+            .overflow_y_scroll()
             .text_size(px(13.0))
             .text_color(theme.text)
             .child(self.section_header(Section::Devices, "Devices", false, cx));
         if !self.collapsed_devices {
             root = root.child(self.render_devices(cx));
         }
-        root = root.child(self.favorites_section(&favorites, cx));
-        root = root.child(self.section_header(Section::Tree, "Folders", false, cx));
-        if !self.collapsed_tree {
-            root = root.child(self.render_tree(cx));
+
+        // Locations is absent, not empty, until the resolve lands — and on a
+        // machine with none of them it stays absent rather than showing a
+        // header over nothing.
+        if !self.locations.is_empty() {
+            root = root.child(self.section_header(Section::Locations, "Locations", false, cx));
+            if !self.collapsed_locations {
+                root = root.child(self.render_locations(cx));
+            }
         }
-        // **Tags last** (M7c), as Finder and ForkLift both place them. The
-        // section above it is the browsable tree, which is unbounded and the
-        // thing a user scrolls; a fixed-length list of tag colours sitting
-        // between Favorites and the tree pushed the tree down the sidebar
-        // for no reason.
+
+        root = root.child(self.favorites_section(&favorites, cx));
+
+        if !recents.is_empty() {
+            root = root.child(self.section_header(Section::Recents, "Recents", false, cx));
+            if !self.collapsed_recents {
+                root = root.child(self.render_recents(&recents, cx));
+            }
+        }
+
         root = root.child(self.section_header(Section::Tags, "Tags", false, cx));
         if !self.collapsed_tags {
             root = root.child(self.render_tags(cx));
         }
-        root
+        // A little breathing room under the last section, so the final row is
+        // not flush against the window edge when the column is full.
+        root.child(div().h(px(8.0)).flex_none())
     }
 }
 
@@ -911,8 +932,27 @@ mod tests {
     use std::sync::Arc;
 
     const SETTINGS_PATH: &str = "/config/file-explorer/settings.json";
+    /// The fixture home (M7d-b): Locations and the seeded Favorites both
+    /// resolve relative to it.
+    const TEST_HOME: &str = "/home/me";
 
+    /// The default fixture: an **already-seeded** profile, so the M7d-b
+    /// default Favorites do not appear in tests about pinning, reordering and
+    /// dropping. Those tests assert on exact favorites lists, and seeding
+    /// would otherwise put two rows they never asked for in front of every
+    /// assertion. `init_fresh_profile` is the opposite fixture, used by the
+    /// seeding tests themselves.
     fn init_test(cx: &mut TestAppContext) -> Arc<FakeVfs> {
+        let vfs = init_fresh_profile(cx);
+        cx.update(|cx| {
+            // Seeding with no candidates flips the flag and pins nothing —
+            // exactly the state of a profile that was seeded long ago.
+            cx.update_global::<AppSettings, bool>(|settings, _| settings.seed_favorites(&[]));
+        });
+        vfs
+    }
+
+    fn init_fresh_profile(cx: &mut TestAppContext) -> Arc<FakeVfs> {
         cx.update(|cx| {
             let spawner: Arc<dyn Spawner> =
                 Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
@@ -926,6 +966,22 @@ mod tests {
                         ".hidden-dir": {},
                     },
                     "other": { "b.txt": "b" },
+                    // M7d-b: a Mac-shaped home, so Locations resolves to
+                    // something and the seeded Favorites have folders to find.
+                    // `Desktop`/`Documents` exist and `Downloads` deliberately
+                    // does not — the seeder has to drop what is missing.
+                    "home": {
+                        "me": {
+                            "Library": {
+                                "Mobile Documents": { "com~apple~CloudDocs": {} }
+                            },
+                            "OneDrive - Test Ltd": {},
+                            "Desktop": {},
+                            "Documents": {},
+                            ".Trash": {},
+                        }
+                    },
+                    "Network": { "Servers": {} },
                 }),
             );
             crate::keymap::init(cx);
@@ -937,6 +993,9 @@ mod tests {
                 Arc::new(fs_core::StubPlatform::new()),
             );
             crate::settings::init_with_path(cx, PathBuf::from(SETTINGS_PATH));
+            // The env's real home is not in this FakeVfs, so without this
+            // every Locations row would resolve to nothing (M7d-b).
+            crate::app_state::FsContext::global_mut(cx).home = PathBuf::from(TEST_HOME);
             vfs
         })
     }
@@ -1160,7 +1219,7 @@ mod tests {
         let header = bounds(cx, "sidebar-section-Favorites");
         let zone = bounds(cx, "sidebar-favorites-drop-zone");
         assert!(
-            zone.bottom() > header.bottom() + px(TREE_ROW_HEIGHT),
+            zone.bottom() > header.bottom() + px(ROW_HEIGHT),
             "an empty Favorites list must still present a real drop target \
              (zone {zone:?}, header {header:?})"
         );
@@ -1321,175 +1380,6 @@ mod tests {
         assert_eq!(persisted_favorites(&vfs).len(), 3);
     }
 
-    #[gpui::test]
-    fn tree_expand_reflattens_and_collapse_restores(cx: &mut TestAppContext) {
-        let _vfs = init_test(cx);
-        let (workspace, cx) = build_workspace(cx);
-        let sidebar = sidebar_of(&workspace, cx);
-        cx.run_until_parked();
-
-        // Compare as `PathBuf`s: path equality is component-wise, so the
-        // assertions hold on Windows (`\`) and Unix (`/`) alike.
-        let rows = |sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext| {
-            sidebar.read_with(cx, |sidebar, _| {
-                sidebar
-                    .flat_rows()
-                    .iter()
-                    .map(|row| (row.path.to_path_buf(), row.depth))
-                    .collect::<Vec<_>>()
-            })
-        };
-        let expect = |entries: &[(&str, usize)]| {
-            entries
-                .iter()
-                .map(|(path, depth)| (PathBuf::from(path), *depth))
-                .collect::<Vec<_>>()
-        };
-
-        // Volume roots only, depth 0.
-        assert_eq!(
-            rows(&sidebar, cx),
-            expect(&[
-                ("/", 0),
-                ("/Volumes/External SSD", 0),
-                ("/Volumes/Camera", 0),
-            ])
-        );
-
-        // Expand "/": its dirs-only, sorted, non-hidden children splice in at
-        // depth 1 once the background load lands.
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/"), cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            rows(&sidebar, cx),
-            expect(&[
-                ("/", 0),
-                ("/other", 1),
-                ("/root", 1),
-                ("/Volumes/External SSD", 0),
-                ("/Volumes/Camera", 0),
-            ])
-        );
-
-        // Expand a nested node: depth 2 (hidden dirs and files excluded).
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/root"), cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            rows(&sidebar, cx),
-            expect(&[
-                ("/", 0),
-                ("/other", 1),
-                ("/root", 1),
-                ("/root/sub", 2),
-                ("/Volumes/External SSD", 0),
-                ("/Volumes/Camera", 0),
-            ])
-        );
-
-        // Collapse "/": the whole subtree re-flattens away…
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/"), cx)
-        });
-        assert_eq!(
-            rows(&sidebar, cx),
-            expect(&[
-                ("/", 0),
-                ("/Volumes/External SSD", 0),
-                ("/Volumes/Camera", 0),
-            ])
-        );
-
-        // …and re-expanding restores it instantly from cached children,
-        // including the still-expanded nested node.
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/"), cx)
-        });
-        assert_eq!(
-            rows(&sidebar, cx),
-            expect(&[
-                ("/", 0),
-                ("/other", 1),
-                ("/root", 1),
-                ("/root/sub", 2),
-                ("/Volumes/External SSD", 0),
-                ("/Volumes/Camera", 0),
-            ])
-        );
-    }
-
-    // §6 invalidation: the tree caches child listings, and the only news it
-    // gets about external changes is the active pane's watcher batch
-    // (Pane → PaneEvent::DirsChanged → Workspace → Sidebar).
-    #[gpui::test]
-    fn external_change_invalidates_the_cached_tree_children(cx: &mut TestAppContext) {
-        let vfs = init_test(cx);
-        let (workspace, cx) = build_workspace(cx);
-        let sidebar = sidebar_of(&workspace, cx);
-
-        // The pane's watch is what observes /root.
-        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
-        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
-        cx.run_until_parked();
-
-        // "/root" is only a visible row once its parent volume is expanded.
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/"), cx)
-        });
-        cx.run_until_parked();
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/root"), cx)
-        });
-        cx.run_until_parked();
-        // The rows *inside* /root (depth 2 under the expanded volume root).
-        let child_rows = |cx: &mut VisualTestContext| {
-            sidebar.read_with(cx, |sidebar, _| {
-                sidebar
-                    .flat_rows()
-                    .iter()
-                    .filter(|row| row.path.parent() == Some(Path::new("/root")))
-                    .map(|row| row.path.to_path_buf())
-                    .collect::<Vec<_>>()
-            })
-        };
-        assert_eq!(child_rows(cx), vec![PathBuf::from("/root/sub")]);
-
-        // A folder appears in /root behind the app's back.
-        vfs.insert_dir("/root/newdir");
-        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
-        cx.run_until_parked();
-
-        assert_eq!(
-            child_rows(cx),
-            vec![PathBuf::from("/root/newdir"), PathBuf::from("/root/sub")],
-            "the expanded node re-listed instead of keeping its stale children"
-        );
-
-        // A collapsed node's cache is dropped too: re-expanding re-lists.
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/root"), cx)
-        });
-        cx.run_until_parked();
-        vfs.insert_dir("/root/later");
-        cx.executor().advance_clock(crate::pane::WATCH_LATENCY);
-        cx.run_until_parked();
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar.toggle_expanded(Path::new("/root"), cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            child_rows(cx),
-            vec![
-                PathBuf::from("/root/later"),
-                PathBuf::from("/root/newdir"),
-                PathBuf::from("/root/sub")
-            ],
-        );
-    }
-
     // Regression: `settings::init` swaps the disk-loaded global in from a
     // background task *after* the sidebar's first paint — the sidebar must
     // observe the global and repaint, or boot-persisted favorites stay
@@ -1537,6 +1427,312 @@ mod tests {
             );
             sidebar.toggle_section(Section::Devices, cx);
             assert!(!sidebar.section_collapsed(Section::Devices));
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // M7d-b: Locations, seeded Favorites, Recents, and the two-level rule
+    // ------------------------------------------------------------------
+
+    fn location_names(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) -> Vec<String> {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar.locations().iter().map(|l| l.name.clone()).collect()
+        })
+    }
+
+    /// The section the M7d brief asked for, resolved against the fixture's
+    /// Mac-shaped home and in the order a person reads it.
+    #[gpui::test]
+    fn locations_resolve_from_the_home_directory(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            location_names(&sidebar, cx),
+            vec![
+                "iCloud Drive".to_string(),
+                "OneDrive - Test Ltd".to_string(),
+                "me".to_string(),
+                "Network".to_string(),
+                "Trash".to_string(),
+            ],
+        );
+    }
+
+    /// Clicking a location navigates the active pane, like every other row —
+    /// the sidebar emits, the workspace acts (§2).
+    #[gpui::test]
+    fn clicking_a_location_navigates_the_active_pane(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let target = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .locations()
+                .iter()
+                .find(|l| l.kind == LocationKind::Home)
+                .expect("a Home location")
+                .path
+                .clone()
+        });
+        sidebar.update(cx, |sidebar, cx| sidebar.open_path(target.clone(), cx));
+        cx.run_until_parked();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.path().map(Path::to_path_buf)),
+            Some(target),
+        );
+    }
+
+    /// A fresh profile gets the defaults — and only the ones that exist. The
+    /// fixture has Desktop and Documents but deliberately no Downloads.
+    #[gpui::test]
+    fn a_fresh_profile_is_seeded_with_the_defaults_that_exist(cx: &mut TestAppContext) {
+        let _vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).favorites(),
+                [
+                    PathBuf::from("/home/me/Desktop"),
+                    PathBuf::from("/home/me/Documents"),
+                ],
+                "Downloads is absent from the fixture, so it must not be pinned"
+            );
+            assert!(AppSettings::global(cx).favorites_seeded());
+        });
+    }
+
+    /// The M7d brief's own words — "so emptying them stays empty". Seeding is
+    /// guarded by the flag, not by the list being empty, so unpinning
+    /// everything survives the next launch.
+    #[gpui::test]
+    fn unpinning_every_seeded_favorite_survives_a_relaunch(cx: &mut TestAppContext) {
+        let _vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        for path in [
+            PathBuf::from("/home/me/Desktop"),
+            PathBuf::from("/home/me/Documents"),
+        ] {
+            sidebar.update(cx, |sidebar, cx| sidebar.remove_favorite(&path, cx));
+        }
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(AppSettings::global(cx).favorites().is_empty()));
+
+        // A second sidebar is the next launch: same settings global, same
+        // seeded flag, and it must not re-pin anything.
+        let (workspace2, cx) = build_workspace(cx);
+        let _sidebar2 = sidebar_of(&workspace2, cx);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(
+                AppSettings::global(cx).favorites().is_empty(),
+                "the user emptied them deliberately; a relaunch must not argue"
+            );
+        });
+    }
+
+    /// Recents is written by the **workspace** off `PaneEvent::Navigated`, so
+    /// this drives a real navigation rather than calling `push_recent`.
+    #[gpui::test]
+    fn navigating_records_a_recent_most_recent_first(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        for dir in ["/root", "/other", "/root/sub"] {
+            pane.update(cx, |pane, cx| pane.navigate_to(Path::new(dir), cx));
+            cx.run_until_parked();
+        }
+
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).recents(),
+                [
+                    PathBuf::from("/root/sub"),
+                    PathBuf::from("/other"),
+                    PathBuf::from("/root"),
+                ],
+                "most recent first"
+            );
+        });
+    }
+
+    /// An in-place reload is not a navigation. Re-entering the folder the pane
+    /// is already in must not push a duplicate — this is the guard on
+    /// `path_changed` in `Pane::load`, checked end to end.
+    #[gpui::test]
+    fn re_entering_the_same_folder_does_not_duplicate_a_recent(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        for _ in 0..3 {
+            pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+            cx.run_until_parked();
+        }
+
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).recents(),
+                [PathBuf::from("/root")],
+                "one entry, not three"
+            );
+        });
+    }
+
+    /// The two-level rule, as a compile-and-behavior check rather than a
+    /// comment: the sidebar exposes no way to expand anything. If a future
+    /// change reintroduces a tree, this section list is where it shows up.
+    #[gpui::test]
+    fn every_section_collapses_independently(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let sections = [
+            Section::Devices,
+            Section::Locations,
+            Section::Favorites,
+            Section::Recents,
+            Section::Tags,
+        ];
+        sidebar.update(cx, |sidebar, cx| {
+            for section in sections {
+                assert!(
+                    !sidebar.section_collapsed(section),
+                    "{section:?} starts open"
+                );
+                sidebar.toggle_section(section, cx);
+                assert!(sidebar.section_collapsed(section));
+            }
+            // All five collapsed at once: nothing is pinned, nothing is
+            // `flex_1`, so the column is just five headers.
+            for section in sections {
+                assert!(sidebar.section_collapsed(section));
+                sidebar.toggle_section(section, cx);
+                assert!(!sidebar.section_collapsed(section));
+            }
+        });
+    }
+
+    /// Collapsing a section moves the ones below it **up** — the behavior the
+    /// M7d brief asked for by name, and the thing M7c's `flex_1` folder tree
+    /// made impossible (it ate the spare height and pinned Tags to the bottom
+    /// edge). Asserted on painted geometry, not on the section list.
+    #[gpui::test]
+    fn collapsing_a_section_moves_the_ones_below_it_up(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let before = bounds(cx, "sidebar-section-Tags").origin.y;
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.toggle_section(Section::Devices, cx)
+        });
+        cx.run_until_parked();
+        let after = bounds(cx, "sidebar-section-Tags").origin.y;
+
+        assert!(
+            after < before,
+            "Tags should rise when Devices collapses, but went {before:?} -> {after:?}"
+        );
+    }
+
+    /// **Regression (M7d-b).** Neither startup writer may touch settings
+    /// before the initial load has landed.
+    ///
+    /// Why this matters is documented on `AppSettings::loaded` and pinned by
+    /// `settings::tests::a_write_inside_the_load_window_discards_the_file`:
+    /// a write inside that window makes `init_with_path` discard the entire
+    /// on-disk file, and the following `save` persists defaults over it. On a
+    /// real profile that silently deleted a saved `Graphite Light`.
+    ///
+    /// The window cannot be reproduced through `build_workspace` — it parks
+    /// the executor, so the load has always landed by the time a test can
+    /// navigate. So this puts the global *back* into the not-yet-loaded state
+    /// and drives both writers at it: the sidebar's seeding (via the settings
+    /// observer) and the workspace's Recents (via a real navigation).
+    #[gpui::test]
+    fn neither_startup_writer_touches_settings_before_the_load_lands(cx: &mut TestAppContext) {
+        let _vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        // Back into the boot window: a fresh global holds defaults and has not
+        // loaded. Replacing it also notifies the sidebar's observer, which is
+        // one of the two writers under test.
+        cx.update(|_, cx| {
+            cx.set_global(AppSettings::new(PathBuf::from(SETTINGS_PATH)));
+            assert!(!AppSettings::global(cx).is_loaded());
+        });
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let settings = AppSettings::global(cx);
+            assert!(
+                settings.recents().is_empty(),
+                "Recents must not be recorded before the load lands: {:?}",
+                settings.recents(),
+            );
+            assert!(
+                !settings.favorites_seeded(),
+                "seeding must wait for the load too"
+            );
+            assert_eq!(
+                settings.content(),
+                &crate::settings::SettingsContent::default(),
+                "nothing at all was written into the load window"
+            );
+        });
+    }
+
+    /// And the gates delay the work rather than cancelling it: once the load
+    /// has landed, a fresh profile still gets seeded and navigation still
+    /// records.
+    #[gpui::test]
+    fn both_writers_resume_once_the_load_has_landed(cx: &mut TestAppContext) {
+        let _vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let settings = AppSettings::global(cx);
+            assert!(settings.favorites_seeded(), "seeding ran, just later");
+            assert_eq!(
+                settings.favorites(),
+                [
+                    PathBuf::from("/home/me/Desktop"),
+                    PathBuf::from("/home/me/Documents"),
+                ],
+            );
+            assert_eq!(settings.recents(), [PathBuf::from("/root")]);
         });
     }
 }

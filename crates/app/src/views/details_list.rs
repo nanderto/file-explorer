@@ -311,6 +311,21 @@ fn render_row(
         }))
         .child(div().w(px(row.depth as f32 * DISCLOSURE_WIDTH)).flex_none())
         .child(disclosure)
+        // M7d-b: the type icon. The list view had none at all — the only
+        // thing distinguishing a folder row from a file row was a disclosure
+        // chevron, which a *search result* folder does not get (M6a), so in
+        // search results the two were indistinguishable.
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .mr(px(6.0))
+                .child(crate::icons::icon(
+                    crate::icons::entry_icon(entry.is_dir_like()),
+                    theme.muted,
+                )),
+        )
         .child(
             // Name, and — for a search hit from another folder (M6a) — the
             // folder it is in, muted and beside the name. Explorer devotes a
