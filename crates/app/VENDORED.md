@@ -41,12 +41,14 @@ of a dependency update.
 - **Source**: https://github.com/lucide-icons/lucide — the `lucide-static` npm
   package's `icons/` folder, fetched from
   `https://unpkg.com/lucide-static@1.44.0/icons/<name>.svg`
-- **Revision**: `lucide-static@1.44.0` (fetched 2026-09-11)
+- **Revision**: `lucide-static@1.44.0` (fetched 2026-09-11; extended
+  with six more icons for the M7d-b sidebar rows on the same date and from
+  the same package version)
 - **License**: ISC — `assets/icons/LICENSE` is the upstream text, fetched from
   the same package. (Plan §7's M7d entry says "MIT-licensed (Lucide/Feather)";
   Lucide is ISC, which is the same permissive shape — attribution retained,
   no copyleft — so it was taken as written rather than swapped for Feather.)
-- **Local modifications**: **none.** The fourteen SVGs are byte-for-byte as
+- **Local modifications**: **none.** All twenty-one SVGs are byte-for-byte as
   published, so re-vendoring is a re-download and never a merge. Each carries
   its own `<!-- @license lucide-static v1.44.0 - ISC -->` header, which is how
   a stale copy is spotted.

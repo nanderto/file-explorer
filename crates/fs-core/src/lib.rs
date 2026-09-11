@@ -38,6 +38,7 @@ pub mod clipboard;
 pub mod entry;
 pub mod exec;
 pub mod listing;
+pub mod locations;
 pub mod ops;
 pub mod platform;
 pub mod search;
@@ -58,6 +59,9 @@ pub use exec::{Spawner, SpawnerExt};
 pub use listing::{
     ListingCache, ListingPatch, ListingSnapshot, ResolvedBatch, list_dir, patch_listing,
     resolve_watch_batch,
+};
+pub use locations::{
+    Location, LocationKind, fixed_candidates, onedrive_candidates, resolve_locations,
 };
 pub use ops::{
     Conflict, ConflictChoice, FileOp, JobEvent, JobId, JobInfo, JobKind, JobQueue, OpReceipt,

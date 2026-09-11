@@ -42,6 +42,11 @@ use crate::watch_guard::BackgroundWatchGuard;
 /// chmod) and one reload per burst is enough.
 pub const SETTINGS_WATCH_LATENCY: Duration = Duration::from_millis(150);
 
+/// How many recent folders the sidebar keeps. Finder shows a comparable
+/// handful; the section has to stay scannable at a glance, and the sidebar is
+/// not a history browser (that is what `cmd-[` is for).
+pub const MAX_RECENTS: usize = 10;
+
 /// The complete document. Compiled in, so a setting always has a value.
 const DEFAULTS_JSON: &str = include_str!("../settings/defaults.json");
 
@@ -52,6 +57,16 @@ const DEFAULTS_JSON: &str = include_str!("../settings/defaults.json");
 pub struct SettingsContent {
     /// Sidebar favorites, in display order.
     pub favorites: Vec<PathBuf>,
+    /// Whether the default Favorites have ever been seeded (M7d-b).
+    ///
+    /// A flag rather than "is `favorites` empty?", because those are
+    /// different questions: a user who unpins everything *means* it, and
+    /// re-seeding on the next launch would be the app arguing with them. Once
+    /// true it stays true.
+    pub favorites_seeded: bool,
+    /// Recently visited folders, most recent first (M7d-b). Capped at
+    /// [`MAX_RECENTS`]; every pane navigation pushes onto it.
+    pub recents: Vec<PathBuf>,
     /// The chosen theme: one name, or the light/dark pair that follows the
     /// system (plan §6's `appearance: system`).
     pub theme: ThemeSelection,
@@ -81,6 +96,8 @@ impl Default for SettingsContent {
 #[serde(default)]
 struct SettingsPartial {
     favorites: Option<Vec<PathBuf>>,
+    favorites_seeded: Option<bool>,
+    recents: Option<Vec<PathBuf>>,
     theme: Option<ThemeSelection>,
     confirm_delete_to_trash: Option<bool>,
     folders_first: Option<bool>,
@@ -92,6 +109,12 @@ impl SettingsPartial {
     fn merge_onto(self, mut base: SettingsContent, warnings: &mut Vec<String>) -> SettingsContent {
         if let Some(favorites) = self.favorites {
             base.favorites = favorites;
+        }
+        if let Some(seeded) = self.favorites_seeded {
+            base.favorites_seeded = seeded;
+        }
+        if let Some(recents) = self.recents {
+            base.recents = recents;
         }
         if let Some(theme) = self.theme {
             base.theme = theme;
@@ -256,6 +279,60 @@ impl AppSettings {
         true
     }
 
+    /// Seed the default Favorites **once** (M7d-b): the folders Finder pins
+    /// for a new user, filtered to the ones this machine actually has.
+    ///
+    /// Returns whether anything changed, so the caller knows to persist.
+    ///
+    /// The flag, not emptiness, is the guard. A user who unpins every favorite
+    /// has expressed a preference, and re-seeding on the next launch would be
+    /// the app overruling them — the M7d brief calls this out by name
+    /// ("so emptying them stays empty"). Seeding also *appends*, so a user who
+    /// already has favorites from an earlier version keeps them and their
+    /// order.
+    pub fn seed_favorites(&mut self, candidates: &[PathBuf]) -> bool {
+        if self.content.favorites_seeded {
+            return false;
+        }
+        self.content.favorites_seeded = true;
+        for candidate in candidates {
+            if !self.content.favorites.contains(candidate) {
+                self.content.favorites.push(candidate.clone());
+            }
+        }
+        // Always a change, even when every candidate was already pinned or
+        // none of them exist: the *flag* moved, and it has to reach disk or a
+        // machine with no default folders re-seeds on every launch forever.
+        true
+    }
+
+    /// Whether the defaults have been seeded.
+    pub fn favorites_seeded(&self) -> bool {
+        self.content.favorites_seeded
+    }
+
+    /// Recently visited folders, most recent first.
+    pub fn recents(&self) -> &[PathBuf] {
+        &self.content.recents
+    }
+
+    /// Record a visit (M7d-b). Most-recent-first, deduplicated, capped at
+    /// [`MAX_RECENTS`]. Returns whether the list changed, so a re-visit of the
+    /// folder already at the top costs no write.
+    ///
+    /// Dedup is by exact path and moves the entry to the front rather than
+    /// adding a second copy — a list where "Documents" appears four times is
+    /// a worse list, not a more accurate one.
+    pub fn push_recent(&mut self, path: PathBuf) -> bool {
+        if self.content.recents.first() == Some(&path) {
+            return false;
+        }
+        self.content.recents.retain(|p| p != &path);
+        self.content.recents.insert(0, path);
+        self.content.recents.truncate(MAX_RECENTS);
+        true
+    }
+
     /// Reorder the favorites (M3 drag-to-reorder, the gap M2 deferred): move
     /// `path` so it sits immediately **before** `before`, or to the end when
     /// `before` is `None`. Path-keyed on both sides like every other identity
@@ -357,6 +434,15 @@ fn user_overrides(content: &SettingsContent) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     if content.favorites != defaults.favorites {
         map.insert("favorites".into(), serde_json::json!(content.favorites));
+    }
+    if content.favorites_seeded != defaults.favorites_seeded {
+        map.insert(
+            "favorites_seeded".into(),
+            serde_json::json!(content.favorites_seeded),
+        );
+    }
+    if content.recents != defaults.recents {
+        map.insert("recents".into(), serde_json::json!(content.recents));
     }
     if content.theme != defaults.theme {
         map.insert("theme".into(), serde_json::json!(content.theme));
@@ -871,5 +957,160 @@ mod tests {
                 "favorites survive restart"
             );
         });
+    }
+
+    // ------------------------------------------------------------------
+    // M7d-b: seeded default Favorites, and Recents
+    // ------------------------------------------------------------------
+
+    fn settings() -> AppSettings {
+        AppSettings::new(PathBuf::from("/config/settings.json"))
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn seeding_pins_the_defaults_on_a_fresh_profile() {
+        let mut s = settings();
+        assert!(!s.favorites_seeded());
+        assert!(s.seed_favorites(&paths(&[
+            "/Users/me/Desktop",
+            "/Users/me/Documents",
+            "/Users/me/Downloads",
+        ])));
+        assert_eq!(
+            s.favorites(),
+            paths(&[
+                "/Users/me/Desktop",
+                "/Users/me/Documents",
+                "/Users/me/Downloads"
+            ])
+            .as_slice(),
+            "seeded in the order given, which is the order they are shown"
+        );
+        assert!(s.favorites_seeded());
+    }
+
+    /// The point of the flag, and the M7d brief's actual words: "so emptying
+    /// them stays empty". A user who unpins everything has expressed a
+    /// preference; re-seeding on the next launch is the app overruling them.
+    #[test]
+    fn emptying_the_favorites_stays_empty_across_a_reseed() {
+        let mut s = settings();
+        s.seed_favorites(&paths(&["/Users/me/Desktop", "/Users/me/Documents"]));
+        for path in paths(&["/Users/me/Desktop", "/Users/me/Documents"]) {
+            s.remove_favorite(&path);
+        }
+        assert!(s.favorites().is_empty());
+
+        // The next launch seeds again — and must change nothing.
+        assert!(
+            !s.seed_favorites(&paths(&["/Users/me/Desktop", "/Users/me/Documents"])),
+            "a second seed is a no-op and must not ask to be persisted"
+        );
+        assert!(
+            s.favorites().is_empty(),
+            "the user emptied them deliberately; they stay empty"
+        );
+    }
+
+    /// Seeding appends rather than replaces, so a profile that predates the
+    /// defaults keeps what it had — and keeps it *first*.
+    #[test]
+    fn seeding_preserves_favorites_that_were_already_there() {
+        let mut s = settings();
+        s.add_favorite(PathBuf::from("/Users/me/Projects"));
+        s.seed_favorites(&paths(&["/Users/me/Desktop", "/Users/me/Projects"]));
+        assert_eq!(
+            s.favorites(),
+            paths(&["/Users/me/Projects", "/Users/me/Desktop"]).as_slice(),
+            "the existing pin keeps its slot and is not duplicated"
+        );
+    }
+
+    /// A machine with none of the default folders must not retry forever:
+    /// the flag has to move (and be persisted) even when nothing was added.
+    #[test]
+    fn seeding_nothing_still_marks_the_profile_seeded() {
+        let mut s = settings();
+        assert!(
+            s.seed_favorites(&[]),
+            "the flag moved, so this must ask to be persisted"
+        );
+        assert!(s.favorites_seeded());
+        assert!(!s.seed_favorites(&paths(&["/Users/me/Desktop"])));
+        assert!(
+            s.favorites().is_empty(),
+            "the second call is a no-op, defaults or not"
+        );
+    }
+
+    #[test]
+    fn recents_are_most_recent_first_and_deduplicated() {
+        let mut s = settings();
+        assert!(s.push_recent(PathBuf::from("/a")));
+        assert!(s.push_recent(PathBuf::from("/b")));
+        assert!(s.push_recent(PathBuf::from("/c")));
+        assert_eq!(s.recents(), paths(&["/c", "/b", "/a"]).as_slice());
+
+        // Re-visiting moves it to the front rather than adding a second copy:
+        // a list where one folder appears three times is a worse list.
+        assert!(s.push_recent(PathBuf::from("/a")));
+        assert_eq!(s.recents(), paths(&["/a", "/c", "/b"]).as_slice());
+    }
+
+    /// Navigating to the folder already on top is the commonest case there is
+    /// (a refresh, a sort flip, a pane re-focus). It must not cost a write.
+    #[test]
+    fn revisiting_the_newest_recent_changes_nothing() {
+        let mut s = settings();
+        s.push_recent(PathBuf::from("/a"));
+        assert!(
+            !s.push_recent(PathBuf::from("/a")),
+            "already at the front — no change, so no persist"
+        );
+        assert_eq!(s.recents(), paths(&["/a"]).as_slice());
+    }
+
+    #[test]
+    fn recents_are_capped() {
+        let mut s = settings();
+        for i in 0..(MAX_RECENTS + 5) {
+            s.push_recent(PathBuf::from(format!("/dir{i}")));
+        }
+        assert_eq!(s.recents().len(), MAX_RECENTS);
+        assert_eq!(
+            s.recents()[0],
+            PathBuf::from(format!("/dir{}", MAX_RECENTS + 4)),
+            "newest first"
+        );
+        assert!(
+            !s.recents().contains(&PathBuf::from("/dir0")),
+            "the oldest fell off the end"
+        );
+    }
+
+    /// Both new keys are round-tripped through the override writer, and both
+    /// stay out of the file while they hold their default.
+    #[test]
+    fn the_new_keys_are_written_only_when_they_differ() {
+        let mut s = settings();
+        assert_eq!(
+            user_overrides(s.content()),
+            serde_json::json!({}),
+            "a pristine profile writes nothing"
+        );
+        s.seed_favorites(&paths(&["/Users/me/Desktop"]));
+        s.push_recent(PathBuf::from("/Users/me/Desktop"));
+        assert_eq!(
+            user_overrides(s.content()),
+            serde_json::json!({
+                "favorites": ["/Users/me/Desktop"],
+                "favorites_seeded": true,
+                "recents": ["/Users/me/Desktop"],
+            }),
+        );
     }
 }

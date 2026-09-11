@@ -7,7 +7,7 @@
 //! runs on gpui's (test-controllable) clock and every blocking call runs on
 //! the background thread pool — the UI thread never touches the disk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,16 @@ pub struct FsContext {
     /// The cut/copy file clipboard (ARCHITECTURE.md §2/§6): a plain struct —
     /// cut membership drives render dimming; paste turns it into a `FileOp`.
     pub clipboard: FileClipboard,
+    /// The user's home directory (M7d-b).
+    ///
+    /// A field rather than an `env::home_dir()` call at each use site,
+    /// because everything that reads it — the sidebar's Locations, the seeded
+    /// Favorites, `main`'s boot navigation — has to resolve *inside the
+    /// fixture tree* under `#[gpui::test]` and in the visual runner. With the
+    /// env call inline, those would look for `/Users/<someone>` in a `FakeVfs`
+    /// that only contains `/home`, find nothing, and render an empty
+    /// Locations section into a baseline that looks plausible.
+    pub home: PathBuf,
 }
 
 impl Global for FsContext {}
@@ -120,8 +130,15 @@ pub fn install(
         undo,
         jobs: jobs.clone(),
         clipboard: FileClipboard::default(),
+        home: default_home(),
     });
     jobs
+}
+
+/// The real home directory, or `/` where the platform will not say. Tests and
+/// the visual runner overwrite `FsContext::home` after `install`.
+pub fn default_home() -> PathBuf {
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Install the real [`FsContext`] (RealVfs over the app's background

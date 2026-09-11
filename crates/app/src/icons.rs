@@ -46,8 +46,21 @@ pub enum Icon {
     ChevronUp,
     /// A checked state: a context-menu tick, a settings checkbox.
     Check,
-    /// A folder, where no thumbnail is available.
+    /// A folder, where no thumbnail is available; also a Favorites or
+    /// Recents row.
     Folder,
+    /// A mounted volume (a Devices row).
+    Drive,
+    /// A cloud sync root — iCloud Drive, OneDrive.
+    Cloud,
+    /// The user's home folder.
+    Home,
+    /// `/Network`.
+    Network,
+    /// The Trash.
+    Trash,
+    /// Recently visited (the Recents section header's idea, not its rows).
+    Clock,
     /// A file of no particular kind, where no thumbnail is available.
     File,
     /// Unmount an ejectable volume.
@@ -79,6 +92,12 @@ impl Icon {
             Icon::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),
             Icon::Check => include_bytes!("../assets/icons/check.svg"),
             Icon::Folder => include_bytes!("../assets/icons/folder.svg"),
+            Icon::Drive => include_bytes!("../assets/icons/hard-drive.svg"),
+            Icon::Cloud => include_bytes!("../assets/icons/cloud.svg"),
+            Icon::Home => include_bytes!("../assets/icons/house.svg"),
+            Icon::Network => include_bytes!("../assets/icons/globe.svg"),
+            Icon::Trash => include_bytes!("../assets/icons/trash-2.svg"),
+            Icon::Clock => include_bytes!("../assets/icons/clock.svg"),
             Icon::File => include_bytes!("../assets/icons/file.svg"),
             Icon::Eject => include_bytes!("../assets/icons/eject.svg"),
             Icon::Close => include_bytes!("../assets/icons/x.svg"),
@@ -100,6 +119,12 @@ impl Icon {
         Icon::ChevronUp,
         Icon::Check,
         Icon::Folder,
+        Icon::Drive,
+        Icon::Cloud,
+        Icon::Home,
+        Icon::Network,
+        Icon::Trash,
+        Icon::Clock,
         Icon::File,
         Icon::Eject,
         Icon::Close,

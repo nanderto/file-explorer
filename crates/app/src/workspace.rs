@@ -236,9 +236,11 @@ impl Workspace {
         workspace
     }
 
-    /// The sidebar tree caches child listings of its own, so an external
-    /// change a pane's watcher reported has to reach it too (§6: cached child
-    /// listings must not survive a change to the folder they came from).
+    /// Pane events the workspace acts on. Note what is *not* here any more:
+    /// through M7c this forwarded `DirsChanged` to the sidebar, whose folder
+    /// tree cached child listings that a watcher batch could invalidate. M7d-b
+    /// deleted that tree — the sidebar has no cached listings left to go
+    /// stale, so the arm is now a deliberate no-op rather than a missing case.
     fn handle_pane_event(
         &mut self,
         pane: &Entity<Pane>,
@@ -247,10 +249,23 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            PaneEvent::DirsChanged(dirs) => {
-                let dirs = dirs.clone();
-                self.sidebar
-                    .update(cx, |sidebar, cx| sidebar.invalidate_children(&dirs, cx));
+            // Nothing in the sidebar caches a directory listing any more
+            // (M7d-b); the pane has already patched its own.
+            PaneEvent::DirsChanged(_) => {}
+            // M7d-b: the sidebar's Recents. Recorded here rather than in the
+            // pane because the list is one per *app*, not one per pane — a
+            // split workspace has two panes navigating into a single history.
+            PaneEvent::Navigated(path) => {
+                let path = path.clone();
+                let changed =
+                    cx.update_global::<AppSettings, bool>(|settings, _| settings.push_recent(path));
+                // Re-entering the folder already at the top is the commonest
+                // navigation there is; `push_recent` reports it as no change
+                // so it costs no disk write.
+                if changed {
+                    AppSettings::global(cx).save(cx);
+                    self.sidebar.update(cx, |_, cx| cx.notify());
+                }
             }
             // Focus landed anywhere inside a pane, so that pane becomes the
             // one every workspace-level command targets (M4 dual pane).

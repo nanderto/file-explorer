@@ -67,6 +67,16 @@ pub enum PaneEvent {
     /// delete-permanently, sidebar navigation) targets the pane the user is
     /// actually working in rather than pane 0 (M4 dual pane).
     FocusIn,
+    /// This pane actually **left** one folder for another (M7d-b), which is
+    /// what the sidebar's Recents records.
+    ///
+    /// Emitted from `load`, the single funnel every navigation goes through —
+    /// `navigate_to`, `go_up`, `go_back`, `go_forward` and a double-click all
+    /// end there, so there is one place to get this right. Guarded on the same
+    /// `path_changed` the rename/search/tag-filter teardown uses, so an
+    /// in-place reload (refresh, sort flip, hidden-files toggle) does **not**
+    /// re-record the folder the user is already standing in.
+    Navigated(PathBuf),
 }
 
 /// One history slot: where we were **and** what it looked like — back/forward
@@ -559,6 +569,9 @@ impl Pane {
             // listing, so it means nothing in the next one (see `crate::tags`
             // on the deviation from Finder's volume-wide query).
             self.cancel_tag_filter_for_navigation(cx);
+        }
+        if path_changed {
+            cx.emit(PaneEvent::Navigated(path.to_path_buf()));
         }
         self.generation += 1;
         let generation = self.generation;
