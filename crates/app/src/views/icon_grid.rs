@@ -409,13 +409,11 @@ fn tile_image(
             .bg(theme
                 .accent
                 .opacity(if entry.is_dir_like() { 0.20 } else { 0.10 }))
-            .text_size(px(20.0))
-            .text_color(theme.muted)
-            .child(SharedString::new_static(if entry.is_dir_like() {
-                "▣"
-            } else {
-                "▢"
-            }))
+            .child(crate::icons::sized_icon(
+                crate::icons::entry_icon(entry.is_dir_like()),
+                px(ICON_PX * 0.6),
+                theme.muted,
+            ))
             .into_any_element(),
     }
 }

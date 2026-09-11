@@ -652,10 +652,18 @@ fn render_command(
             div()
                 .w(px(MENU_GUTTER))
                 .flex_none()
-                .child(SharedString::new_static(if command.checked {
-                    "✓"
-                } else {
-                    ""
+                .flex()
+                .items_center()
+                .children(command.checked.then(|| {
+                    crate::icons::sized_icon(
+                        crate::icons::Icon::Check,
+                        px(crate::icons::SMALL_ICON_PX),
+                        if command.enabled {
+                            theme.text
+                        } else {
+                            theme.muted
+                        },
+                    )
                 })),
         )
         .children(
@@ -726,8 +734,13 @@ fn render_submenu_row(
         .child(
             div()
                 .flex_none()
-                .text_color(theme.muted)
-                .child(SharedString::new_static("▸")),
+                .flex()
+                .items_center()
+                .child(crate::icons::sized_icon(
+                    crate::icons::Icon::ChevronRight,
+                    px(crate::icons::SMALL_ICON_PX),
+                    theme.muted,
+                )),
         );
 
     if open {

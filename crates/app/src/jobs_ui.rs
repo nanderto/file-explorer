@@ -94,14 +94,20 @@ impl JobsIndicator {
                                             .debug_selector(|| format!("job-cancel-{ix}"))
                                             .px(px(4.0))
                                             .rounded(px(3.0))
-                                            .text_size(px(11.0))
-                                            .text_color(theme.muted)
+                                            .flex()
+                                            .items_center()
                                             .cursor_pointer()
-                                            .hover(|s| s.text_color(theme.error))
                                             .on_click(cx.listener(move |_, _, _, cx| {
                                                 jobs.read(cx).cancel_job(id);
                                             }))
-                                            .child(SharedString::new_static("✕")),
+                                            .child(
+                                                crate::icons::sized_icon(
+                                                    crate::icons::Icon::Close,
+                                                    px(crate::icons::SMALL_ICON_PX),
+                                                    theme.muted,
+                                                )
+                                                .hover(|s| s.text_color(theme.error)),
+                                            ),
                                     ),
                             )
                             // Progress bar: track + accent fill.

@@ -936,9 +936,11 @@ impl InfoPanel {
                         .h(px(96.0))
                         .rounded(px(4.0))
                         .bg(theme.accent.opacity(if folder { 0.20 } else { 0.10 }))
-                        .text_size(px(34.0))
-                        .text_color(theme.muted)
-                        .child(SharedString::new_static(if folder { "▣" } else { "▢" })),
+                        .child(crate::icons::sized_icon(
+                            crate::icons::entry_icon(folder),
+                            px(48.0),
+                            theme.muted,
+                        )),
                 )
                 .into_any_element()
             }
@@ -970,11 +972,10 @@ impl InfoPanel {
             .hover(|s| s.bg(theme.accent.opacity(0.10)))
             .text_size(px(12.0))
             .child(SharedString::new_static(title))
-            .child(
-                div()
-                    .text_color(theme.muted)
-                    .child(SharedString::new_static(if open { "⌄" } else { "›" })),
-            )
+            .child(div().flex().items_center().child(crate::icons::icon(
+                crate::icons::disclosure(open),
+                theme.muted,
+            )))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if general {
                     this.toggle_general(cx);
@@ -1489,25 +1490,13 @@ fn perm_matrix(perms: Option<fs_core::UnixPerms>) -> [[bool; 3]; 3] {
 /// mode has been read; Hide Extension, Hidden and Locked pass `false` and are
 /// dimmed to [`DISABLED_ALPHA`], reading as disabled rather than dead.
 fn checkbox(theme: &Theme, checked: bool, live: bool) -> impl IntoElement + use<> {
-    let mut box_ = div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .w(px(13.0))
-        .h(px(13.0))
-        .rounded(px(3.0))
-        .border_1()
-        .border_color(theme.border);
     let alpha = if live { 1.0 } else { DISABLED_ALPHA };
-    if checked {
-        box_ = box_
-            .bg(theme.accent.opacity(alpha))
-            .text_size(px(9.0))
-            .text_color(theme.text.opacity(alpha))
-            .child(SharedString::new_static("✓"));
-    }
-    box_
+    crate::icons::check_box(
+        checked,
+        theme.border,
+        theme.accent.opacity(alpha),
+        theme.text.opacity(alpha),
+    )
 }
 
 /// A value, or the em dash the panel shows for "not known" — either because
