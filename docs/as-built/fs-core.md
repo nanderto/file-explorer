@@ -643,3 +643,10 @@ watching it belongs to the app (see
     include `/Volumes/<name>/.Trashes/<uid>`, which Finder's single Trash icon
     unions in. Pinned by `trash_is_the_boot_volumes_only` so it stays a
     recorded limit rather than a surprise.
+
+- `vfs.rs` (M7d-c): `FakeVfs::write_count(path)` — how many times a path has
+  been `atomic_write`-n, including calls that then failed via an injected
+  error, because the question it answers is "did we go to the disk". Test
+  observability for a property nothing else can express: content and mtime
+  assertions cannot distinguish "did not write" from "wrote identical bytes",
+  and reducing disk churn is exactly what the M7d-c code does.

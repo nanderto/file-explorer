@@ -686,11 +686,19 @@ impl Sidebar {
         if settings.favorites_seeded() {
             return;
         }
-        let changed = cx
-            .update_global::<AppSettings, bool>(|settings, _| settings.seed_favorites(&candidates));
-        if changed {
-            AppSettings::global(cx).save(cx);
-        }
+        // **Seeded in memory, never written here** (M7d-c). The seed is
+        // deterministic — the same defaults, filtered by the same existence
+        // check — so re-deriving it on each launch produces exactly the same
+        // rows. Persisting it would be a disk write at startup for a result
+        // the app can recompute for free.
+        //
+        // It reaches disk the first time the user changes anything, because
+        // `save` writes the whole document. That is also what keeps "emptying
+        // them stays empty" working: unpinning is a user change, so the empty
+        // list and the seeded flag persist together, and the next launch sees
+        // the flag and does not re-seed.
+        cx.update_global::<AppSettings, bool>(|settings, _| settings.seed_favorites(&candidates));
+        cx.notify();
     }
 
     /// What this machine has, as last resolved.
@@ -1734,5 +1742,116 @@ mod tests {
             );
             assert_eq!(settings.recents(), [PathBuf::from("/root")]);
         });
+    }
+
+    // ------------------------------------------------------------------
+    // M7d-c: no writes at startup, and Recents debounced
+    // ------------------------------------------------------------------
+
+    /// How many times the settings file has been written.
+    fn settings_writes(vfs: &Arc<FakeVfs>) -> usize {
+        vfs.write_count(Path::new(SETTINGS_PATH))
+    }
+
+    /// **Booting must not touch the disk.** Seeding is deterministic — the
+    /// same defaults filtered by the same existence check — so it is derived
+    /// in memory on every launch rather than persisted. A startup write buys
+    /// nothing and costs a disk round-trip on the one path where the app
+    /// should feel instant.
+    #[gpui::test]
+    fn a_fresh_profile_boots_without_writing_anything(cx: &mut TestAppContext) {
+        let vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let settings = AppSettings::global(cx);
+            assert!(
+                settings.favorites_seeded(),
+                "seeded in memory, so the rows are there"
+            );
+            assert_eq!(
+                settings.favorites(),
+                [
+                    PathBuf::from("/home/me/Desktop"),
+                    PathBuf::from("/home/me/Documents"),
+                ],
+            );
+        });
+        assert_eq!(
+            settings_writes(&vfs),
+            0,
+            "a fresh profile must reach a usable sidebar with no disk write"
+        );
+    }
+
+    /// And the seed still reaches disk — carried by the first change the user
+    /// actually makes, because `save` writes the whole document. This is what
+    /// keeps "emptying them stays empty" working without a startup write.
+    #[gpui::test]
+    fn the_seed_is_persisted_by_the_first_real_change(cx: &mut TestAppContext) {
+        let vfs = init_fresh_profile(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+        assert_eq!(settings_writes(&vfs), 0);
+
+        // The user unpins one. That is a real change, so it persists — and it
+        // carries the seeded flag and the surviving seeded row with it.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.remove_favorite(Path::new("/home/me/Desktop"), cx)
+        });
+        cx.run_until_parked();
+
+        assert!(settings_writes(&vfs) > 0, "a user change persists");
+        let written = persisted_favorites(&vfs);
+        assert_eq!(
+            written,
+            vec![PathBuf::from("/home/me/Documents")],
+            "the unpin and the surviving seeded row both reached disk"
+        );
+    }
+
+    /// **Browsing is a burst, and it must cost one write, not one per click.**
+    /// Four navigations used to be four full rewrites of settings.json, each a
+    /// temp file plus a rename, for a list only interesting once the user
+    /// stops moving.
+    #[gpui::test]
+    fn a_burst_of_navigation_costs_one_recents_write(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        let (workspace, cx) = build_workspace(cx);
+        let _sidebar = sidebar_of(&workspace, cx);
+        cx.run_until_parked();
+        let before = settings_writes(&vfs);
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        for dir in ["/root", "/other", "/root/sub", "/root"] {
+            pane.update(cx, |pane, cx| pane.navigate_to(Path::new(dir), cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            settings_writes(&vfs),
+            before,
+            "nothing written while the user is still moving"
+        );
+
+        // The list is live in memory the whole time — the debounce delays the
+        // *disk*, never the sidebar.
+        cx.update(|_, cx| {
+            assert_eq!(
+                AppSettings::global(cx).recents().first(),
+                Some(&PathBuf::from("/root")),
+            );
+        });
+
+        cx.executor()
+            .advance_clock(crate::workspace::RECENTS_FLUSH_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            settings_writes(&vfs),
+            before + 1,
+            "one write once it settles, not four"
+        );
     }
 }

@@ -56,6 +56,15 @@ pub const INFO_PANEL_MAX_WIDTH: f32 = 420.0;
 /// split is `cmd-shift-o`, not a gesture you can trigger by accident.
 pub const PANE_MIN_WIDTH: f32 = 240.0;
 /// Width of the invisible grab strip straddling each region border.
+/// How long Recents waits after the last navigation before it reaches disk
+/// (M7d-c).
+///
+/// Long enough that clicking through a folder tree is one write rather than
+/// one per click; short enough that quitting a second after you stop browsing
+/// still keeps the list. The write itself has always been on the background
+/// executor — this is about disk churn, not UI latency.
+pub const RECENTS_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
 const SPLITTER_HITBOX_WIDTH: f32 = 6.0;
 /// Height of the per-pane active marker painted above a split pane (M4).
 const PANE_MARKER_HEIGHT: f32 = 2.0;
@@ -168,6 +177,10 @@ pub struct Workspace {
     /// Repaints and fans out when `AppSettings` changes — see
     /// [`Workspace::settings_changed`].
     _settings_observer: Subscription,
+    /// The debounce behind Recents (M7d-c). Held, never detached (§5):
+    /// replacing it cancels the pending flush, which is exactly what a further
+    /// navigation should do.
+    _recents_flush: Option<gpui::Task<()>>,
     /// The system light/dark switch, for `appearance: system` themes.
     _appearance_observer: Subscription,
     _subscriptions: Vec<Subscription>,
@@ -229,6 +242,7 @@ impl Workspace {
             modal: None,
             _subscriptions: vec![sidebar_subscription, jobs_subscription],
             _settings_observer: settings_observer,
+            _recents_flush: None,
             _appearance_observer: appearance_observer,
         };
         // The panel opens describing the pane's state, not a stale default.
@@ -270,12 +284,30 @@ impl Workspace {
                 let changed =
                     cx.update_global::<AppSettings, bool>(|settings, _| settings.push_recent(path));
                 // Re-entering the folder already at the top is the commonest
-                // navigation there is; `push_recent` reports it as no change
-                // so it costs no disk write.
-                if changed {
-                    AppSettings::global(cx).save(cx);
-                    self.sidebar.update(cx, |_, cx| cx.notify());
+                // navigation there is; `push_recent` reports it as no change,
+                // so it costs nothing at all.
+                if !changed {
+                    return;
                 }
+                // The sidebar repaints straight away — the list is in memory
+                // and the user should see it move.
+                self.sidebar.update(cx, |_, cx| cx.notify());
+                // **The write is debounced** (M7d-c). Browsing is a burst:
+                // clicking through four folders used to be four full rewrites
+                // of settings.json, each a temp file plus a rename, for a list
+                // that is only interesting once the user stops moving. Each
+                // navigation replaces this task, cancelling the previous
+                // flush, so a session of clicking costs one write once it
+                // settles rather than one per click.
+                //
+                // Nothing is lost to a crash that a crash would not already
+                // lose: Recents is a convenience, and the folders are still
+                // there.
+                self._recents_flush = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(RECENTS_FLUSH_DELAY).await;
+                    this.update(cx, |_, cx| AppSettings::global(cx).save(cx))
+                        .ok();
+                }));
             }
             // Focus landed anywhere inside a pane, so that pane becomes the
             // one every workspace-level command targets (M4 dual pane).
