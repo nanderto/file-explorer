@@ -670,6 +670,14 @@ mod fake {
         next_mtime: u64,
         next_trash_id: u64,
         consumed_trash: std::collections::HashSet<TrashId>,
+        /// How many times each path has been `atomic_write`-n (M7d-c).
+        ///
+        /// Test observability for a property that is otherwise invisible:
+        /// "this did **not** touch the disk". Content and mtime assertions
+        /// cannot express it — a write that produces identical bytes is still
+        /// a write, and reducing disk churn is the whole point of the code
+        /// this exists to check.
+        write_counts: HashMap<PathBuf, usize>,
     }
 
     /// In-memory [`Vfs`] for tests: trees built from `serde_json::json!`
@@ -696,6 +704,20 @@ mod fake {
         pub fn insert_tree(&self, root: impl AsRef<Path>, tree: serde_json::Value) {
             let mut state = self.state.lock().unwrap();
             insert_tree_locked(&mut state, root.as_ref(), &tree);
+        }
+
+        /// How many times `atomic_write` has been called for `path`,
+        /// **including** calls that then failed via an injected error — the
+        /// question this answers is "did we go to the disk", not "did the
+        /// bytes land".
+        pub fn write_count(&self, path: impl AsRef<Path>) -> usize {
+            self.state
+                .lock()
+                .unwrap()
+                .write_counts
+                .get(path.as_ref())
+                .copied()
+                .unwrap_or(0)
         }
 
         /// Add (or overwrite) a file node and emit `Created`/`Changed`.
@@ -1314,6 +1336,7 @@ mod fake {
 
         async fn atomic_write(&self, path: &Path, data: Vec<u8>) -> Result<()> {
             let mut state = self.state.lock().unwrap();
+            *state.write_counts.entry(path.to_path_buf()).or_default() += 1;
             if let Some(message) = state.errors.get(path) {
                 return Err(anyhow!("{message}"));
             }

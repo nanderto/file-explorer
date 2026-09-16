@@ -1554,3 +1554,17 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   — including when the file is missing and including when the clobber guard
   declined to apply the load — because a writer waiting on it would otherwise
   wait forever. See the change log entry for what went wrong without it.
+
+- `settings.rs` (M7d-c): **the load is a merge.** `ChangedSinceBoot` records
+  which fields the running app has explicitly changed; `apply_loaded` takes the
+  file's value for every field it has not. This replaces the all-or-nothing
+  guard that discarded the entire loaded file whenever anything had touched the
+  global first — the M7d-b data-loss bug. Startup writers still gate on
+  `is_loaded()`, now as defence in depth rather than as the only protection.
+- `sidebar.rs` (M7d-c): seeding is **memory-only**. Deterministic, so it is
+  re-derived each launch rather than persisted, and reaches disk on the user's
+  first real change. A fresh profile boots with no disk write at all.
+- `workspace.rs` (M7d-c): the Recents write is **debounced** by
+  `RECENTS_FLUSH_DELAY` (3s), held in `_recents_flush` so a further navigation
+  cancels the pending flush. The sidebar repaints immediately; only the disk
+  waits.
