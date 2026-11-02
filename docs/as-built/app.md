@@ -1608,3 +1608,19 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   asked to launch — the only instrument covering menu → dispatch → platform.
   Plus 6 pure menu-shape tests (omission when nothing is discovered, ordering
   under `Open`, enabling rules, Terminal standing alone).
+
+- `open_with.rs` (M8, Launch Services): the cache is keyed by **type**
+  (`AppsKey::{Directory, Extension(Option<String>)}`), not loaded once, because
+  Launch Services' answer differs per file type. `request_external_apps`
+  prefetches every distinct type **visible in the projection**, capped at 32,
+  rather than only the selection — a right-click both *changes* the selection
+  and opens the menu in one gesture, so querying on selection change alone
+  leaves the first right-click on a new type with no `Open with ▸` at all. A
+  caught regression, not a precaution: the end-to-end menu-click test failed
+  exactly that way before the prefetch existed. Keying by type is what keeps it
+  cheap — a folder of a thousand `.rs` files is one query.
+- `context_menu.rs` (M8, Launch Services): `MenuFacts` gains `has_terminal`
+  alongside `external_apps`, because the terminal is discovered separately (it
+  is not a document handler). Application names are runtime strings, so
+  `sub_command_owned` joins `sub_command` for rows whose label is not
+  `&'static str`.

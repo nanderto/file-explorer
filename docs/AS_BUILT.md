@@ -22,6 +22,39 @@ Keep it truthful — these files are only useful if they match the code.
 
 ## Status
 
+**M8 (partial) — the Open with ▸ list is now the system's own.** The submenu is
+populated from **Launch Services**, macOS's equivalent of the registry keys a
+Windows installer writes: an application declares its document types in
+`Info.plist`, the system registers them at install, and `NSWorkspace` reads
+them back. Install an editor and it appears with no code change.
+
+* **Type-aware**, which a hard-coded list cannot be. Verified on the
+  development Mac: a `.rs` file offers Zed and VS Code, a folder offers seven
+  applications, a `.txt` offers eighteen — default handler first, as Finder
+  does it.
+* **The Space guarantee survives, and is now explicit.** Launch Services says
+  *which* applications can open a file; it never says *how to open a new window*
+  in one, and that is what keeps the window on the Space the user is looking at.
+  So the two are separated: `RECIPES` (Zed, VS Code) carry
+  `LaunchStrategy::NewWindow` and the guarantee; everything else gets
+  `SystemOpen`, which is best-effort and may switch Spaces — the same thing
+  Finder does. `keeps_current_space()` makes the difference legible instead of
+  a surprise.
+* **Verified end to end in the running app**: right-click a `.txt`, the
+  submenu lists eighteen real applications, click Zed — the Space does not
+  change and a new Zed window holding that file appears on it.
+* **De-duplication is load-bearing**, not hygiene: this machine reports
+  **three** Microsoft Edge bundles from updater staging directories.
+* **Terminals stay curated** (iTerm, Ghostty, WezTerm, Terminal, in that
+  preference order) because a terminal is not a document handler and never
+  appears in Launch Services' answer for a folder.
+* A prefetch of every **visible** type backs the menu, because a right-click
+  changes the selection and opens the menu in one gesture — there is no moment
+  to await in. Caught by the end-to-end test, which failed exactly that way
+  first.
+* Cost: a new `objc2-app-kit` dependency (`default-features = false`, one
+  feature), and therefore a full workspace rebuild.
+
 **M8 (partial) — Open with ▸ / Open Terminal Here, and "Open" finally opens.**
 Not a milestone, a feature landed ahead of M8's main lanes (see
 `docs/M8_PLAN.md`).
@@ -311,14 +344,26 @@ cache, the `Platform` trait with its macOS and stub impls.
   headless tests assert the rows exist and dispatch, so this is a pixel risk
   only. Note that `Tags ▸` has never been pinned open either; closing this
   means a `Setup` variant that opens a submenu, which would cover both.
-- **M8 open-with: the application set is closed and not configurable.** `Zed`,
-  `VsCode` and `Terminal` are compiled in, because each encodes *how to open a
-  new window in it*. A user with another editor (or iTerm/Ghostty instead of
-  Terminal) cannot add it without a code change. A settings-backed list, with
-  a per-app "new window" argument, is the honest fix.
-- **M8 open-with: discovery runs once per `DirView` and never re-probes.**
-  Installing Zed while the app is running leaves it absent until relaunch.
-  Cheap to fix (re-run on window focus) and not worth it until someone hits it.
+- **M8 open-with: the submenu can overflow the window.** A `.txt` offers
+  eighteen applications on this machine and the list runs off the bottom of a
+  760px window — there is no cap, no scrolling and no "Other…". Finder solves
+  this with a scrolling menu. Visible in the M8 verification screenshots.
+- **M8 open-with: a `SystemOpen` application may still switch Spaces, and the
+  menu does not say so.** `ExternalApp::keeps_current_space()` is computed and
+  carried, but nothing paints it yet. Marking those rows (or grouping the
+  guaranteed ones first) is a small UI step on an already-present fact.
+- **M8 open-with: `RECIPES` is compiled in.** Adding an editor that is not Zed
+  or VS Code means a code change to get the Space guarantee — the application
+  still *appears* (Launch Services finds it), it just falls back to
+  `SystemOpen`. A settings-backed recipe table, with a per-app new-window
+  argument, is the honest fix and is purely additive.
+- **M8 open-with: a type's answer is cached for the life of the `DirView`.**
+  Installing an application while the app is running leaves it absent from an
+  already-queried type until relaunch. Cheap to fix (invalidate on window
+  focus) and not worth it until someone hits it.
+- **M8 open-with: the visible-type prefetch is capped at 32 types.** A folder
+  with more distinct extensions than that leaves the surplus to be queried on
+  demand, which reintroduces the cold-first-right-click for those types.
 - **M7d-c: Recents can lose the last few seconds to a hard kill.** The write
   is debounced by `RECENTS_FLUSH_DELAY` (3s), so a crash or force-quit inside
   that window drops the folders visited in it. Deliberate: Recents is a
@@ -956,6 +1001,7 @@ component sections; this list is the scannable index.
 
 | Date | PR | Change |
 |---|---|---|
+| 2026-11-03 | — | **M8: the Open with ▸ list comes from Launch Services.** Replaces the compiled-in three-application set with the system's own registry — macOS's equivalent of the registry keys a Windows installer writes — so an application installed tomorrow appears with no code change, and the list is **type-aware** (a `.rs` offers two applications here, a folder seven, a `.txt` eighteen). The Space guarantee is what made this non-trivial: Launch Services says *which* applications can open a file but never *how to open a new window* in one, and the new window is the whole mechanism by which it lands on the Space the user is looking at. The two are therefore separated — `RECIPES` (Zed, VS Code) carry `LaunchStrategy::NewWindow`; everything else gets `SystemOpen`, best-effort, as Finder does. A recipe whose CLI is missing degrades rather than building a command that cannot spawn. `dedup_handlers` keeps one row per bundle id because this machine reports **three** Microsoft Edge bundles from updater staging directories. Terminals stay curated — a terminal is not a document handler, so Launch Services never lists one for a folder. The app-side cache is keyed by **type** and prefetches every visible type: a right-click changes the selection and opens the menu in one gesture, so querying only on selection change left the first right-click on a new type with no submenu at all — caught by the end-to-end test, which failed exactly that way. Costs a new `objc2-app-kit` dependency and so a full workspace rebuild. Verified in the running app: the submenu lists eighteen real applications, and clicking Zed opens the file in a new window **without changing Space**. +6 tests (679 total). |
 | 2026-11-02 | — | **M8 (partial): "Open with ▸ Zed / Visual Studio Code", "Open Terminal Here", and a real "Open".** New `fs-core/src/apps.rs` + three `Platform` methods (`external_apps`, `open_with`, `open_default`), new `crates/app/src/open_with.rs`, two new actions and four new context-menu rows. **The whole design turns on one macOS behavior**: Mission Control defaults to switching Spaces when an application is *activated*, so `open -a` drags the user to wherever the app already has windows. Asking the app for a **new window** instead (`zed -n`, `code -n`; `open -a <bundle> <dir>` for Terminal, which opens one anyway) puts it on the Space they are looking at — verified on the development Mac against all three with their windows on another Space. The flags are pinned by unit tests, including one whose only job is to fail if they are reduced back to `open -a`. The CLIs are addressed **inside the discovered bundle** rather than through `$PATH`, because a bundled `.app` does not inherit a login shell's `PATH`. Discovery lists only what is installed and **refuses a bundle whose CLI is missing**, since such a bundle cannot honour the new-window guarantee. Separately and unplanned: `app_state.rs` was still installing M1's `LoggingOpener` in the shipped app, so plain **"Open" did nothing** — a double-click, `enter` and the menu row all just printed to stderr. `PlatformOpener` fixes it. +33 tests (15 fs-core unit, 13 `#[gpui::test]`, 4 end-to-end menu-click, 6 menu-shape); `context_menu_open`'s baseline is stale and needs a runner regeneration. |
 | 2026-09-11 | — | **M7d-c: the load is a merge, and startup writes nothing.** Three changes, from the question "why are we writing at startup at all?". **(1) The clobber guard is gone.** `init_with_path` used to ask one all-or-nothing question — "is the content still exactly the defaults?" — and, if not, **discard the loaded file**, which is how M7d-b destroyed a real profile's saved theme. `apply_loaded` now merges field by field: a field the app has changed since boot keeps the app's value, every other field takes the file's. Nothing is discarded and nothing in flight is clobbered. Tracked by `ChangedSinceBoot`, set by each mutator. The test that pinned the hazard now pins the merge instead — `a_write_inside_the_load_window_keeps_both_it_and_the_file` asserts *both* halves, since the interesting property is that the in-flight change **and** the untouched fields survive together. **(2) Seeding never writes.** The seed is deterministic — the same defaults filtered by the same existence check — so it is derived in memory on every launch instead of persisted, and reaches disk only when the user next changes something (`save` writes the whole document). "Emptying them stays empty" still holds: unpinning is a user change, so the empty list and the seeded flag persist together. A brand-new profile now boots to a fully populated sidebar having written **nothing** — verified on a real Mac by deleting `settings.json` and launching. **(3) Recents is debounced** (`RECENTS_FLUSH_DELAY`, 3s). Clicking through four folders was four full rewrites of `settings.json`, each a temp file plus a rename, for a list only interesting once the user stops moving; it is now one write once they settle. The sidebar still repaints immediately — the debounce delays the *disk*, never the UI, and the write was already off the UI thread. `FakeVfs::write_count` is new, because "this did **not** touch the disk" is not expressible with content or mtime assertions: a write producing identical bytes is still a write. 631 tests, 5 new; both write-reduction tests were verified to fail when their fix is removed (4 writes instead of 1; 1 instead of 0). |
 | 2026-09-11 | — | **M7d-b fix: startup writes no longer destroy the settings file.** Found by running the app against a real profile rather than a fixture. `settings::init_with_path` seeds the global with defaults, loads the file in the background, and **declines to apply that load if the content changed meanwhile** — so a write inside that window makes the whole file be discarded and the defaults persisted over it. M7d-b added two writers that fire exactly there: the sidebar's favorites seeding, and the workspace's Recents (because `main` navigates to home immediately at boot). The result was a silently deleted `"theme": "Graphite Light"` and a lost favorite. `AppSettings::is_loaded()` is new and gates both; the sidebar's seeding is retried from the settings observer so whichever of the two startup conditions resolves last performs it — and reads `favorites_seeded()` before `update_global`, because `update_global` notifies the observer it is called from and the unconditional version recursed forever. 628 tests, 4 more: the hazard itself is pinned at the settings layer (`a_write_inside_the_load_window_discards_the_file`, which asserts the *unfixed* behavior honestly so nobody mistakes `is_loaded` for something the module enforces), and the gates are pinned at the call sites (`neither_startup_writer_touches_settings_before_the_load_lands`, verified to fail with either gate removed). |

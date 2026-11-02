@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{Platform, VolumeId, VolumeInfo};
-use crate::apps::{AppKind, ExternalApp};
+use crate::apps::{ExternalApp, LaunchStrategy};
 use crate::attrs::{FileAttrs, UnixPerms};
 use crate::tags::{Tag, standard_tags};
 use crate::thumbnail::{Thumbnail, validate_px};
@@ -49,13 +49,20 @@ pub struct StubPlatform {
     launches: Mutex<Vec<StubLaunch>>,
 }
 
-/// One recorded launch request. [`StubLaunch::app`] is `None` for the plain
-/// "Open" that goes to the system's default handler.
+/// One recorded launch request. [`StubLaunch::app`] is the bundle id, or
+/// `None` for the plain "Open" that goes to the system's default handler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StubLaunch {
-    pub app: Option<AppKind>,
+    pub app: Option<String>,
     pub target: PathBuf,
 }
+
+/// The bundle ids the stub reports, so tests can name them without repeating
+/// string literals. `STUB_RECIPE_APP` carries the new-window guarantee;
+/// `STUB_PLAIN_APP` deliberately does not, so both branches are exercised.
+pub const STUB_RECIPE_APP: &str = "dev.zed.Zed";
+pub const STUB_PLAIN_APP: &str = "com.example.PlainEditor";
+pub const STUB_TERMINAL_APP: &str = "com.apple.Terminal";
 
 /// The one account name the stub refuses to hand a file to, standing in for the
 /// `EPERM` a real unprivileged `chown` returns. Fixed rather than random so the
@@ -256,18 +263,43 @@ impl Platform for StubPlatform {
         Ok(())
     }
 
-    /// A fixed set, present on every platform, so the "Open with \u25b8" submenu
-    /// has deterministic contents in tests and visual scenarios whether or not
-    /// the machine running them has any of these installed. The bundle paths
-    /// are the canonical macOS ones; nothing here touches the filesystem.
-    async fn external_apps(&self) -> Vec<ExternalApp> {
-        AppKind::ALL
-            .iter()
-            .map(|&kind| ExternalApp {
-                kind,
-                bundle: stub_bundle(kind),
-            })
-            .collect()
+    /// A fixed set, identical on every platform and independent of `target`.
+    ///
+    /// Deliberately **not** built through [`crate::apps::app_from_bundle`]:
+    /// that probes the filesystem for a recipe's CLI, so the strategy would
+    /// depend on what happens to be installed on the machine running the
+    /// tests. The strategies are stated outright instead, which is what makes
+    /// the visual scenarios and the UI tests deterministic.
+    ///
+    /// One app carries the new-window guarantee and one does not, so both
+    /// branches of the menu are exercised.
+    async fn apps_for(&self, _target: &Path) -> Vec<ExternalApp> {
+        vec![
+            ExternalApp {
+                name: "Zed".to_string(),
+                bundle_id: STUB_RECIPE_APP.to_string(),
+                bundle: PathBuf::from("/Applications/Zed.app"),
+                strategy: LaunchStrategy::NewWindow {
+                    program: PathBuf::from("/Applications/Zed.app/Contents/MacOS/cli"),
+                    flag: "-n",
+                },
+            },
+            ExternalApp {
+                name: "Plain Editor".to_string(),
+                bundle_id: STUB_PLAIN_APP.to_string(),
+                bundle: PathBuf::from("/Applications/Plain Editor.app"),
+                strategy: LaunchStrategy::SystemOpen,
+            },
+        ]
+    }
+
+    async fn terminal(&self) -> Option<ExternalApp> {
+        Some(ExternalApp {
+            name: "Terminal".to_string(),
+            bundle_id: STUB_TERMINAL_APP.to_string(),
+            bundle: PathBuf::from("/System/Applications/Utilities/Terminal.app"),
+            strategy: LaunchStrategy::SystemOpen,
+        })
     }
 
     /// Records the request instead of launching anything \u2014 a headless test
@@ -275,7 +307,7 @@ impl Platform for StubPlatform {
     /// is covered by [`crate::apps::launch_command`]'s own unit tests.
     async fn open_with(&self, app: &ExternalApp, target: &Path) -> Result<()> {
         self.launches.lock().unwrap().push(StubLaunch {
-            app: Some(app.kind),
+            app: Some(app.bundle_id.clone()),
             target: target.to_path_buf(),
         });
         Ok(())
@@ -288,16 +320,6 @@ impl Platform for StubPlatform {
         });
         Ok(())
     }
-}
-
-/// The canonical install location for each app, so the stub's [`ExternalApp`]s
-/// look like real ones without touching the filesystem.
-fn stub_bundle(kind: AppKind) -> PathBuf {
-    let root = match kind {
-        AppKind::Terminal => "/System/Applications/Utilities",
-        _ => "/Applications",
-    };
-    PathBuf::from(root).join(kind.bundle_name())
 }
 
 /// The four modes the stub hands out, covering a read-only file, an executable,

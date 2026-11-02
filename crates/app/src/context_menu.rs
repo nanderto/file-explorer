@@ -151,6 +151,18 @@ fn toggle(label: &'static str, action: Box<dyn Action>, checked: bool) -> MenuIt
     })
 }
 
+/// A submenu row whose label is discovered at runtime (an application name),
+/// so it cannot be a `&'static str` the way the fixed rows are.
+fn sub_command_owned(label: String, action: Box<dyn Action>, enabled: bool) -> MenuCommand {
+    MenuCommand {
+        label: SharedString::from(label),
+        action,
+        enabled,
+        checked: false,
+        dot: None,
+    }
+}
+
 fn sub_command(label: &'static str, action: Box<dyn Action>, enabled: bool) -> MenuCommand {
     MenuCommand {
         label: SharedString::new_static(label),
@@ -227,6 +239,10 @@ pub struct MenuFacts {
     /// view — the menu is built synchronously and cannot await an OS call.
     /// Empty means the submenu is omitted entirely rather than shown empty.
     pub external_apps: Vec<ExternalApp>,
+    /// Whether a terminal was discovered, which is what decides if
+    /// `Open Terminal Here` appears. Separate from `external_apps` because a
+    /// terminal is not a document handler — see [`fs_core::apps::TERMINALS`].
+    pub has_terminal: bool,
 }
 
 impl MenuFacts {
@@ -252,10 +268,9 @@ fn open_with_submenu(facts: &MenuFacts, enabled: bool) -> Option<MenuItem> {
     let items: Vec<MenuCommand> = facts
         .external_apps
         .iter()
-        .filter(|app| !app.kind.wants_directory())
         .map(|app| {
-            sub_command(
-                app.label(),
+            sub_command_owned(
+                app.label().to_string(),
                 Box::new(OpenWith { app: app.clone() }),
                 enabled,
             )
@@ -270,9 +285,7 @@ fn open_with_submenu(facts: &MenuFacts, enabled: bool) -> Option<MenuItem> {
 /// "Open Terminal Here", when a terminal was found.
 fn open_terminal_item(facts: &MenuFacts, enabled: bool) -> Option<MenuItem> {
     facts
-        .external_apps
-        .iter()
-        .any(|app| app.kind.wants_directory())
+        .has_terminal
         .then(|| command("Open Terminal Here", Box::new(OpenTerminalHere), enabled))
 }
 
@@ -507,7 +520,8 @@ impl DirView {
             paste_dest: None,
             known_tags: self.known_tags().to_vec(),
             selection_tags: self.tags_on_whole_selection(),
-            external_apps: self.external_apps().to_vec(),
+            external_apps: self.external_apps(cx).to_vec(),
+            has_terminal: self.terminal_app().is_some(),
             paste_dest_inside_source: pane.as_ref().is_some_and(|pane| {
                 pane.read(cx)
                     .path()
@@ -866,6 +880,7 @@ mod tests {
             paste_dest_inside_source: false,
             known_tags: fs_core::standard_tags(),
             external_apps: Vec::new(),
+            has_terminal: false,
             selection_tags: Vec::new(),
         }
     }
@@ -873,13 +888,21 @@ mod tests {
     /// Facts with the three apps the stub platform reports.
     fn facts_with_apps() -> MenuFacts {
         MenuFacts {
-            external_apps: fs_core::apps::AppKind::ALL
-                .iter()
-                .map(|&kind| ExternalApp {
-                    kind,
-                    bundle: std::path::PathBuf::from("/Applications").join(kind.bundle_name()),
-                })
-                .collect(),
+            external_apps: vec![
+                ExternalApp {
+                    name: "Zed".into(),
+                    bundle_id: "dev.zed.Zed".into(),
+                    bundle: PathBuf::from("/Applications/Zed.app"),
+                    strategy: fs_core::LaunchStrategy::SystemOpen,
+                },
+                ExternalApp {
+                    name: "Visual Studio Code".into(),
+                    bundle_id: "com.microsoft.VSCode".into(),
+                    bundle: PathBuf::from("/Applications/Visual Studio Code.app"),
+                    strategy: fs_core::LaunchStrategy::SystemOpen,
+                },
+            ],
+            has_terminal: true,
             ..facts()
         }
     }
@@ -1272,7 +1295,7 @@ mod tests {
         assert_eq!(
             platform.launches(),
             vec![fs_core::StubLaunch {
-                app: Some(fs_core::apps::AppKind::Terminal),
+                app: Some(fs_core::STUB_TERMINAL_APP.to_string()),
                 target: PathBuf::from("/root"),
             }],
             "a file row opens a terminal in its enclosing folder"
@@ -1291,7 +1314,7 @@ mod tests {
         assert_eq!(
             platform.launches(),
             vec![fs_core::StubLaunch {
-                app: Some(fs_core::apps::AppKind::Zed),
+                app: Some(fs_core::STUB_RECIPE_APP.to_string()),
                 target: PathBuf::from("/root/a.txt"),
             }]
         );
@@ -1308,7 +1331,7 @@ mod tests {
         assert_eq!(
             platform.launches(),
             vec![fs_core::StubLaunch {
-                app: Some(fs_core::apps::AppKind::Terminal),
+                app: Some(fs_core::STUB_TERMINAL_APP.to_string()),
                 target: PathBuf::from("/root"),
             }]
         );
