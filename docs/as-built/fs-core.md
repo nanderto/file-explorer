@@ -566,47 +566,54 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   "every `FileOp` variant" test in `tests/torture.rs` covers all three too.
 
 
-### M8 external applications: `apps.rs` + `Platform::external_apps`/`open_with`/`open_default`
+### M8 external applications: `apps.rs` + Launch Services
 
 `apps.rs` is the "hand this path to another application" module behind the
 context menu's **Open with ▸** and **Open Terminal Here**.
 
-- **The reason it is a module and not a `Command::new("open")`.** macOS's
-  Mission Control defaults to *"when switching to an application, switch to a
-  Space with open windows for the application"*, so `open -a Foo` **activates**
-  `Foo` and yanks the user to whichever Space `Foo` already has windows on. The
-  fix is to ask the app for a **new window**, which is created on the Space the
-  user is actually looking at. Verified on the development Mac against Zed, VS
-  Code and Terminal with the app's windows on another Space: `-n` stays put.
-- **`AppKind`** — a deliberately *closed* set (`Zed`, `VsCode`, `Terminal`),
-  because each variant encodes **how to open a new window in it**, which cannot
-  be derived from a bundle. Arbitrary "open with" is the system's job, which is
-  `open_default`.
-- **`launch_command`** is the load-bearing pure function, and the only thing
-  worth unit-testing here: Zed → `<bundle>/Contents/MacOS/cli -n <path>`,
-  VS Code → `<bundle>/Contents/Resources/app/bin/code -n <path>`, Terminal →
-  `/usr/bin/open -a <bundle> <dir>`. `no_editor_is_launched_by_activating_the_application`
-  exists specifically to fail if someone "simplifies" these back to `open -a`,
-  which looks equivalent and silently reintroduces the Space switch.
+- **The list is the system's, not ours.** On Windows an installer writes
+  registry keys and the app appears in Explorer's menu; macOS's equivalent is
+  **Launch Services**, which registers each application's declared document
+  types at install time. `NSWorkspace::URLsForApplicationsToOpenURL` reads
+  exactly that — it is what Finder's own "Open With" shows — so the submenu
+  needs no maintenance when the user installs a new editor. Verified on the
+  development Mac: a `.rs` file offers Zed and VS Code, a folder offers seven,
+  a `.txt` offers eighteen.
+- **It is type-aware**, which a hard-coded list can never be. That is also why
+  the app-side cache is keyed by type rather than loaded once.
+- **Why that is only half the problem.** Mission Control defaults to switching
+  Spaces when an application is *activated*, so `open -a Foo` yanks the user to
+  wherever `Foo` already has windows. The fix is to ask for a **new window**,
+  which macOS creates on the current Space — but Launch Services says *which*
+  applications, never *how to open a new window* in one. That knowledge cannot
+  be derived, so it lives in **`RECIPES`**, a table keyed by bundle id (Zed →
+  `Contents/MacOS/cli -n`, VS Code → `Contents/Resources/app/bin/code -n`).
+- **Two strategies, honestly labelled.** `LaunchStrategy::NewWindow` carries
+  the guarantee; `LaunchStrategy::SystemOpen` is best-effort and may switch
+  Spaces, exactly as Finder does. `keeps_current_space()` is what the UI reads,
+  so the difference is visible rather than a surprise. A recipe whose CLI is
+  missing **degrades to `SystemOpen`** rather than building a command that
+  cannot spawn.
 - **In-bundle CLIs, not `$PATH`.** Homebrew's `zed`/`code` are symlinks into
   these bundles, but a bundled `.app` does not inherit a login shell's `PATH`,
-  so `/opt/homebrew/bin` disappears once M8e ships. Addressing the CLI through
-  the discovered bundle works in both worlds.
-- **`discover_in(roots)`** takes its roots as an argument, so discovery is
-  testable against a `tempfile` tree on any platform. It lists only what is
-  installed (the Locations rule), keeps `AppKind::ALL` order, prefers an
-  earlier root, and **refuses a bundle whose CLI is missing** — such a bundle
-  cannot honour the new-window guarantee, and offering it would degrade
-  silently to the behavior this module exists to avoid.
-- **Platform additions.** `external_apps` (never fails — an app that is not
-  installed is simply absent), `open_with` (spawns `launch_command`
-  detached, stdio nulled) and `open_default`. `MacPlatform` runs all of it
-  through `unblock`; `StubPlatform` **records instead of launching** (a
-  headless test must never spawn a GUI app) and exposes `StubLaunch` /
-  `launches()`, which is what the app-crate tests assert against.
-- Tests: 15 unit in `apps.rs` (discovery incl. the missing-CLI refusal and
-  root precedence; every launch command's flags; the anti-`open -a` guard;
-  paths with spaces; `enclosing_directory`).
+  so `/opt/homebrew/bin` disappears once M8e ships.
+- **`dedup_handlers`** keeps one row per bundle id, default first. Not
+  hygiene: a real machine reported **three** Microsoft Edge entries from
+  updater staging directories, which would be a visibly broken menu.
+- **Terminals stay curated** (`TERMINALS`, preference-ordered: iTerm, Ghostty,
+  WezTerm, Terminal) because a terminal is *not* a document handler and never
+  appears in Launch Services' answer for a folder. Necessity, not preference.
+- **Platform**: `apps_for(target)` (type-aware, never fails), `terminal()`,
+  `open_with`, `open_default`. `MacPlatform` runs all of it through `unblock`;
+  bundle ids come from parsing `Info.plist` with the
+  `NSPropertyListSerialization` already present for Finder tags, rather than
+  `NSBundle` — AppKit caches every `NSBundle` it instantiates for the process
+  lifetime and we need two strings from a dozen candidates. `StubPlatform`
+  **records instead of launching** and states its strategies outright rather
+  than probing the filesystem, so tests are deterministic on any machine.
+- Tests: 18 unit in `apps.rs` (recipe matching and its CLI-missing
+  degradation, every launch command's flags, the anti-`open -a` guard,
+  dedup and default-first ordering, terminal preference, `enclosing_directory`).
 
 ## theme (crate)
 

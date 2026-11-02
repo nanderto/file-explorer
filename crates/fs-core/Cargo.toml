@@ -26,6 +26,14 @@ tempfile = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
+# M8 Launch Services: NSWorkspace answers "which installed applications can
+# open this file", which is how the Open with ▸ submenu populates itself the
+# way Finder's does. default-features = false because the full AppKit surface
+# is ~300 features and we want exactly one class.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSWorkspace",
+] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", features = [
     "CGBitmapContext",
