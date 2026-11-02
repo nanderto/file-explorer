@@ -51,8 +51,9 @@ pub mod vfs;
 pub mod watcher;
 
 pub use apps::{
-    AppKind, ExternalApp, LaunchCommand, default_roots, discover_in, enclosing_directory,
-    launch_command, open_default_command,
+    ExternalApp, LaunchCommand, LaunchStrategy, NewWindowRecipe, RECIPES, TERMINALS,
+    app_from_bundle, dedup_handlers, default_roots, discover_terminal_in, enclosing_directory,
+    launch_command, open_default_command, strategy_for,
 };
 pub use attrs::{
     FileAttrs, PREVIEW_SIZE_CEILING, PermBit, PermClass, SelectionSummary, UnixPerms,
@@ -75,7 +76,8 @@ pub use ops::{
 #[cfg(target_os = "macos")]
 pub use platform::MacPlatform;
 pub use platform::{
-    Platform, STUB_PRIVILEGED_OWNER, StubLaunch, StubPlatform, VolumeId, VolumeInfo, watch_volumes,
+    Platform, STUB_PLAIN_APP, STUB_PRIVILEGED_OWNER, STUB_RECIPE_APP, STUB_TERMINAL_APP,
+    StubLaunch, StubPlatform, VolumeId, VolumeInfo, watch_volumes,
 };
 pub use search::{
     CYCLE_REPEATS, MAX_CONCURRENT_DIR_READS, MAX_CYCLE_PERIOD, MAX_DEPTH, PROGRESS_EVERY_DIRS,

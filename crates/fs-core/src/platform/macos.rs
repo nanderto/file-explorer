@@ -164,15 +164,22 @@ impl Platform for MacPlatform {
             .await
     }
 
-    /// Whatever of [`AppKind::ALL`] is installed, discovered by looking for
-    /// the bundles under [`crate::apps::default_roots`].
+    /// Launch Services' own answer for `target` — the registry an installer
+    /// populates, which is why this needs no maintenance when the user
+    /// installs a new editor. See [`crate::apps`].
     ///
-    /// Never fails: an app that is not installed is simply absent from the
-    /// menu. The `is_dir` probes are filesystem calls, so they go through
-    /// `unblock` like every other blocking call here.
-    async fn external_apps(&self) -> Vec<ExternalApp> {
+    /// Never fails: a lookup that returns nothing simply yields no submenu.
+    /// All of it is blocking Objective-C, so it goes through `unblock`.
+    async fn apps_for(&self, target: &Path) -> Vec<ExternalApp> {
+        let target = target.to_path_buf();
         self.spawner
-            .unblock(move || crate::apps::discover_in(&crate::apps::default_roots()))
+            .unblock(move || launch_services_handlers(&target))
+            .await
+    }
+
+    async fn terminal(&self) -> Option<ExternalApp> {
+        self.spawner
+            .unblock(move || crate::apps::discover_terminal_in(&crate::apps::default_roots()))
             .await
     }
 
@@ -186,7 +193,7 @@ impl Platform for MacPlatform {
     /// not there", which `spawn` does report.
     async fn open_with(&self, app: &ExternalApp, target: &Path) -> Result<()> {
         let command = crate::apps::launch_command(app, target);
-        let label = app.label();
+        let label = app.label().to_string();
         self.spawner
             .unblock(move || run_detached(&command).with_context(|| format!("opening {label}")))
             .await
@@ -198,6 +205,80 @@ impl Platform for MacPlatform {
             .unblock(move || run_detached(&command).context("opening with the default application"))
             .await
     }
+}
+
+/// Ask Launch Services which applications can open `target`, default first.
+///
+/// Blocking (Objective-C); callers go through `unblock`. Never panics and
+/// never fails — an empty list means "no submenu", which is a legitimate
+/// answer for an item nothing claims.
+#[allow(unused_unsafe)] // see volumes_blocking: objc2's generated bindings
+// flip between safe and unsafe across versions, and the `unsafe` is correct
+// for the ones that are.
+fn launch_services_handlers(target: &Path) -> Vec<ExternalApp> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSString, NSURL};
+
+    let path = NSString::from_str(&target.to_string_lossy());
+    let url = unsafe { NSURL::fileURLWithPath(&path) };
+    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+
+    // The default handler is listed first, the way Finder does it, so the
+    // most likely choice needs no reading.
+    let default = unsafe { workspace.URLForApplicationToOpenURL(&url) }
+        .and_then(|u| bundle_path(&u))
+        .and_then(|p| external_app_at(&p));
+
+    let rest: Vec<ExternalApp> = unsafe { workspace.URLsForApplicationsToOpenURL(&url) }
+        .iter()
+        .filter_map(|u| bundle_path(&u))
+        .filter_map(|p| external_app_at(&p))
+        .collect();
+
+    crate::apps::dedup_handlers(default, rest)
+}
+
+/// The filesystem path behind a file URL Launch Services handed us.
+#[allow(unused_unsafe)] // see launch_services_handlers
+fn bundle_path(url: &objc2_foundation::NSURL) -> Option<PathBuf> {
+    unsafe { url.path() }.map(|p| PathBuf::from(p.to_string()))
+}
+
+/// Read a bundle's identifier and display name off disk.
+///
+/// `NSBundle` would be the obvious route, but AppKit caches every `NSBundle`
+/// it instantiates for the lifetime of the process, and we need exactly two
+/// strings from each of a dozen candidates. Parsing `Info.plist` with the
+/// `NSPropertyListSerialization` already present for Finder tags costs no new
+/// dependency and leaves nothing behind.
+///
+/// An unreadable or identifier-less bundle is skipped rather than guessed at:
+/// the bundle id is what [`crate::apps::strategy_for`] matches recipes on, so
+/// a wrong one would silently cost the Space guarantee.
+fn external_app_at(bundle: &Path) -> Option<ExternalApp> {
+    let bundle_id = bundle_identifier(bundle)?;
+    let name = bundle
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bundle_id.clone());
+    Some(crate::apps::app_from_bundle(
+        name,
+        bundle_id,
+        bundle.to_path_buf(),
+    ))
+}
+
+/// `CFBundleIdentifier` out of a bundle's `Info.plist`.
+fn bundle_identifier(bundle: &Path) -> Option<String> {
+    use objc2_foundation::{NSDictionary, NSString};
+
+    let bytes = std::fs::read(bundle.join("Contents/Info.plist")).ok()?;
+    let object = plist_object(&bytes).ok()?;
+    let dict = object.downcast_ref::<NSDictionary>()?;
+    let key = NSString::from_str("CFBundleIdentifier");
+    let value = dict.objectForKey(&key)?;
+    let value = value.downcast_ref::<NSString>()?;
+    Some(value.to_string())
 }
 
 /// Spawn a [`LaunchCommand`] and forget it.

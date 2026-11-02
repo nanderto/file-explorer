@@ -1819,8 +1819,12 @@ mod tests {
             self.inner.known_tags().await
         }
 
-        async fn external_apps(&self) -> Vec<fs_core::apps::ExternalApp> {
-            self.inner.external_apps().await
+        async fn apps_for(&self, target: &std::path::Path) -> Vec<fs_core::apps::ExternalApp> {
+            self.inner.apps_for(target).await
+        }
+
+        async fn terminal(&self) -> Option<fs_core::apps::ExternalApp> {
+            self.inner.terminal().await
         }
 
         async fn open_with(

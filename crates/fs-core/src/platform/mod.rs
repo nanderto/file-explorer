@@ -31,7 +31,10 @@ pub(crate) mod trash;
 
 #[cfg(target_os = "macos")]
 pub use macos::MacPlatform;
-pub use stub::{STUB_PRIVILEGED_OWNER, StubLaunch, StubPlatform};
+pub use stub::{
+    STUB_PLAIN_APP, STUB_PRIVILEGED_OWNER, STUB_RECIPE_APP, STUB_TERMINAL_APP, StubLaunch,
+    StubPlatform,
+};
 
 /// Stable identity of a mounted volume. M2 keys it by mount path — unique per
 /// mounted volume and exactly what both eject and navigation need.
@@ -164,14 +167,25 @@ pub trait Platform: Send + Sync {
         group: Option<&str>,
     ) -> Result<()>;
 
-    /// The external applications installed on this machine that we can hand a
-    /// path to ("Open with ▸", "Open Terminal Here").
+    /// The applications that can open `target`, as the system's own
+    /// "Open With" would list them — default handler first, one row per
+    /// bundle id.
     ///
-    /// Lists only what exists, so the menu never offers an app that is not
-    /// installed — the rule the sidebar's Locations section already follows.
+    /// Backed by Launch Services on macOS, which is the registry an installer
+    /// populates: install an editor and it appears here with no code change.
+    /// Takes the target because the answer is **type-aware** — a `.rs` file
+    /// and a folder have different handlers.
+    ///
     /// Best-effort: an implementation that cannot look returns an empty list
     /// rather than failing, and the menu simply omits the submenu.
-    async fn external_apps(&self) -> Vec<ExternalApp>;
+    async fn apps_for(&self, target: &Path) -> Vec<ExternalApp>;
+
+    /// The preferred installed terminal, for "Open Terminal Here".
+    ///
+    /// Separate from [`apps_for`](Self::apps_for) because a terminal is not a
+    /// document handler and so never appears in Launch Services' answer for a
+    /// folder — this list is curated out of necessity, not preference.
+    async fn terminal(&self) -> Option<ExternalApp>;
 
     /// Open `target` in `app`, **in a new window on the Space the user is
     /// currently looking at**.
