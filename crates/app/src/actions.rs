@@ -14,6 +14,8 @@ actions!(
     [
         // navigation
         OpenSelected,
+        // M8: "Open Terminal Here" (context menu only; no chord in §0).
+        OpenTerminalHere,
         GoUp,
         GoBack,
         GoForward,
@@ -116,6 +118,19 @@ pub struct SortBy {
 /// Parameterized for the same reason `Paste`/`SortBy` are: one command, one
 /// implementation ([`crate::dir_view::DirView::toggle_tag_on_selection`]),
 /// however many rows the menu paints.
+/// Open the selection in a specific application (M8, "Open with \u25b8").
+///
+/// Parameterized for the same reason [`ToggleTag`] is: one command, one
+/// implementation ([`crate::dir_view::DirView::handle_open_with`]), however
+/// many applications the submenu paints. `no_json` joins the existing set —
+/// an `ExternalApp` carries a discovered bundle path, which is not something
+/// a user could sensibly write in `keymap.json` anyway.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = file_explorer, no_json)]
+pub struct OpenWith {
+    pub app: fs_core::apps::ExternalApp,
+}
+
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = file_explorer, no_json)]
 pub struct ToggleTag {

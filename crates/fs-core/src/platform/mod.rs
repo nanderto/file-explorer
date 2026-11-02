@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 
+use crate::apps::ExternalApp;
 use crate::attrs::FileAttrs;
 use crate::exec::Spawner;
 use crate::tags::Tag;
@@ -30,7 +31,7 @@ pub(crate) mod trash;
 
 #[cfg(target_os = "macos")]
 pub use macos::MacPlatform;
-pub use stub::{STUB_PRIVILEGED_OWNER, StubPlatform};
+pub use stub::{STUB_PRIVILEGED_OWNER, StubLaunch, StubPlatform};
 
 /// Stable identity of a mounted volume. M2 keys it by mount path — unique per
 /// mounted volume and exactly what both eject and navigation need.
@@ -162,6 +163,34 @@ pub trait Platform: Send + Sync {
         owner: Option<&str>,
         group: Option<&str>,
     ) -> Result<()>;
+
+    /// The external applications installed on this machine that we can hand a
+    /// path to ("Open with ▸", "Open Terminal Here").
+    ///
+    /// Lists only what exists, so the menu never offers an app that is not
+    /// installed — the rule the sidebar's Locations section already follows.
+    /// Best-effort: an implementation that cannot look returns an empty list
+    /// rather than failing, and the menu simply omits the submenu.
+    async fn external_apps(&self) -> Vec<ExternalApp>;
+
+    /// Open `target` in `app`, **in a new window on the Space the user is
+    /// currently looking at**.
+    ///
+    /// That last clause is the contract, not a nicety: see
+    /// [`crate::apps`] for why activating the application instead would drag
+    /// the user to another Space. Implementations must run the command built
+    /// by [`crate::apps::launch_command`] rather than inventing their own.
+    ///
+    /// Spawns and returns; it does not wait for the application to finish.
+    async fn open_with(&self, app: &ExternalApp, target: &Path) -> Result<()>;
+
+    /// Open `target` with the system's default handler — the plain "Open" the
+    /// context menu and `enter` both use.
+    ///
+    /// Unlike [`open_with`](Self::open_with) this cannot promise a new window,
+    /// because the handler is an arbitrary application; it matches the
+    /// system's own behavior instead.
+    async fn open_default(&self, target: &Path) -> Result<()>;
 }
 
 /// Watch the volume list for changes by polling [`Platform::volumes`] every

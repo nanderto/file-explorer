@@ -18,6 +18,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{Platform, VolumeId, VolumeInfo};
+use crate::apps::{AppKind, ExternalApp};
 use crate::attrs::{FileAttrs, UnixPerms};
 use crate::tags::{Tag, standard_tags};
 use crate::thumbnail::{Thumbnail, validate_px};
@@ -41,6 +42,19 @@ pub struct StubPlatform {
     /// something the app *writes*, so a write-then-read test would otherwise be
     /// fiction.
     ownership: Mutex<BTreeMap<PathBuf, (String, String)>>,
+    /// Every [`Platform::open_with`] / [`Platform::open_default`] the stub was
+    /// asked for, in order. The stub launches nothing — a headless test must
+    /// never spawn a GUI application — so recording the request is the only
+    /// way a test can assert that the right app got the right path.
+    launches: Mutex<Vec<StubLaunch>>,
+}
+
+/// One recorded launch request. [`StubLaunch::app`] is `None` for the plain
+/// "Open" that goes to the system's default handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StubLaunch {
+    pub app: Option<AppKind>,
+    pub target: PathBuf,
 }
 
 /// The one account name the stub refuses to hand a file to, standing in for the
@@ -82,7 +96,14 @@ impl StubPlatform {
             volumes: Mutex::new(fixed_volumes()),
             tags: Mutex::new(BTreeMap::new()),
             ownership: Mutex::new(BTreeMap::new()),
+            launches: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Everything [`Platform::open_with`] / [`Platform::open_default`] was
+    /// asked to launch, in order.
+    pub fn launches(&self) -> Vec<StubLaunch> {
+        self.launches.lock().unwrap().clone()
     }
 
     /// Pre-load tags on `path` without awaiting anything — for visual scenarios
@@ -234,6 +255,49 @@ impl Platform for StubPlatform {
         volumes.remove(ix);
         Ok(())
     }
+
+    /// A fixed set, present on every platform, so the "Open with \u25b8" submenu
+    /// has deterministic contents in tests and visual scenarios whether or not
+    /// the machine running them has any of these installed. The bundle paths
+    /// are the canonical macOS ones; nothing here touches the filesystem.
+    async fn external_apps(&self) -> Vec<ExternalApp> {
+        AppKind::ALL
+            .iter()
+            .map(|&kind| ExternalApp {
+                kind,
+                bundle: stub_bundle(kind),
+            })
+            .collect()
+    }
+
+    /// Records the request instead of launching anything \u2014 a headless test
+    /// must never spawn a GUI application. The command that *would* have run
+    /// is covered by [`crate::apps::launch_command`]'s own unit tests.
+    async fn open_with(&self, app: &ExternalApp, target: &Path) -> Result<()> {
+        self.launches.lock().unwrap().push(StubLaunch {
+            app: Some(app.kind),
+            target: target.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    async fn open_default(&self, target: &Path) -> Result<()> {
+        self.launches.lock().unwrap().push(StubLaunch {
+            app: None,
+            target: target.to_path_buf(),
+        });
+        Ok(())
+    }
+}
+
+/// The canonical install location for each app, so the stub's [`ExternalApp`]s
+/// look like real ones without touching the filesystem.
+fn stub_bundle(kind: AppKind) -> PathBuf {
+    let root = match kind {
+        AppKind::Terminal => "/System/Applications/Utilities",
+        _ => "/Applications",
+    };
+    PathBuf::from(root).join(kind.bundle_name())
 }
 
 /// The four modes the stub hands out, covering a read-only file, an executable,

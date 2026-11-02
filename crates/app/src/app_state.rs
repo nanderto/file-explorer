@@ -31,13 +31,47 @@ pub trait Opener: Send + Sync {
     fn open(&self, path: &Path);
 }
 
-/// M1 stub [`Opener`]: logs the request. The real implementation is trivial
-/// with the `open` crate and joins the `Platform` trait work (M2).
+/// M1 stub [`Opener`]: logs the request. Kept for the visual runner and for
+/// any context that must not launch anything; the shipped app uses
+/// [`PlatformOpener`].
 pub struct LoggingOpener;
 
 impl Opener for LoggingOpener {
     fn open(&self, path: &Path) {
         eprintln!("open: {}", path.display());
+    }
+}
+
+/// The real [`Opener`] (M8): hands the path to the system's default
+/// application through [`fs_core::Platform::open_default`].
+///
+/// Until M8 this was [`LoggingOpener`] in the shipped app too, so "Open" — the
+/// context-menu row, a double-click and `enter` on a file — printed a line to
+/// stderr and did nothing visible.
+///
+/// Fire-and-forget by contract: [`Opener::open`] is synchronous and the UI
+/// thread must not touch the disk (§5), so the work is spawned and the
+/// failure path is a log line.
+pub struct PlatformOpener {
+    platform: Arc<dyn Platform>,
+    spawner: Arc<dyn Spawner>,
+}
+
+impl PlatformOpener {
+    pub fn new(platform: Arc<dyn Platform>, spawner: Arc<dyn Spawner>) -> Self {
+        Self { platform, spawner }
+    }
+}
+
+impl Opener for PlatformOpener {
+    fn open(&self, path: &Path) {
+        let platform = self.platform.clone();
+        let path = path.to_path_buf();
+        self.spawner.spawn(Box::pin(async move {
+            if let Err(error) = platform.open_default(&path).await {
+                eprintln!("open {}: {error:#}", path.display());
+            }
+        }));
     }
 }
 
@@ -150,7 +184,8 @@ pub fn init(cx: &mut App) {
     let platform: Arc<dyn Platform> = Arc::new(fs_core::MacPlatform::new(spawner.clone()));
     #[cfg(not(target_os = "macos"))]
     let platform: Arc<dyn Platform> = Arc::new(fs_core::StubPlatform::new());
-    install(cx, vfs, spawner, Arc::new(LoggingOpener), platform);
+    let opener: Arc<dyn Opener> = Arc::new(PlatformOpener::new(platform.clone(), spawner.clone()));
+    install(cx, vfs, spawner, opener, platform);
 }
 
 /// fs-core [`Spawner`] implemented on `gpui::BackgroundExecutor`

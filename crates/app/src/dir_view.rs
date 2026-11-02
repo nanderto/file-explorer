@@ -221,6 +221,8 @@ pub struct DirView {
     /// `Tags ▸` submenu offers, and the single-slot read task that cancels
     /// itself on scroll-away. See [`crate::tags`].
     pub(crate) tags: TagState,
+    /// M8: the installed applications behind `Open with \u25b8`.
+    pub(crate) apps: crate::open_with::AppState,
     /// The auto-hide scrollbar's visibility + fade timer (M4). See
     /// [`crate::scrollbar`].
     pub(crate) scrollbar: ScrollbarState,
@@ -266,6 +268,7 @@ impl DirView {
             menu: None,
             thumbnails: ThumbnailState::default(),
             tags: TagState::default(),
+            apps: crate::open_with::AppState::default(),
             scrollbar: ScrollbarState::default(),
             // One column until the first layout, which makes an unpainted
             // grid behave exactly like the list rather than dividing by zero.
@@ -1440,6 +1443,16 @@ impl Render for DirView {
                 (false, false) => "DirView",
             })
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| this.open_selected(cx)))
+            .on_action(
+                cx.listener(|this, action: &crate::actions::OpenWith, _, cx| {
+                    this.handle_open_with(action, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &crate::actions::OpenTerminalHere, _, cx| {
+                    this.handle_open_terminal_here(action, cx)
+                }),
+            )
             // §0 cursor movement. In the details list `down`/`up` step one
             // row; in the icon grid they step one *line* (±cols) and
             // `right`/`left` take over horizontal movement from
