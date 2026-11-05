@@ -22,7 +22,40 @@ Keep it truthful — these files are only useful if they match the code.
 
 ## Status
 
-**M7d-b done** — the sidebar is a peer of Finder's, and M7d is complete.
+**M8 (partial) — Open with ▸ / Open Terminal Here, and "Open" finally opens.**
+Not a milestone, a feature landed ahead of M8's main lanes (see
+`docs/M8_PLAN.md`).
+
+* **The point of it is Spaces.** macOS defaults to "when switching to an
+  application, switch to a Space with open windows for the application", so
+  `open -a Zed` **activates** Zed and drags you to whichever Space it already
+  has windows on. Every launch here asks the app for a **new window**
+  instead — `zed -n`, `code -n` — which macOS creates on the Space you are
+  actually looking at. Verified on the development Mac with the editors'
+  windows on another Space: the Space does not change and the new window
+  appears here. `fs_core::apps` documents it, and
+  `no_editor_is_launched_by_activating_the_application` fails if anyone
+  "simplifies" it back to `open -a`.
+* **In-bundle CLIs, not `$PATH`.** Homebrew's `zed`/`code` are symlinks into
+  the bundles, but a bundled `.app` does not inherit a login shell's `PATH` —
+  so once M8e ships, `/opt/homebrew/bin` is gone. The CLI is addressed through
+  the discovered bundle.
+* **Only what is installed** is offered, and a bundle whose CLI is missing is
+  refused rather than offered-and-degraded. Nothing discovered ⇒ the rows are
+  omitted entirely, not greyed.
+* **Terminal is a top-level row**, not a submenu entry: it is about the
+  folder, not the file under the pointer. It opens exactly **one** terminal —
+  a selected folder, a selected file's parent, or the folder on screen.
+* **"Open" was a stub until now.** `app_state.rs` still installed M1's
+  `LoggingOpener` in the shipped app, so the context menu's "Open", a
+  double-click and `enter` on a file printed to stderr and did nothing.
+  `PlatformOpener` replaces it. Shipping "Open with Zed" beside a dead "Open"
+  would have been absurd.
+* **Baselines**: `context_menu_open` gains two rows and **has not been
+  regenerated** — see Known gaps.
+
+M7d-b remains as built below — the sidebar is a peer of Finder's, and M7d is
+complete.
 
 * **Five sections, one order**: Devices, Locations, Favorites, Recents, Tags.
 * **Two levels, always.** M2's Explorer-style folder *tree* is deleted. It
@@ -268,6 +301,24 @@ cache, the `Platform` trait with its macOS and stub impls.
 
 ## Known gaps
 
+- **M8 open-with: `context_menu_open`'s baseline is stale.** The background
+  menu gained `Open with ▸` and `Open Terminal Here`, so the panel is two rows
+  taller. One runner regeneration closes it:
+  `gh workflow run update-visual-baselines.yml --ref <branch>`.
+- **M8 open-with: no scenario pins an *open* submenu.** `Open with ▸`'s
+  contents are discovered at runtime, and nothing in the visual suite proves
+  they paint — the same class of silent failure as the M7d-a icon gap. The
+  headless tests assert the rows exist and dispatch, so this is a pixel risk
+  only. Note that `Tags ▸` has never been pinned open either; closing this
+  means a `Setup` variant that opens a submenu, which would cover both.
+- **M8 open-with: the application set is closed and not configurable.** `Zed`,
+  `VsCode` and `Terminal` are compiled in, because each encodes *how to open a
+  new window in it*. A user with another editor (or iTerm/Ghostty instead of
+  Terminal) cannot add it without a code change. A settings-backed list, with
+  a per-app "new window" argument, is the honest fix.
+- **M8 open-with: discovery runs once per `DirView` and never re-probes.**
+  Installing Zed while the app is running leaves it absent until relaunch.
+  Cheap to fix (re-run on window focus) and not worth it until someone hits it.
 - **M7d-c: Recents can lose the last few seconds to a hard kill.** The write
   is debounced by `RECENTS_FLUSH_DELAY` (3s), so a crash or force-quit inside
   that window drops the folders visited in it. Deliberate: Recents is a
@@ -905,6 +956,7 @@ component sections; this list is the scannable index.
 
 | Date | PR | Change |
 |---|---|---|
+| 2026-11-02 | — | **M8 (partial): "Open with ▸ Zed / Visual Studio Code", "Open Terminal Here", and a real "Open".** New `fs-core/src/apps.rs` + three `Platform` methods (`external_apps`, `open_with`, `open_default`), new `crates/app/src/open_with.rs`, two new actions and four new context-menu rows. **The whole design turns on one macOS behavior**: Mission Control defaults to switching Spaces when an application is *activated*, so `open -a` drags the user to wherever the app already has windows. Asking the app for a **new window** instead (`zed -n`, `code -n`; `open -a <bundle> <dir>` for Terminal, which opens one anyway) puts it on the Space they are looking at — verified on the development Mac against all three with their windows on another Space. The flags are pinned by unit tests, including one whose only job is to fail if they are reduced back to `open -a`. The CLIs are addressed **inside the discovered bundle** rather than through `$PATH`, because a bundled `.app` does not inherit a login shell's `PATH`. Discovery lists only what is installed and **refuses a bundle whose CLI is missing**, since such a bundle cannot honour the new-window guarantee. Separately and unplanned: `app_state.rs` was still installing M1's `LoggingOpener` in the shipped app, so plain **"Open" did nothing** — a double-click, `enter` and the menu row all just printed to stderr. `PlatformOpener` fixes it. +33 tests (15 fs-core unit, 13 `#[gpui::test]`, 4 end-to-end menu-click, 6 menu-shape); `context_menu_open`'s baseline is stale and needs a runner regeneration. |
 | 2026-09-11 | — | **M7d-c: the load is a merge, and startup writes nothing.** Three changes, from the question "why are we writing at startup at all?". **(1) The clobber guard is gone.** `init_with_path` used to ask one all-or-nothing question — "is the content still exactly the defaults?" — and, if not, **discard the loaded file**, which is how M7d-b destroyed a real profile's saved theme. `apply_loaded` now merges field by field: a field the app has changed since boot keeps the app's value, every other field takes the file's. Nothing is discarded and nothing in flight is clobbered. Tracked by `ChangedSinceBoot`, set by each mutator. The test that pinned the hazard now pins the merge instead — `a_write_inside_the_load_window_keeps_both_it_and_the_file` asserts *both* halves, since the interesting property is that the in-flight change **and** the untouched fields survive together. **(2) Seeding never writes.** The seed is deterministic — the same defaults filtered by the same existence check — so it is derived in memory on every launch instead of persisted, and reaches disk only when the user next changes something (`save` writes the whole document). "Emptying them stays empty" still holds: unpinning is a user change, so the empty list and the seeded flag persist together. A brand-new profile now boots to a fully populated sidebar having written **nothing** — verified on a real Mac by deleting `settings.json` and launching. **(3) Recents is debounced** (`RECENTS_FLUSH_DELAY`, 3s). Clicking through four folders was four full rewrites of `settings.json`, each a temp file plus a rename, for a list only interesting once the user stops moving; it is now one write once they settle. The sidebar still repaints immediately — the debounce delays the *disk*, never the UI, and the write was already off the UI thread. `FakeVfs::write_count` is new, because "this did **not** touch the disk" is not expressible with content or mtime assertions: a write producing identical bytes is still a write. 631 tests, 5 new; both write-reduction tests were verified to fail when their fix is removed (4 writes instead of 1; 1 instead of 0). |
 | 2026-09-11 | — | **M7d-b fix: startup writes no longer destroy the settings file.** Found by running the app against a real profile rather than a fixture. `settings::init_with_path` seeds the global with defaults, loads the file in the background, and **declines to apply that load if the content changed meanwhile** — so a write inside that window makes the whole file be discarded and the defaults persisted over it. M7d-b added two writers that fire exactly there: the sidebar's favorites seeding, and the workspace's Recents (because `main` navigates to home immediately at boot). The result was a silently deleted `"theme": "Graphite Light"` and a lost favorite. `AppSettings::is_loaded()` is new and gates both; the sidebar's seeding is retried from the settings observer so whichever of the two startup conditions resolves last performs it — and reads `favorites_seeded()` before `update_global`, because `update_global` notifies the observer it is called from and the unconditional version recursed forever. 628 tests, 4 more: the hazard itself is pinned at the settings layer (`a_write_inside_the_load_window_discards_the_file`, which asserts the *unfixed* behavior honestly so nobody mistakes `is_loaded` for something the module enforces), and the gates are pinned at the call sites (`neither_startup_writer_touches_settings_before_the_load_lands`, verified to fail with either gate removed). |
 | 2026-09-11 | — | **M7d-b: the sidebar rebuilt.** Five sections in one order — Devices, Locations, Favorites, Recents, Tags — and **two levels of hierarchy, full stop**. M2's Explorer-style folder tree is deleted (`TreeRow`, the `expanded` set, the per-node `children` cache, `_child_loads`, `flat`/`reflatten`/`flatten_into`, `toggle_expanded`, `invalidate_children`, and the `PaneEvent::DirsChanged` forward in `workspace.rs` that existed only to invalidate that cache). It could open to arbitrary depth, which made the sidebar a second, worse file browser beside the real one. **Collapsing a section now moves everything below it up**: one `overflow_y_scroll` column, every section an ordinary block, nothing `flex_1`. That closes M7c's scroll gap *without* the heterogeneous-`uniform_list` refactor it was expected to need — deleting the tree deleted the only unbounded content. **Section chevrons moved to the far right** (Finder and ForkLift both), so titles share one left margin. **Locations** is new: `fs-core/locations.rs` (GPUI-free, `Vfs`-driven) resolves iCloud Drive, every OneDrive tenant root, home, `/Network` and Trash, stats them, and returns only what exists — a row pointing at a missing folder navigates to an error. Two plan corrections fell out of checking the development Mac rather than assuming: **`/Network` is a real path** (autofs, `-> /System/Volumes/Data/Network`, containing `Servers`), so it needed none of the platform work the plan budgeted; and **AirDrop genuinely has no filesystem presence**, so it is omitted rather than faked. OneDrive is *matched* rather than fixed, because the sync root is tenant-suffixed (`OneDrive - BidOne Ltd`) — and matched as `OneDrive` or `OneDrive - <anything>`, not "starts with OneDrive", which would claim a user's own `OneDriveBackups`. **Favorites seed once** with Desktop/Documents/Downloads filtered to what exists, guarded by a `favorites_seeded` flag rather than by emptiness so unpinning them all stays unpinned; **Applications is excluded** because Finder's points at `/Applications` while a Mac also has `~/Applications` — one name, two folders. **Recents** is workspace-level (`Pane::load` emits `Navigated`, guarded on the same `path_changed` that tears down a rename so an in-place reload does not re-record; `Workspace` pushes onto `AppSettings`), capped at 10, deduplicated by moving to the front. **Row icons everywhere** — and the details list gained a type icon per row, which it had never had: the only thing separating a folder row from a file row was the disclosure chevron, and a folder among *search results* does not get one (M6a), so in search results they were indistinguishable. `FsContext` gained `home: PathBuf` so Locations and seeding resolve inside the fixture tree under test — with `env::home_dir()` inline they would look for `/Users/<someone>` in a `FakeVfs` holding only `/home` and render an empty Locations section into a plausible-looking baseline. 624 tests, 24 new (4 unit + 6 integration in `fs-core`, 8 settings, 8 sidebar UI — including `collapsing_a_section_moves_the_ones_below_it_up`, which asserts on painted geometry rather than on the section list). `sidebar_tree_expanded` is replaced by `sidebar_sections_collapsed`; all 24 baselines move. |

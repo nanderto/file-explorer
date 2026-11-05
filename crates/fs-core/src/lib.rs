@@ -33,6 +33,7 @@
 //! multi-selection summary, the previewable-type gate, and
 //! [`platform::Platform::file_attrs`] for the attributes that need an OS call.
 
+pub mod apps;
 pub mod attrs;
 pub mod clipboard;
 pub mod entry;
@@ -49,6 +50,10 @@ pub mod undo;
 pub mod vfs;
 pub mod watcher;
 
+pub use apps::{
+    AppKind, ExternalApp, LaunchCommand, default_roots, discover_in, enclosing_directory,
+    launch_command, open_default_command,
+};
 pub use attrs::{
     FileAttrs, PREVIEW_SIZE_CEILING, PermBit, PermClass, SelectionSummary, UnixPerms,
     is_previewable, is_previewable_entry, summarize,
@@ -70,7 +75,7 @@ pub use ops::{
 #[cfg(target_os = "macos")]
 pub use platform::MacPlatform;
 pub use platform::{
-    Platform, STUB_PRIVILEGED_OWNER, StubPlatform, VolumeId, VolumeInfo, watch_volumes,
+    Platform, STUB_PRIVILEGED_OWNER, StubLaunch, StubPlatform, VolumeId, VolumeInfo, watch_volumes,
 };
 pub use search::{
     CYCLE_REPEATS, MAX_CONCURRENT_DIR_READS, MAX_CYCLE_PERIOD, MAX_DEPTH, PROGRESS_EVERY_DIRS,

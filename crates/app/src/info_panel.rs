@@ -1819,6 +1819,22 @@ mod tests {
             self.inner.known_tags().await
         }
 
+        async fn external_apps(&self) -> Vec<fs_core::apps::ExternalApp> {
+            self.inner.external_apps().await
+        }
+
+        async fn open_with(
+            &self,
+            app: &fs_core::apps::ExternalApp,
+            target: &std::path::Path,
+        ) -> anyhow::Result<()> {
+            self.inner.open_with(app, target).await
+        }
+
+        async fn open_default(&self, target: &std::path::Path) -> anyhow::Result<()> {
+            self.inner.open_default(target).await
+        }
+
         async fn set_ownership(
             &self,
             path: &Path,

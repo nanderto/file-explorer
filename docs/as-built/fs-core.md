@@ -566,6 +566,48 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   "every `FileOp` variant" test in `tests/torture.rs` covers all three too.
 
 
+### M8 external applications: `apps.rs` + `Platform::external_apps`/`open_with`/`open_default`
+
+`apps.rs` is the "hand this path to another application" module behind the
+context menu's **Open with ▸** and **Open Terminal Here**.
+
+- **The reason it is a module and not a `Command::new("open")`.** macOS's
+  Mission Control defaults to *"when switching to an application, switch to a
+  Space with open windows for the application"*, so `open -a Foo` **activates**
+  `Foo` and yanks the user to whichever Space `Foo` already has windows on. The
+  fix is to ask the app for a **new window**, which is created on the Space the
+  user is actually looking at. Verified on the development Mac against Zed, VS
+  Code and Terminal with the app's windows on another Space: `-n` stays put.
+- **`AppKind`** — a deliberately *closed* set (`Zed`, `VsCode`, `Terminal`),
+  because each variant encodes **how to open a new window in it**, which cannot
+  be derived from a bundle. Arbitrary "open with" is the system's job, which is
+  `open_default`.
+- **`launch_command`** is the load-bearing pure function, and the only thing
+  worth unit-testing here: Zed → `<bundle>/Contents/MacOS/cli -n <path>`,
+  VS Code → `<bundle>/Contents/Resources/app/bin/code -n <path>`, Terminal →
+  `/usr/bin/open -a <bundle> <dir>`. `no_editor_is_launched_by_activating_the_application`
+  exists specifically to fail if someone "simplifies" these back to `open -a`,
+  which looks equivalent and silently reintroduces the Space switch.
+- **In-bundle CLIs, not `$PATH`.** Homebrew's `zed`/`code` are symlinks into
+  these bundles, but a bundled `.app` does not inherit a login shell's `PATH`,
+  so `/opt/homebrew/bin` disappears once M8e ships. Addressing the CLI through
+  the discovered bundle works in both worlds.
+- **`discover_in(roots)`** takes its roots as an argument, so discovery is
+  testable against a `tempfile` tree on any platform. It lists only what is
+  installed (the Locations rule), keeps `AppKind::ALL` order, prefers an
+  earlier root, and **refuses a bundle whose CLI is missing** — such a bundle
+  cannot honour the new-window guarantee, and offering it would degrade
+  silently to the behavior this module exists to avoid.
+- **Platform additions.** `external_apps` (never fails — an app that is not
+  installed is simply absent), `open_with` (spawns `launch_command`
+  detached, stdio nulled) and `open_default`. `MacPlatform` runs all of it
+  through `unblock`; `StubPlatform` **records instead of launching** (a
+  headless test must never spawn a GUI app) and exposes `StubLaunch` /
+  `launches()`, which is what the app-crate tests assert against.
+- Tests: 15 unit in `apps.rs` (discovery incl. the missing-CLI refusal and
+  root precedence; every launch command's flags; the anti-`open -a` guard;
+  paths with spaces; `enclosing_directory`).
+
 ## theme (crate)
 
 `crates/theme` (lib name `theme`) — the theme **model and JSON loader**,

@@ -1568,3 +1568,43 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   `RECENTS_FLUSH_DELAY` (3s), held in `_recents_flush` so a further navigation
   cancels the pending flush. The sidebar repaints immediately; only the disk
   waits.
+
+- `open_with.rs` (M8, new): the `DirView` half of `fs_core::apps` — **Open
+  with ▸** and **Open Terminal Here**. Mirrors `tags.rs`: a one-shot
+  `external_apps` load kicked off from `render` (via `request_tags`), because
+  the context menu is built synchronously from `MenuFacts` and cannot await an
+  OS call; the targets each command acts on; and the two handlers, which spawn
+  on the background executor (the UI thread never touches the disk, and
+  spawning a process is disk work). **Targets**: `Open with` takes the whole
+  selection (the `open_selected` rule, so the two commands never disagree about
+  what "this" means); `Open Terminal Here` takes exactly **one** folder — a
+  selected folder, a selected file's parent, or the folder on screen —
+  because opening nine terminals for nine selected rows is not what "here"
+  means. `Open with ▸ Terminal` resolves a file to its folder for the same
+  reason. A launch failure is a log line, not a dialog: the window either
+  appears or it does not, and the user cannot act on it from here.
+- `context_menu.rs` (M8): `MenuFacts` gains `external_apps`; `Open with ▸`
+  and `Open Terminal Here` sit **directly under `Open`**, where Finder's
+  "Open With" and Explorer's "Open in Terminal" both are. Terminal is
+  deliberately *not* inside the submenu — it is about the folder, not the file
+  under the pointer. With nothing discovered **both are omitted entirely**
+  rather than shown empty. On a row they follow the selection; on the
+  background they follow `has_dir` and act on the open folder.
+- `actions.rs` (M8): `OpenWith { app: ExternalApp }` (parameterized, `no_json`,
+  joining `Paste`/`SortBy`/`ToggleTag` — a discovered bundle path is not
+  something anyone would write in `keymap.json`) and the parameterless
+  `OpenTerminalHere`. Neither has a chord; the context menu is their only
+  entry point.
+- `app_state.rs` (M8): **`PlatformOpener` replaces `LoggingOpener` in the
+  shipped app.** Until M8 the opener was still the M1 stub, so plain **"Open"**
+  — the context-menu row, a double-click and `enter` on a file — printed a line
+  to stderr and did nothing visible. It now goes through
+  `Platform::open_default`. `LoggingOpener` remains for the visual runner and
+  for tests, which must not launch anything.
+- Tests (M8): 13 `#[gpui::test]` in `open_with.rs` (render-driven discovery;
+  every target rule; one terminal for a multi-selection; inert without a
+  discovered terminal) and 4 end-to-end in `context_menu.rs` that right-click a
+  real row, click the **painted** menu row and assert what the platform was
+  asked to launch — the only instrument covering menu → dispatch → platform.
+  Plus 6 pure menu-shape tests (omission when nothing is discovered, ordering
+  under `Open`, enabling rules, Terminal standing alone).

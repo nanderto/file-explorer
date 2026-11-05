@@ -31,7 +31,7 @@
 //! from M4 on it is also compiled and tested locally.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -39,6 +39,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 
 use super::{Platform, VolumeId, VolumeInfo};
+use crate::apps::{ExternalApp, LaunchCommand};
 use crate::attrs::{FileAttrs, UnixPerms};
 use crate::exec::{Spawner, SpawnerExt as _};
 use crate::tags::{Tag, TagColor, decode_tag_strings, encode_tag_strings, standard_tags};
@@ -162,6 +163,57 @@ impl Platform for MacPlatform {
             })
             .await
     }
+
+    /// Whatever of [`AppKind::ALL`] is installed, discovered by looking for
+    /// the bundles under [`crate::apps::default_roots`].
+    ///
+    /// Never fails: an app that is not installed is simply absent from the
+    /// menu. The `is_dir` probes are filesystem calls, so they go through
+    /// `unblock` like every other blocking call here.
+    async fn external_apps(&self) -> Vec<ExternalApp> {
+        self.spawner
+            .unblock(move || crate::apps::discover_in(&crate::apps::default_roots()))
+            .await
+    }
+
+    /// Spawns [`crate::apps::launch_command`] — the command built to open a
+    /// **new window on the current Space**. See [`crate::apps`] before
+    /// changing anything about how this runs.
+    ///
+    /// `spawn`, not `output`: we are launching a GUI application and must not
+    /// block waiting for it to exit. A non-zero exit we never see is the
+    /// deliberate trade — the failure mode worth catching is "the program is
+    /// not there", which `spawn` does report.
+    async fn open_with(&self, app: &ExternalApp, target: &Path) -> Result<()> {
+        let command = crate::apps::launch_command(app, target);
+        let label = app.label();
+        self.spawner
+            .unblock(move || run_detached(&command).with_context(|| format!("opening {label}")))
+            .await
+    }
+
+    async fn open_default(&self, target: &Path) -> Result<()> {
+        let command = crate::apps::open_default_command(target);
+        self.spawner
+            .unblock(move || run_detached(&command).context("opening with the default application"))
+            .await
+    }
+}
+
+/// Spawn a [`LaunchCommand`] and forget it.
+///
+/// stdin/stdout/stderr are closed rather than inherited: these are GUI
+/// applications, and an inherited pipe keeps a handle alive that can outlive
+/// us and, for the editor CLIs, make them think they are being piped to.
+fn run_detached(command: &LaunchCommand) -> Result<()> {
+    Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning {}", command.program.display()))?;
+    Ok(())
 }
 
 /// Move `path` to the real macOS trash via `NSFileManager

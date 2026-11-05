@@ -43,8 +43,11 @@ use gpui::{
 
 use crate::actions::{
     Copy, Cut, DeletePermanently, DeleteToTrash, Duplicate, NewFile, NewFolder, OpenSelected,
-    Paste, Refresh, RenameSelected, SortBy, ToggleHiddenFiles, ToggleTag,
+    OpenTerminalHere, OpenWith, Paste, Refresh, RenameSelected, SortBy, ToggleHiddenFiles,
+    ToggleTag,
 };
+use fs_core::apps::ExternalApp;
+
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 use crate::marquee::{ContentPoint, list_viewport, scroll_y};
@@ -220,6 +223,10 @@ pub struct MenuFacts {
     /// The tags **every** selected row is known to carry — the rows that render
     /// checked, and so the ones a click removes.
     pub selection_tags: Vec<Tag>,
+    /// The installed applications behind `Open with ▸` (M8), as cached by the
+    /// view — the menu is built synchronously and cannot await an OS call.
+    /// Empty means the submenu is omitted entirely rather than shown empty.
+    pub external_apps: Vec<ExternalApp>,
 }
 
 impl MenuFacts {
@@ -236,12 +243,51 @@ impl MenuFacts {
 /// when the click landed on one — via the parameterized `Paste { dest }`
 /// action, so the destination changes without the operation being implemented
 /// twice.
+/// `Open with ▸`, or nothing at all when no supported application was found.
+///
+/// Terminal is deliberately *not* in this submenu: it is offered as the
+/// top-level "Open Terminal Here", because opening a terminal is about the
+/// folder, not about the file under the pointer.
+fn open_with_submenu(facts: &MenuFacts, enabled: bool) -> Option<MenuItem> {
+    let items: Vec<MenuCommand> = facts
+        .external_apps
+        .iter()
+        .filter(|app| !app.kind.wants_directory())
+        .map(|app| {
+            sub_command(
+                app.label(),
+                Box::new(OpenWith { app: app.clone() }),
+                enabled,
+            )
+        })
+        .collect();
+    (!items.is_empty()).then(|| MenuItem::Submenu {
+        label: SharedString::new_static("Open with"),
+        items,
+    })
+}
+
+/// "Open Terminal Here", when a terminal was found.
+fn open_terminal_item(facts: &MenuFacts, enabled: bool) -> Option<MenuItem> {
+    facts
+        .external_apps
+        .iter()
+        .any(|app| app.kind.wants_directory())
+        .then(|| command("Open Terminal Here", Box::new(OpenTerminalHere), enabled))
+}
+
 pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     let any = facts.selection_len > 0;
-    vec![
+    let mut items = vec![
         // Enabled for *any* selection because `OpenSelected` opens all of it
         // (Explorer behavior), not just the cursor row.
         command("Open", Box::new(OpenSelected), any),
+    ];
+    // M8: `Open with ▸` and `Open Terminal Here` sit directly under `Open`,
+    // where Finder's "Open With" and Explorer's "Open in Terminal" both are.
+    items.extend(open_with_submenu(facts, any));
+    items.extend(open_terminal_item(facts, any));
+    items.extend([
         MenuItem::Separator,
         command("Cut", Box::new(Cut), any),
         command("Copy", Box::new(Copy), any),
@@ -281,7 +327,8 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
         // §0 "Bypass trash (confirm dialog first)": the workspace's
         // ConfirmDialog is the guard, exactly as for shift-delete.
         command("Delete Permanently", Box::new(DeletePermanently), any),
-    ]
+    ]);
+    items
 }
 
 /// The background menu (right-click in the empty space below the rows). Every
@@ -291,7 +338,7 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
 /// `New ▸ Text file…` is this menu's reason to exist: plan §3 gives `NewFile`
 /// no key binding at all, so the context menu is its **only** entry point.
 pub fn background_menu(facts: &MenuFacts) -> Vec<MenuItem> {
-    vec![
+    let mut items = vec![
         command(
             "Paste",
             Box::new(Paste {
@@ -308,6 +355,13 @@ pub fn background_menu(facts: &MenuFacts) -> Vec<MenuItem> {
             ],
         },
         MenuItem::Separator,
+    ];
+    // M8: on the background these act on the folder on screen, which is what
+    // "here" means with nothing selected.
+    items.extend(open_with_submenu(facts, facts.has_dir));
+    items.extend(open_terminal_item(facts, facts.has_dir));
+    items.extend([
+        MenuItem::Separator,
         command("Refresh", Box::new(Refresh), facts.has_dir),
         MenuItem::Submenu {
             label: SharedString::new_static("Sort by"),
@@ -323,7 +377,8 @@ pub fn background_menu(facts: &MenuFacts) -> Vec<MenuItem> {
             Box::new(ToggleHiddenFiles),
             facts.show_hidden,
         ),
-    ]
+    ]);
+    items
 }
 
 // ----------------------------------------------------------------------
@@ -452,6 +507,7 @@ impl DirView {
             paste_dest: None,
             known_tags: self.known_tags().to_vec(),
             selection_tags: self.tags_on_whole_selection(),
+            external_apps: self.external_apps().to_vec(),
             paste_dest_inside_source: pane.as_ref().is_some_and(|pane| {
                 pane.read(cx)
                     .path()
@@ -809,7 +865,22 @@ mod tests {
             paste_dest: None,
             paste_dest_inside_source: false,
             known_tags: fs_core::standard_tags(),
+            external_apps: Vec::new(),
             selection_tags: Vec::new(),
+        }
+    }
+
+    /// Facts with the three apps the stub platform reports.
+    fn facts_with_apps() -> MenuFacts {
+        MenuFacts {
+            external_apps: fs_core::apps::AppKind::ALL
+                .iter()
+                .map(|&kind| ExternalApp {
+                    kind,
+                    bundle: std::path::PathBuf::from("/Applications").join(kind.bundle_name()),
+                })
+                .collect(),
+            ..facts()
         }
     }
 
@@ -853,6 +924,81 @@ mod tests {
             ],
             "every row-menu command dispatches an existing §0 action"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M8: Open with ▸ / Open Terminal Here
+    // ------------------------------------------------------------------
+
+    /// With nothing discovered the submenu is omitted entirely — an empty
+    /// "Open with ▸" is worse than none.
+    #[test]
+    fn open_with_is_absent_when_no_application_was_found() {
+        let items = row_menu(&facts());
+        assert!(
+            !items.iter().any(|item| item.label() == "Open with"),
+            "no applications discovered ⇒ no submenu"
+        );
+        assert!(!items.iter().any(|i| i.label() == "Open Terminal Here"));
+    }
+
+    /// Terminal is offered as its own top-level row, not inside `Open with ▸`:
+    /// opening a terminal is about the folder, not the file under the pointer.
+    #[test]
+    fn open_with_lists_the_editors_and_terminal_stands_alone() {
+        let items = row_menu(&facts_with_apps());
+        let open_with = items[find(&items, "Open with")].submenu().unwrap();
+        let labels: Vec<&str> = open_with.iter().map(|c| c.label.as_ref()).collect();
+        assert_eq!(labels, vec!["Zed", "Visual Studio Code"]);
+        assert!(
+            items.iter().any(|i| i.label() == "Open Terminal Here"),
+            "Terminal is a top-level row"
+        );
+    }
+
+    #[test]
+    fn open_with_rows_dispatch_the_open_with_action() {
+        let items = row_menu(&facts_with_apps());
+        let open_with = items[find(&items, "Open with")].submenu().unwrap();
+        for command in open_with {
+            assert_eq!(command.action.name(), "file_explorer::OpenWith");
+        }
+    }
+
+    /// Directly under `Open`, where Finder's "Open With" and Explorer's
+    /// "Open in Terminal" both sit.
+    #[test]
+    fn open_with_sits_directly_under_open() {
+        let items = row_menu(&facts_with_apps());
+        assert_eq!(items[0].label(), "Open");
+        assert_eq!(items[1].label(), "Open with");
+        assert_eq!(items[2].label(), "Open Terminal Here");
+    }
+
+    /// Nothing selected ⇒ the row commands are disabled, including the new
+    /// ones, exactly like `Open`.
+    #[test]
+    fn open_with_follows_the_selection_for_enabling() {
+        let items = row_menu(&MenuFacts {
+            selection_len: 0,
+            ..facts_with_apps()
+        });
+        assert!(!enabled(&items, "Open Terminal Here"));
+        let open_with = items[find(&items, "Open with")].submenu().unwrap();
+        assert!(open_with.iter().all(|c| !c.enabled));
+    }
+
+    /// On the background both act on the folder on screen, so they follow
+    /// `has_dir` rather than the selection.
+    #[test]
+    fn background_menu_offers_both_against_the_open_folder() {
+        let items = background_menu(&facts_with_apps());
+        assert!(enabled(&items, "Open Terminal Here"));
+        let items = background_menu(&MenuFacts {
+            has_dir: false,
+            ..facts_with_apps()
+        });
+        assert!(!enabled(&items, "Open Terminal Here"));
     }
 
     #[test]
@@ -1049,6 +1195,37 @@ mod tests {
         (vfs, pane, view, cx)
     }
 
+    /// `open_root`, but keeping the [`fs_core::StubPlatform`] so a test can
+    /// read back what a menu click asked to launch.
+    fn open_root_with_platform(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<fs_core::StubPlatform>,
+        Entity<DirView>,
+        &mut VisualTestContext,
+    ) {
+        let platform = Arc::new(fs_core::StubPlatform::new());
+        let handle = platform.clone();
+        cx.update(|cx| {
+            let spawner: Arc<dyn Spawner> =
+                Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
+            let vfs = FakeVfs::new(spawner.clone());
+            vfs.insert_tree("/root", json!({ "sub": {}, "a.txt": "a" }));
+            crate::keymap::init(cx);
+            crate::app_state::install(cx, vfs, spawner, Arc::new(LoggingOpener), platform);
+        });
+        let (pane, cx) = cx.add_window_view(Pane::new);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        let view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        cx.update(|window, cx| {
+            let focus = view.read(cx).focus_handle_ref().clone();
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+        (handle, view, cx)
+    }
+
     fn tree_has(vfs: &Arc<FakeVfs>, path: &str) -> bool {
         vfs.snapshot().keys().any(|p| p == Path::new(path))
     }
@@ -1076,6 +1253,75 @@ mod tests {
     fn background_point(view: &Entity<DirView>, cx: &mut VisualTestContext) -> Point<Pixels> {
         let rows = view.read_with(cx, |view, _| view.flat_rows().len());
         row_point(view, cx, rows + 1)
+    }
+
+    // ------------------------------------------------------------------
+    // M8: the whole path, through real painted rows — right-click, click the
+    // row, assert what the platform was asked to launch. This is the only
+    // instrument that covers menu → action dispatch → platform; the module's
+    // pure tests cover the menu's shape and `fs_core::apps` covers the flags.
+    // ------------------------------------------------------------------
+
+    #[gpui::test]
+    fn clicking_open_terminal_here_launches_a_terminal_at_the_folder(cx: &mut TestAppContext) {
+        let (platform, view, cx) = open_root_with_platform(cx);
+        let at = row_point(&view, cx, 1); // a.txt
+        right_click(cx, at);
+        click_item(cx, "context-menu-item-Open Terminal Here");
+        cx.run_until_parked();
+        assert_eq!(
+            platform.launches(),
+            vec![fs_core::StubLaunch {
+                app: Some(fs_core::apps::AppKind::Terminal),
+                target: PathBuf::from("/root"),
+            }],
+            "a file row opens a terminal in its enclosing folder"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_an_open_with_row_launches_that_editor(cx: &mut TestAppContext) {
+        let (platform, view, cx) = open_root_with_platform(cx);
+        let at = row_point(&view, cx, 1); // a.txt
+        right_click(cx, at);
+        // The submenu paints only once its parent row is open.
+        click_item(cx, "context-menu-item-Open with");
+        click_item(cx, "context-menu-item-Zed");
+        cx.run_until_parked();
+        assert_eq!(
+            platform.launches(),
+            vec![fs_core::StubLaunch {
+                app: Some(fs_core::apps::AppKind::Zed),
+                target: PathBuf::from("/root/a.txt"),
+            }]
+        );
+    }
+
+    /// The background menu acts on the folder on screen.
+    #[gpui::test]
+    fn clicking_open_terminal_here_on_the_background_uses_the_open_folder(cx: &mut TestAppContext) {
+        let (platform, view, cx) = open_root_with_platform(cx);
+        let at = background_point(&view, cx);
+        right_click(cx, at);
+        click_item(cx, "context-menu-item-Open Terminal Here");
+        cx.run_until_parked();
+        assert_eq!(
+            platform.launches(),
+            vec![fs_core::StubLaunch {
+                app: Some(fs_core::apps::AppKind::Terminal),
+                target: PathBuf::from("/root"),
+            }]
+        );
+    }
+
+    /// Activating any of these closes the menu, like every other command row.
+    #[gpui::test]
+    fn launching_closes_the_menu(cx: &mut TestAppContext) {
+        let (_platform, view, cx) = open_root_with_platform(cx);
+        let at = row_point(&view, cx, 1);
+        right_click(cx, at);
+        click_item(cx, "context-menu-item-Open Terminal Here");
+        assert!(!menu_is_open(&view, cx));
     }
 
     fn right_click(cx: &mut VisualTestContext, at: Point<Pixels>) {

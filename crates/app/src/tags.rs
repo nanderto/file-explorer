@@ -184,6 +184,10 @@ impl DirView {
     /// reads on every repaint.
     pub(crate) fn request_tags(&mut self, cols: usize, row_height: f32, cx: &mut Context<Self>) {
         self.load_known_tags(cx);
+        // M8: the `Open with \u25b8` submenu needs its applications for the same
+        // reason the `Tags \u25b8` submenu needs its tags \u2014 the menu is built
+        // synchronously and cannot await.
+        self.load_external_apps(cx);
         let len = self.flat_rows().len();
         let viewport = crate::marquee::list_viewport(self);
         let rows = visible_rows(
@@ -959,6 +963,22 @@ mod tests {
 
         async fn known_tags(&self) -> anyhow::Result<Vec<Tag>> {
             self.inner.known_tags().await
+        }
+
+        async fn external_apps(&self) -> Vec<fs_core::apps::ExternalApp> {
+            self.inner.external_apps().await
+        }
+
+        async fn open_with(
+            &self,
+            app: &fs_core::apps::ExternalApp,
+            target: &std::path::Path,
+        ) -> anyhow::Result<()> {
+            self.inner.open_with(app, target).await
+        }
+
+        async fn open_default(&self, target: &std::path::Path) -> anyhow::Result<()> {
+            self.inner.open_default(target).await
         }
 
         async fn set_ownership(
