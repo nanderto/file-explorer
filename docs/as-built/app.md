@@ -1631,3 +1631,15 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   which meant a commit that did not move the pane left the editor open — and
   holding focus, it then ate every subsequent keystroke. The editor's lifetime
   is tied to a destination being chosen, not to the listing changing.
+
+- `address_bar.rs` (fix): `visible_suggestions` suppresses a suggestion list
+  whose every row already equals the typed text — the common case when the
+  editor opens on a folder, since completion lists the parent and filters by
+  that folder's own name. `tab` still completes; only the drawing stops.
+- `pane.rs` (fix): the pane body carries a capture-phase
+  `capture_any_mouse_down` that ends a path edit. The editor is a transient
+  mode and nothing but Escape or a navigation used to end it. Capture phase so
+  a row's own handler cannot swallow it, and mouse-*down* because a marquee or
+  drag may never produce a click. Focus-based approaches do not work here: the
+  field is inside the pane's subtree, so neither the pane's `on_focus_in` nor
+  the field's `on_focus_out` fires when focus moves between them.

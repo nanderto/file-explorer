@@ -27,7 +27,8 @@ use crate::input::{InputEvent, InputState};
 pub enum AddressBarEvent {
     /// A valid directory path was confirmed.
     Navigated(PathBuf),
-    /// Editing was abandoned (`escape` or blur) — restore the breadcrumb.
+    /// Editing was abandoned with `escape` — restore the breadcrumb **and**
+    /// hand focus back to the pane.
     Cancelled,
 }
 
@@ -256,6 +257,20 @@ fn split_for_completion(typed: &str) -> (Option<PathBuf>, String) {
     }
 }
 
+/// The suggestions worth *drawing*: none, when every one of them is already
+/// exactly what the field contains.
+///
+/// Opening the editor on `/Users/me/Documents` lists the parent and filters by
+/// the prefix `Documents`, which matches the folder itself and nothing else —
+/// so the list had exactly one row, identical to the text above it.
+fn visible_suggestions(suggestions: &[SharedString], typed: &str) -> Vec<SharedString> {
+    let typed = typed.trim();
+    if suggestions.iter().all(|s| s.as_ref() == typed) {
+        return Vec::new();
+    }
+    suggestions.to_vec()
+}
+
 impl Focusable for AddressBar {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.read(cx).focus_handle(cx)
@@ -267,7 +282,11 @@ impl Render for AddressBar {
         let theme = crate::theme::theme(cx).clone();
         crate::input::refresh_input_colors(&self.input, cx);
         let error = self.error.clone();
-        let suggestions = self.suggestions.clone();
+        // A suggestion list whose only row *is* what you already typed
+        // completes nothing — it just draws a one-row dropdown repeating the
+        // field back at you, which is what it looked like. `tab` still
+        // appends the separator; only the redundant drawing is suppressed.
+        let suggestions = visible_suggestions(&self.suggestions, &self.text(cx));
         let selected = self.selected_suggestion;
 
         div()
@@ -482,6 +501,38 @@ mod tests {
             text.contains("Documents") && text.ends_with(std::path::MAIN_SEPARATOR),
             "completed with trailing separator, got {text:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The suggestion list only draws when it completes something.
+    // ------------------------------------------------------------------
+
+    /// Opening the editor on a folder lists its parent and filters by the
+    /// folder's own name, so the only match is the folder itself — a one-row
+    /// dropdown repeating the field back at you.
+    #[test]
+    fn a_suggestion_identical_to_the_typed_path_is_not_drawn() {
+        let only = vec![SharedString::from("/Users/me/Documents")];
+        assert!(visible_suggestions(&only, "/Users/me/Documents").is_empty());
+        // Trailing whitespace in the field must not resurrect it.
+        assert!(visible_suggestions(&only, "  /Users/me/Documents  ").is_empty());
+    }
+
+    #[test]
+    fn real_completions_are_still_drawn() {
+        let many = vec![
+            SharedString::from("/Users/me/Documents"),
+            SharedString::from("/Users/me/Downloads"),
+        ];
+        assert_eq!(visible_suggestions(&many, "/Users/me/Do").len(), 2);
+        // Even a single row earns its place when it would change the text.
+        let one = vec![SharedString::from("/Users/me/Documents")];
+        assert_eq!(visible_suggestions(&one, "/Users/me/Doc").len(), 1);
+    }
+
+    #[test]
+    fn no_suggestions_draws_nothing() {
+        assert!(visible_suggestions(&[], "/Users/me").is_empty());
     }
 
     #[gpui::test]

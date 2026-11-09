@@ -1191,6 +1191,25 @@ impl Render for Pane {
             // The details view (header + uniform_list rows).
             self.dir_view.clone().into_any_element()
         };
+        // §3 "breadcrumb that becomes an editable text path": the editor is a
+        // *transient* mode, so pressing anywhere in the listing ends it.
+        //
+        // Capture phase, and a press rather than a click: a row's own handler
+        // consumes the event, and the gesture that matters (marquee, drag)
+        // may never produce a click at all. Focus events cannot serve here —
+        // the field lives inside the pane's own subtree, so moving between
+        // them never re-enters it.
+        //
+        // Without this the editor lingers over a folder it no longer
+        // describes, and keeps swallowing keystrokes.
+        let body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.close_address_bar(cx)))
+            .child(body)
+            .into_any_element();
 
         div()
             .track_focus(&self.focus_handle)
@@ -1471,6 +1490,44 @@ mod tests {
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.path(), Some(Path::new("/other")));
             assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
+        });
+    }
+
+    /// The editor is a transient mode: pressing in the listing must end it.
+    /// Without this it sits there showing a path that no longer describes
+    /// what you are doing — which is what "it shows the last thing chosen"
+    /// actually was.
+    #[gpui::test]
+    fn pressing_in_the_listing_dismisses_the_address_bar(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.address_bar_mode()),
+            AddressBarMode::Editing
+        );
+
+        // A press on a row, at the pixels the list actually painted.
+        let row = cx
+            .debug_bounds("dir-row-0")
+            .expect("the listing paints its first row");
+        cx.simulate_mouse_down(row.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.address_bar_mode(),
+                AddressBarMode::Breadcrumb,
+                "pressing in the listing ends the edit"
+            );
+            // The folder did not change, so the breadcrumb still shows it.
+            assert_eq!(pane.path(), Some(Path::new("/root")));
         });
     }
 
