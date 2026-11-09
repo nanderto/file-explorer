@@ -92,6 +92,19 @@ impl AddressBar {
         cx.notify();
     }
 
+    /// Set the field's text, for tests that drive the editor the way a user
+    /// does (type, then Enter) from another module.
+    #[cfg(test)]
+    pub(crate) fn set_value_for_test(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input
+            .update(cx, |input, cx| input.set_value(value, window, cx));
+    }
+
     pub fn text(&self, cx: &App) -> String {
         self.input.read(cx).content().to_string()
     }
@@ -182,7 +195,7 @@ impl AddressBar {
 
     /// `enter` — validate on the background executor; a directory navigates,
     /// anything else keeps editing with an inline error.
-    fn confirm(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn confirm(&mut self, cx: &mut Context<Self>) {
         let typed = self.text(cx);
         let path = PathBuf::from(typed.trim());
         if path.as_os_str().is_empty() {

@@ -1624,3 +1624,10 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   is not a document handler). Application names are runtime strings, so
   `sub_command_owned` joins `sub_command` for rows whose label is not
   `&'static str`.
+
+- `pane.rs` (fix): `close_address_bar` puts the breadcrumb back, and is called
+  from **both** `navigate_to`'s unchanged-path early return and the
+  `AddressBarEvent::Navigated` handler. Previously only `load` restored it,
+  which meant a commit that did not move the pane left the editor open — and
+  holding focus, it then ate every subsequent keystroke. The editor's lifetime
+  is tied to a destination being chosen, not to the listing changing.
