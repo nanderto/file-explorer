@@ -184,10 +184,11 @@ impl DirView {
     /// reads on every repaint.
     pub(crate) fn request_tags(&mut self, cols: usize, row_height: f32, cx: &mut Context<Self>) {
         self.load_known_tags(cx);
-        // M8: the `Open with \u25b8` submenu needs its applications for the same
-        // reason the `Tags \u25b8` submenu needs its tags \u2014 the menu is built
-        // synchronously and cannot await.
-        self.load_external_apps(cx);
+        // M8: the `Open with ▸` submenu needs its applications for the same
+        // reason the `Tags ▸` submenu needs its tags — the menu is built
+        // synchronously and cannot await. Type-keyed, so it re-asks when the
+        // cursor moves between a folder and a file.
+        self.request_external_apps(cx);
         let len = self.flat_rows().len();
         let viewport = crate::marquee::list_viewport(self);
         let rows = visible_rows(
@@ -965,8 +966,12 @@ mod tests {
             self.inner.known_tags().await
         }
 
-        async fn external_apps(&self) -> Vec<fs_core::apps::ExternalApp> {
-            self.inner.external_apps().await
+        async fn apps_for(&self, target: &std::path::Path) -> Vec<fs_core::apps::ExternalApp> {
+            self.inner.apps_for(target).await
+        }
+
+        async fn terminal(&self) -> Option<fs_core::apps::ExternalApp> {
+            self.inner.terminal().await
         }
 
         async fn open_with(
