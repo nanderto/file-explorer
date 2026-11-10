@@ -376,10 +376,8 @@ impl AppSettings {
     /// adding a second copy — a list where "Documents" appears four times is
     /// a worse list, not a more accurate one.
     pub fn push_recent(&mut self, path: PathBuf) -> bool {
-        // The Trash is reached from its own Locations row and is not a folder
-        // anyone means to "come back to", so recording it just pushes a real
-        // destination off the end of the list.
-        if is_trash(&path) {
+        // See `is_uninteresting_recent`.
+        if is_uninteresting_recent(&path) {
             return false;
         }
         if self.content.recents.first() == Some(&path) {
@@ -683,6 +681,14 @@ fn start_watching(cx: &mut App, path: PathBuf) {
 /// Matched by name rather than by resolving the real location: the
 /// per-volume ones (`/Volumes/x/.Trashes/501`) have no single canonical path,
 /// and this only decides whether to record a visit.
+/// Folders Recents should never offer: the Trash (reached from its own
+/// Locations row) and the filesystem root (reached from Devices, and not a
+/// place anyone means to "come back to"). Recording either just pushes a real
+/// destination off the end of a capped list.
+pub(crate) fn is_uninteresting_recent(path: &Path) -> bool {
+    is_trash(path) || path.parent().is_none()
+}
+
 pub(crate) fn is_trash(path: &Path) -> bool {
     path.components().any(|c| {
         let name = c.as_os_str().to_string_lossy();
@@ -1197,14 +1203,17 @@ mod tests {
         assert_eq!(s.recents(), paths(&["/a"]).as_slice());
     }
 
-    /// The Trash is reached from its own Locations row and is not a folder
-    /// anyone means to come back to; recording it would push a real
-    /// destination off the end of the list.
+    /// See `is_uninteresting_recent`: neither the Trash nor the filesystem
+    /// root belongs in a capped list of places to come back to.
     #[test]
-    fn the_trash_is_never_recorded_in_recents() {
+    fn the_trash_and_the_root_are_never_recorded_in_recents() {
         let mut settings = AppSettings::new(PathBuf::from("/x/settings.json"));
         assert!(!settings.push_recent(PathBuf::from("/Users/me/.Trash")));
         assert!(!settings.push_recent(PathBuf::from("/Volumes/disk/.Trashes/501")));
+        assert!(
+            !settings.push_recent(PathBuf::from("/")),
+            "the root is reached from Devices, not from Recents"
+        );
         assert!(settings.recents().is_empty());
         // A folder that merely *mentions* trash is a normal folder.
         assert!(settings.push_recent(PathBuf::from("/Users/me/Trash Studies")));

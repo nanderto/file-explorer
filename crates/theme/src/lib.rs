@@ -228,6 +228,13 @@ pub struct LoadedTheme {
 
 const DARK_JSON: &str = include_str!("../themes/graphite-dark.json");
 const LIGHT_JSON: &str = include_str!("../themes/graphite-light.json");
+/// A softer dark: the graphite built-in is near-black against near-white
+/// text, which reads as high contrast. This lifts the surface and drops the
+/// text so the two meet closer to the middle.
+const SLATE_DARK_JSON: &str = include_str!("../themes/slate-dark.json");
+/// A warmer light: the graphite built-in is pure white. This is off-white,
+/// slightly warm, so a full-screen window is less of a glare.
+const PARCHMENT_LIGHT_JSON: &str = include_str!("../themes/parchment-light.json");
 
 impl Theme {
     /// The built-in dark theme (the graphite look of the reference screenshot).
@@ -376,7 +383,12 @@ impl ThemeRegistry {
     /// The two shipped themes, in picker order.
     pub fn builtins_only() -> Self {
         Self {
-            themes: vec![Theme::dark(), Theme::light()],
+            themes: vec![
+                Theme::dark(),
+                Theme::light(),
+                builtin(SLATE_DARK_JSON),
+                builtin(PARCHMENT_LIGHT_JSON),
+            ],
         }
     }
 
@@ -442,7 +454,7 @@ mod tests {
 
     #[test]
     fn built_ins_load_without_a_single_warning() {
-        for source in [DARK_JSON, LIGHT_JSON] {
+        for source in [DARK_JSON, LIGHT_JSON, SLATE_DARK_JSON, PARCHMENT_LIGHT_JSON] {
             let loaded = Theme::from_json_complete(source).unwrap();
             assert!(
                 loaded.warnings.is_empty(),
@@ -579,16 +591,36 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_ships_both_built_ins_and_takes_user_themes() {
+    fn the_registry_ships_the_built_ins_and_takes_user_themes() {
         let mut registry = ThemeRegistry::builtins_only();
-        assert_eq!(registry.len(), 2);
-        assert!(registry.get("Graphite Dark").is_some());
+        let shipped = registry.len();
+        // Two per appearance: the high-contrast graphite pair and the softer
+        // slate/parchment pair.
+        assert_eq!(shipped, 4);
+        for name in [
+            "Graphite Dark",
+            "Graphite Light",
+            "Slate Dark",
+            "Parchment Light",
+        ] {
+            assert!(registry.get(name).is_some(), "{name} ships");
+        }
+        assert_eq!(
+            registry
+                .themes()
+                .iter()
+                .filter(|t| t.appearance == Appearance::Dark)
+                .count(),
+            2,
+            "a dark and a light option on each side, so `appearance: system` \
+             has something to pick either way"
+        );
 
         let mine = Theme::from_json(r#"{ "name": "Mine", "appearance": "dark" }"#)
             .unwrap()
             .theme;
         assert!(!registry.insert(mine));
-        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.len(), shipped + 1);
         assert_eq!(registry.get("Mine").unwrap().appearance, Appearance::Dark);
     }
 
@@ -602,7 +634,11 @@ mod tests {
         .unwrap()
         .theme;
         assert!(registry.insert(override_theme));
-        assert_eq!(registry.len(), 2, "it replaced rather than appended");
+        assert_eq!(
+            registry.len(),
+            ThemeRegistry::builtins_only().len(),
+            "it replaced rather than appended"
+        );
         assert_eq!(
             registry.get("Graphite Dark").unwrap().accent,
             color::parse("hsl(0, 100%, 50%)").unwrap()

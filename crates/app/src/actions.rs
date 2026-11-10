@@ -19,6 +19,8 @@ actions!(
         // Put the path of what is highlighted on the clipboard (context menu
         // and the button beside the path field; no chord in §0).
         CopyPath,
+        // Pin the right-clicked folder to the sidebar's Favorites.
+        AddToFavorites,
         GoUp,
         GoBack,
         GoForward,

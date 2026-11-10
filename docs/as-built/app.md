@@ -1703,3 +1703,15 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   before the change still contains it. `remove_recent` backs the Recents row's
   right-click **Remove from Recents**, which persists immediately like
   unpinning a favorite.
+
+- `sidebar.rs`: rows are `ROW_HEIGHT` 24 (see the constant's doc for why not
+  more), their icons are tinted by `location_color` / the folder colour, and
+  the Favorites section carries `flex_none` — without it the column shrank it
+  below its content once the sections outgrew the sidebar, and the Recents
+  header overdrew its last row.
+- `settings.rs`: `is_uninteresting_recent` keeps both the Trash and the
+  filesystem root out of Recents; both are reached from their own sections,
+  and the list is capped.
+- `open_with.rs` / `context_menu.rs`: `AddToFavorites`, offered for folders
+  only (`favorite_target`) — Favorites is a list of places, so a pinned file
+  would have nowhere to navigate to.

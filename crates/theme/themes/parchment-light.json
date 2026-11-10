@@ -1,0 +1,26 @@
+{
+  "name": "Parchment Light",
+  "appearance": "light",
+  "colors": {
+    "surface": "hsl(40, 18%, 95%)",
+    "sidebar": "hsl(40, 16%, 91%)",
+    "panel": "hsl(40, 18%, 93%)",
+    "titlebar": "hsl(40, 16%, 91%)",
+    "text": "hsl(30, 10%, 22%)",
+    "muted": "hsl(30, 8%, 48%)",
+    "accent": "hsl(210, 60%, 48%)",
+    "selection": "hsla(210, 60%, 48%, 0.26)",
+    "border": "hsla(30, 20%, 20%, 0.14)",
+    "error": "hsl(0, 60%, 48%)"
+  },
+  "file_colors": {
+    "folder": "hsl(210, 55%, 52%)",
+    "image": "hsl(280, 40%, 55%)",
+    "code": "hsl(150, 40%, 40%)",
+    "archive": "hsl(35, 60%, 45%)",
+    "audio": "hsl(330, 40%, 55%)",
+    "video": "hsl(15, 55%, 50%)",
+    "document": "hsl(30, 10%, 40%)",
+    "other": "hsl(30, 8%, 52%)"
+  }
+}

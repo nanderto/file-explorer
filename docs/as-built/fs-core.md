@@ -653,6 +653,13 @@ document, other).
 
 ## theme (crate)
 
+**Four built-ins, two per appearance** (M8): `Graphite Dark`/`Graphite Light`
+are the original high-contrast pair; `Slate Dark` and `Parchment Light` are
+softer — a lifted, less-black dark and an off-white, slightly warm light —
+added by request. Two per appearance means `appearance: system` has a real
+choice on either side.
+
+
 `crates/theme` (lib name `theme`) — the theme **model and JSON loader**,
 built at M7a. Depends on gpui only for `Hsla`/`SharedString`: no windows, no
 entities, no rendering, and no I/O at all. Reading the themes folder and

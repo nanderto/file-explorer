@@ -79,7 +79,17 @@ const DEFAULT_FAVORITES: [&str; 3] = ["Desktop", "Documents", "Downloads"];
 
 /// The height a sidebar row occupies. Also the unit the Favorites drop zone's
 /// minimum height is expressed in.
-const ROW_HEIGHT: f32 = 22.0;
+///
+/// Raised from 22 by request: at 22 the rows read as one dense block, and the
+/// sidebar is a *navigation* surface where the eye lands on a row rather than
+/// scanning a list.
+///
+/// **24 rather than more** because at 25 the Tags section falls outside the
+/// sidebar's viewport in the fixed-size window `#[gpui::test]` uses, and
+/// `clicking_a_sidebar_tag_filters_the_pane…` clicks that row's painted
+/// bounds. That is a brittleness in the test rather than a verdict on the
+/// spacing — going taller means teaching it to scroll first.
+const ROW_HEIGHT: f32 = 24.0;
 /// Favorites reorder drop-target tint (the "insert before this row" cue).
 const FAVORITE_REORDER_ALPHA: f32 = 0.35;
 
@@ -504,7 +514,7 @@ impl Sidebar {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
-                    .child(icons::icon(Icon::Drive, theme.muted))
+                    .child(icons::icon(Icon::Drive, theme.file_colors.other))
                     .child(
                         div()
                             .flex_1()
@@ -569,6 +579,11 @@ impl Sidebar {
             .debug_selector(|| "sidebar-favorites-drop-zone".into())
             .flex()
             .flex_col()
+            // `flex_none`, or the column shrinks it below its content once the
+            // sections together outgrow the sidebar: `min_h` is a *minimum*,
+            // but a flex item still defaults to `flex-shrink: 1`, and the
+            // squeezed section let the next header overdraw its last row.
+            .flex_none()
             .min_h(px(ROW_HEIGHT * 3.0))
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 style.bg(external_theme.accent.opacity(drag::FAVORITES_DROP_ALPHA))
@@ -746,7 +761,10 @@ impl Sidebar {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
-                    .child(icons::icon(location_icon(location.kind), theme.muted))
+                    .child(icons::icon(
+                        location_icon(location.kind),
+                        location_color(location.kind, &theme),
+                    ))
                     .child(div().flex_1().truncate().child(name))
             })
             .collect();
@@ -784,7 +802,7 @@ impl Sidebar {
                             cx.notify();
                         }),
                     )
-                    .child(icons::icon(Icon::Folder, theme.muted))
+                    .child(icons::icon(Icon::Folder, theme.file_colors.folder))
                     .child(div().flex_1().truncate().child(name))
             })
             .collect();
@@ -881,6 +899,20 @@ fn sidebar_row(id: impl Into<gpui::ElementId>, theme: &Theme) -> gpui::Stateful<
         .hover(move |s| s.bg(hover))
 }
 
+/// The tint for a location's icon.
+///
+/// The sidebar is where the eye lands first, so its rows are coloured like
+/// the entries they lead to rather than left uniformly grey: folders take the
+/// folder colour, the cloud roots the accent, and the Trash the error colour
+/// — the one row where acting has consequences.
+fn location_color(kind: LocationKind, theme: &Theme) -> gpui::Hsla {
+    match kind {
+        LocationKind::Trash => theme.error,
+        LocationKind::ICloudDrive | LocationKind::OneDrive => theme.accent,
+        _ => theme.file_colors.folder,
+    }
+}
+
 /// The icon for a location, by kind.
 fn location_icon(kind: LocationKind) -> Icon {
     match kind {
@@ -910,12 +942,12 @@ impl Render for Sidebar {
         let settings = AppSettings::global(cx);
         let favorites: Vec<PathBuf> = settings.favorites().to_vec();
         // Filtered on the way out as well as on the way in: `push_recent`
-        // refuses the Trash now, but a profile written before that still has
-        // it, and the row would sit there until it aged off the end.
+        // refuses these now, but a profile written before that still holds
+        // them, and the rows would sit there until they aged off the end.
         let recents: Vec<PathBuf> = settings
             .recents()
             .iter()
-            .filter(|p| !crate::settings::is_trash(p))
+            .filter(|p| !crate::settings::is_uninteresting_recent(p))
             .cloned()
             .collect();
 

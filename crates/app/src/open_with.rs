@@ -18,9 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use fs_core::apps::{ExternalApp, enclosing_directory};
-use gpui::{App, Context, Task};
+use gpui::{App, BorrowAppContext as _, Context, Task};
 
-use crate::actions::{CopyPath, OpenTerminalHere, OpenWith};
+use crate::actions::{AddToFavorites, CopyPath, OpenTerminalHere, OpenWith};
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 
@@ -277,6 +277,37 @@ impl DirView {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                 path.to_string_lossy().into_owned(),
             ));
+        }
+    }
+
+    /// `Add to Favorites`: pin the highlighted folder, or the open folder
+    /// when nothing is highlighted. Persists immediately, like the sidebar's
+    /// own unpin.
+    ///
+    /// Only folders: Favorites is a list of *places*, and a pinned file would
+    /// have nowhere to navigate to.
+    pub(crate) fn handle_add_to_favorites(&mut self, _: &AddToFavorites, cx: &mut Context<Self>) {
+        let Some(path) = self.favorite_target(cx) else {
+            return;
+        };
+        let changed = cx.update_global::<crate::settings::AppSettings, bool>(|settings, _| {
+            settings.add_favorite(path)
+        });
+        if changed {
+            crate::settings::AppSettings::global(cx).save(cx);
+        }
+    }
+
+    /// The folder `Add to Favorites` would pin, if any.
+    pub(crate) fn favorite_target(&self, cx: &App) -> Option<PathBuf> {
+        match self.command_targets(cx).into_iter().next() {
+            Some((path, true)) => Some(path),
+            // A highlighted *file* is not a place; fall back to the folder on
+            // screen rather than pinning its parent behind the user's back.
+            Some(_) => None,
+            None => self
+                .pane_entity()
+                .and_then(|pane| pane.read(cx).path().map(|p| p.to_path_buf())),
         }
     }
 
@@ -584,6 +615,45 @@ mod tests {
         cx.run_until_parked();
         let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text()));
         assert_eq!(copied.as_deref(), Some("/root"));
+    }
+
+    /// Favorites is a list of *places*, so a highlighted file offers nothing
+    /// to pin — the menu row is dead rather than quietly pinning its parent.
+    #[gpui::test]
+    fn add_to_favorites_only_offers_folders(cx: &mut TestAppContext) {
+        let (_platform, pane, cx) = open_root(cx);
+        let view = dir_view(&pane, cx);
+
+        view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/sub")], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.update(cx, |view, cx| view.favorite_target(cx)),
+            Some(PathBuf::from("/root/sub"))
+        );
+
+        view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/a.txt")], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.update(cx, |view, cx| view.favorite_target(cx)),
+            None,
+            "a file is not a place"
+        );
+    }
+
+    /// Nothing highlighted pins the folder on screen, which is what the
+    /// background menu acts on.
+    #[gpui::test]
+    fn add_to_favorites_falls_back_to_the_open_folder(cx: &mut TestAppContext) {
+        let (_platform, pane, cx) = open_root(cx);
+        let view = dir_view(&pane, cx);
+        assert_eq!(
+            view.update(cx, |view, cx| view.favorite_target(cx)),
+            Some(PathBuf::from("/root"))
+        );
     }
 
     #[test]
