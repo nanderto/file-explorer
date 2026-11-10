@@ -38,6 +38,7 @@ pub mod attrs;
 pub mod clipboard;
 pub mod entry;
 pub mod exec;
+pub mod kind;
 pub mod listing;
 pub mod locations;
 pub mod navigate;
@@ -63,6 +64,7 @@ pub use attrs::{
 pub use clipboard::{ClipboardMode, FileClipboard};
 pub use entry::{EntryId, EntryKind, EntryMeta, FileEntry, TargetKind};
 pub use exec::{Spawner, SpawnerExt};
+pub use kind::{FileKind, classify, classify_extension};
 pub use listing::{
     ListingCache, ListingPatch, ListingSnapshot, ResolvedBatch, list_dir, patch_listing,
     resolve_watch_batch,

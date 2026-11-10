@@ -116,6 +116,9 @@ pub struct Sidebar {
     /// resolve lands, so the first paint does no I/O and the section simply
     /// is not there yet rather than showing rows that might not exist.
     locations: Vec<Location>,
+    /// The Recents row whose one-item menu is showing, and where the
+    /// right-click landed. `None` when no menu is open.
+    recent_menu: Option<(PathBuf, gpui::Point<gpui::Pixels>)>,
     /// The one-shot locations resolve **and** favorites seeding; a field,
     /// never detached (§5).
     _startup: Option<Task<()>>,
@@ -229,6 +232,7 @@ impl Sidebar {
             collapsed_recents: false,
             collapsed_tags: false,
             locations: Vec::new(),
+            recent_menu: None,
             _startup: Some(startup),
             default_favorites: None,
             tags: fs_core::standard_tags(),
@@ -369,6 +373,25 @@ impl Sidebar {
             .update_global::<AppSettings, bool>(|settings, _| settings.move_favorite(path, before));
         if changed {
             AppSettings::global(cx).save(cx);
+            cx.notify();
+        }
+    }
+
+    /// Forget a recent folder (the row's right-click menu). Persists
+    /// immediately, like unpinning a favorite.
+    pub fn remove_recent(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let changed =
+            cx.update_global::<AppSettings, bool>(|settings, _| settings.remove_recent(path));
+        self.recent_menu = None;
+        if changed {
+            AppSettings::global(cx).save(cx);
+        }
+        cx.notify();
+    }
+
+    /// Dismiss the Recents row menu, if one is open.
+    fn close_recent_menu(&mut self, cx: &mut Context<Self>) {
+        if self.recent_menu.take().is_some() {
             cx.notify();
         }
     }
@@ -748,11 +771,19 @@ impl Sidebar {
             .map(|(ix, path)| {
                 let navigate_path = path.clone();
                 let name = SharedString::from(display_name(path));
+                let menu_path = path.clone();
                 sidebar_row(("sidebar-recent", ix), &theme)
                     .debug_selector(move || format!("sidebar-recent-{ix}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.recent_menu = Some((menu_path.clone(), event.position));
+                            cx.notify();
+                        }),
+                    )
                     .child(icons::icon(Icon::Folder, theme.muted))
                     .child(div().flex_1().truncate().child(name))
             })
@@ -878,7 +909,15 @@ impl Render for Sidebar {
         let theme = crate::theme::theme(cx).clone();
         let settings = AppSettings::global(cx);
         let favorites: Vec<PathBuf> = settings.favorites().to_vec();
-        let recents: Vec<PathBuf> = settings.recents().to_vec();
+        // Filtered on the way out as well as on the way in: `push_recent`
+        // refuses the Trash now, but a profile written before that still has
+        // it, and the row would sit there until it aged off the end.
+        let recents: Vec<PathBuf> = settings
+            .recents()
+            .iter()
+            .filter(|p| !crate::settings::is_trash(p))
+            .cloned()
+            .collect();
 
         // **One scrolling column, every section an ordinary block.** No
         // `flex_1` anywhere: that is what pinned Tags to the bottom edge
@@ -896,6 +935,14 @@ impl Render for Sidebar {
             .overflow_y_scroll()
             .text_size(px(13.0))
             .text_color(theme.text)
+            // A *left* press anywhere in the column dismisses the Recents
+            // menu. Bubble phase, so the menu item's own click runs first;
+            // left only, so the right-click that opens the menu on a row does
+            // not immediately close it again.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_recent_menu(cx)),
+            )
             .child(self.section_header(Section::Devices, "Devices", false, cx));
         if !self.collapsed_devices {
             root = root.child(self.render_devices(cx));
@@ -926,7 +973,45 @@ impl Render for Sidebar {
         }
         // A little breathing room under the last section, so the final row is
         // not flush against the window edge when the column is full.
-        root.child(div().h(px(8.0)).flex_none())
+        // The Recents row menu, anchored in **window** coordinates (a
+        // `MouseDownEvent` carries those) and above everything else in the
+        // column. One item does not justify making `context_menu.rs` —
+        // which is built for, and bound to, the listing's `DirView` —
+        // generic over its view.
+        let menu = self.recent_menu.clone().map(|(path, at)| {
+            let hover_bg = theme.accent.opacity(0.15);
+            let panel = div()
+                .id("recent-menu")
+                .occlude()
+                .w(px(190.0))
+                .p(px(4.0))
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(6.0))
+                .bg(theme.panel)
+                .child(
+                    div()
+                        .id("recent-menu-remove")
+                        .debug_selector(|| "recent-menu-remove".into())
+                        .flex()
+                        .items_center()
+                        .h(px(22.0))
+                        .px(px(6.0))
+                        .rounded(px(3.0))
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_recent(&path, cx);
+                        }))
+                        .child("Remove from Recents"),
+                );
+            gpui::deferred(gpui::anchored().position(at).snap_to_window().child(panel))
+                .with_priority(1)
+        });
+
+        root.child(div().h(px(8.0)).flex_none()).children(menu)
     }
 }
 

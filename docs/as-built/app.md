@@ -1691,3 +1691,15 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   file falls back to its folder. It also copies the active pane's view mode
   rather than the complement — a deviation from plan §2, by request, because
   comparing two places is harder when the halves are drawn differently.
+
+- `icons.rs`: `entry_icon_color` maps `fs_core::classify` onto the theme's
+  `file_colors` — the palette modelled since M7a and unpainted until now.
+  The `match` is exhaustive, so a new `FileKind` is a compile error rather
+  than a silently grey icon. **Entry icons are the only coloured icons**;
+  chrome stays monochrome so colour means "what this is", not "this is a
+  control".
+- `settings.rs` / `sidebar.rs`: the Trash is kept out of Recents on the way in
+  (`push_recent`) *and* filtered on the way out, because a profile written
+  before the change still contains it. `remove_recent` backs the Recents row's
+  right-click **Remove from Recents**, which persists immediately like
+  unpinning a favorite.

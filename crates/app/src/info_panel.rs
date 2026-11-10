@@ -939,7 +939,16 @@ impl InfoPanel {
                         .child(crate::icons::sized_icon(
                             crate::icons::entry_icon(folder),
                             px(48.0),
-                            theme.muted,
+                            crate::icons::entry_icon_color(
+                                match &self.subject {
+                                    Subject::One { path, .. } => path,
+                                    // No single path to classify; the
+                                    // generic tint is the honest answer.
+                                    _ => std::path::Path::new(""),
+                                },
+                                folder,
+                                theme,
+                            ),
                         )),
                 )
                 .into_any_element()

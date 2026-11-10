@@ -412,7 +412,7 @@ fn tile_image(
             .child(crate::icons::sized_icon(
                 crate::icons::entry_icon(entry.is_dir_like()),
                 px(ICON_PX * 0.6),
-                theme.muted,
+                crate::icons::entry_icon_color(&entry.path, entry.is_dir_like(), theme),
             ))
             .into_any_element(),
     }

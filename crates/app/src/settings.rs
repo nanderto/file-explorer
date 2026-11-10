@@ -376,6 +376,12 @@ impl AppSettings {
     /// adding a second copy — a list where "Documents" appears four times is
     /// a worse list, not a more accurate one.
     pub fn push_recent(&mut self, path: PathBuf) -> bool {
+        // The Trash is reached from its own Locations row and is not a folder
+        // anyone means to "come back to", so recording it just pushes a real
+        // destination off the end of the list.
+        if is_trash(&path) {
+            return false;
+        }
         if self.content.recents.first() == Some(&path) {
             return false;
         }
@@ -384,6 +390,18 @@ impl AppSettings {
         self.content.recents.truncate(MAX_RECENTS);
         self.changed.recents = true;
         true
+    }
+
+    /// Forget one recent folder (the Recents row's context menu). Returns
+    /// whether the list changed, so a stale row costs no write.
+    pub fn remove_recent(&mut self, path: &Path) -> bool {
+        let before = self.content.recents.len();
+        self.content.recents.retain(|p| p != path);
+        let changed = self.content.recents.len() != before;
+        if changed {
+            self.changed.recents = true;
+        }
+        changed
     }
 
     /// Reorder the favorites (M3 drag-to-reorder, the gap M2 deferred): move
@@ -658,6 +676,18 @@ fn start_watching(cx: &mut App, path: PathBuf) {
         }
     });
     cx.update_global::<AppSettings, _>(|settings, _| settings._watch = Some(task));
+}
+
+/// Whether `path` is a Trash folder — the user's own, or a volume's.
+///
+/// Matched by name rather than by resolving the real location: the
+/// per-volume ones (`/Volumes/x/.Trashes/501`) have no single canonical path,
+/// and this only decides whether to record a visit.
+pub(crate) fn is_trash(path: &Path) -> bool {
+    path.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        name == ".Trash" || name == ".Trashes"
+    })
 }
 
 #[cfg(test)]
@@ -1165,6 +1195,31 @@ mod tests {
             "already at the front — no change, so no persist"
         );
         assert_eq!(s.recents(), paths(&["/a"]).as_slice());
+    }
+
+    /// The Trash is reached from its own Locations row and is not a folder
+    /// anyone means to come back to; recording it would push a real
+    /// destination off the end of the list.
+    #[test]
+    fn the_trash_is_never_recorded_in_recents() {
+        let mut settings = AppSettings::new(PathBuf::from("/x/settings.json"));
+        assert!(!settings.push_recent(PathBuf::from("/Users/me/.Trash")));
+        assert!(!settings.push_recent(PathBuf::from("/Volumes/disk/.Trashes/501")));
+        assert!(settings.recents().is_empty());
+        // A folder that merely *mentions* trash is a normal folder.
+        assert!(settings.push_recent(PathBuf::from("/Users/me/Trash Studies")));
+        assert_eq!(settings.recents().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_recent_drops_only_that_one() {
+        let mut settings = AppSettings::new(PathBuf::from("/x/settings.json"));
+        settings.push_recent(PathBuf::from("/a"));
+        settings.push_recent(PathBuf::from("/b"));
+        assert!(settings.remove_recent(Path::new("/a")));
+        assert_eq!(settings.recents(), [PathBuf::from("/b")]);
+        // A path that is not there costs no write.
+        assert!(!settings.remove_recent(Path::new("/a")));
     }
 
     #[test]
