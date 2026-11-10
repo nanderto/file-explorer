@@ -655,7 +655,7 @@ impl Sidebar {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_path(navigate_path.clone(), cx);
                     }))
-                    .child(icons::icon(Icon::Folder, theme.muted))
+                    .child(icons::icon(Icon::Folder, theme.file_colors.folder))
                     .child(div().flex_1().truncate().child(SharedString::from(name)))
                     .child(
                         div()
