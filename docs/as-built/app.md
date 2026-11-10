@@ -1643,3 +1643,21 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   drag may never produce a click. Focus-based approaches do not work here: the
   field is inside the pane's subtree, so neither the pane's `on_focus_in` nor
   the field's `on_focus_out` fires when focus moves between them.
+
+- `pane.rs`: **`display_path`** is what the path field names — the cursor row
+  (a folder, or a file in full), falling back to the open folder only when
+  nothing is highlighted. The listing expands folders in place, so the open
+  folder and the thing the user is looking at routinely disagree; a field that
+  named the open folder just echoed the last sidebar click and then went
+  stale. The pane's location is untouched: this is display only, and a
+  `cx.observe` on the `DirView` repaints the chrome as the cursor moves.
+  A breadcrumb terminus that names a **file** is painted inert — Enter in the
+  field is the deliberate way to open it, so a stray click cannot launch
+  anything.
+- `dir_view.rs`: `entry_is_dir_like` reads the view's own flat rows rather
+  than `projected_rows`, because the pane asks it *while rendering itself* and
+  `projected_rows` reads the pane back — which gpui refuses mid-update.
+- `address_bar.rs`: `confirm` now dispatches on
+  `fs_core::resolve_entered_path`. `AddressBarEvent::OpenFile` is new; the
+  pane hands it to the global `Opener` and stays put, because the user asked
+  for the file and not its folder.

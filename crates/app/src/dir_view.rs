@@ -281,6 +281,23 @@ impl DirView {
     // Selection (path-keyed SelectionModel, §2)
     // ------------------------------------------------------------------
 
+    /// Whether the projected row at `path` is a directory (or a symlink to
+    /// one). Used by the pane to decide whether the path field's last segment
+    /// names somewhere you can go.
+    ///
+    /// Reads the view's own flat rows rather than the projection, because the
+    /// pane asks this *while rendering itself* — and `projected_rows` reads
+    /// the pane back, which gpui refuses mid-update.
+    ///
+    /// A path no longer in the rows answers `false`: it is not a directory we
+    /// can offer to navigate into, which is the safe reading.
+    pub fn entry_is_dir_like(&self, path: &Path) -> bool {
+        self.flat_rows()
+            .iter()
+            .find(|row| row.entry.path.as_ref() == path)
+            .is_some_and(|row| row.entry.is_dir_like())
+    }
+
     pub fn cursor(&self) -> Option<&EntryId> {
         self.selection.cursor()
     }
