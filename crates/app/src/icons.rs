@@ -81,6 +81,8 @@ pub enum Icon {
     Info,
     /// The settings pane toggle.
     Settings,
+    /// Copy the path to the clipboard.
+    Copy,
 }
 
 impl Icon {
@@ -91,6 +93,7 @@ impl Icon {
             Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
             Icon::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),
             Icon::Check => include_bytes!("../assets/icons/check.svg"),
+            Icon::Copy => include_bytes!("../assets/icons/copy.svg"),
             Icon::Folder => include_bytes!("../assets/icons/folder.svg"),
             Icon::Drive => include_bytes!("../assets/icons/hard-drive.svg"),
             Icon::Cloud => include_bytes!("../assets/icons/cloud.svg"),
@@ -118,6 +121,7 @@ impl Icon {
         Icon::ChevronDown,
         Icon::ChevronUp,
         Icon::Check,
+        Icon::Copy,
         Icon::Folder,
         Icon::Drive,
         Icon::Cloud,
@@ -167,6 +171,34 @@ pub fn entry_icon(is_dir_like: bool) -> Icon {
         Icon::Folder
     } else {
         Icon::File
+    }
+}
+
+/// The themed tint for an entry's icon (plan §6 `file_colors`).
+///
+/// Classification is fs-core's ([`fs_core::classify`]) so the details list,
+/// the icon grid and the info panel cannot disagree about what a `.rs` file
+/// is; the *colour* is the theme's, so a user theme can restyle the lot.
+///
+/// Entry icons are the only coloured icons in the app. Chrome — toolbar
+/// buttons, disclosure chevrons, sidebar controls — stays monochrome, because
+/// colour there would compete with the content it sits beside rather than
+/// telling the user anything.
+pub fn entry_icon_color(
+    path: &std::path::Path,
+    is_dir_like: bool,
+    theme: &crate::theme::Theme,
+) -> Hsla {
+    let colors = &theme.file_colors;
+    match fs_core::classify(path, is_dir_like) {
+        fs_core::FileKind::Folder => colors.folder,
+        fs_core::FileKind::Image => colors.image,
+        fs_core::FileKind::Code => colors.code,
+        fs_core::FileKind::Archive => colors.archive,
+        fs_core::FileKind::Audio => colors.audio,
+        fs_core::FileKind::Video => colors.video,
+        fs_core::FileKind::Document => colors.document,
+        fs_core::FileKind::Other => colors.other,
     }
 }
 
@@ -230,6 +262,25 @@ pub fn check_box(checked: bool, border: Hsla, fill: Hsla, tick: Hsla) -> Div {
 
 #[cfg(test)]
 mod tests {
+    /// The tint follows fs-core's classification, so the three views cannot
+    /// disagree about what a file is. Spot-checked rather than exhaustive:
+    /// the `match` in `entry_icon_color` is exhaustive by construction, so a
+    /// new `FileKind` is a compile error, not a silently grey icon.
+    #[test]
+    fn entry_tints_come_from_the_theme_by_kind() {
+        let theme = crate::theme::Theme::dark();
+        let c = &theme.file_colors;
+        let tint = |name: &str, dir: bool| {
+            super::entry_icon_color(std::path::Path::new(name), dir, &theme)
+        };
+        assert_eq!(tint("/a/anything", true), c.folder);
+        assert_eq!(tint("/a/photo.png", false), c.image);
+        assert_eq!(tint("/a/main.rs", false), c.code);
+        assert_eq!(tint("/a/backup.zip", false), c.archive);
+        assert_eq!(tint("/a/report.pdf", false), c.document);
+        assert_eq!(tint("/a/thing.qqq", false), c.other);
+    }
+
     use super::*;
 
     #[test]

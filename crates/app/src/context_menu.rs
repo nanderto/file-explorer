@@ -42,9 +42,9 @@ use gpui::{
 };
 
 use crate::actions::{
-    Copy, Cut, DeletePermanently, DeleteToTrash, Duplicate, NewFile, NewFolder, OpenSelected,
-    OpenTerminalHere, OpenWith, Paste, Refresh, RenameSelected, SortBy, ToggleHiddenFiles,
-    ToggleTag,
+    AddToFavorites, Copy, CopyPath, Cut, DeletePermanently, DeleteToTrash, Duplicate, NewFile,
+    NewFolder, OpenSelected, OpenTerminalHere, OpenWith, Paste, Refresh, RenameSelected, SortBy,
+    ToggleHiddenFiles, ToggleTag,
 };
 use fs_core::apps::ExternalApp;
 
@@ -243,6 +243,9 @@ pub struct MenuFacts {
     /// `Open Terminal Here` appears. Separate from `external_apps` because a
     /// terminal is not a document handler — see [`fs_core::apps::TERMINALS`].
     pub has_terminal: bool,
+    /// Whether `Add to Favorites` has a folder to pin — Favorites is a list
+    /// of *places*, so a highlighted file offers nothing to add.
+    pub can_favorite: bool,
 }
 
 impl MenuFacts {
@@ -300,6 +303,15 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     // where Finder's "Open With" and Explorer's "Open in Terminal" both are.
     items.extend(open_with_submenu(facts, any));
     items.extend(open_terminal_item(facts, any));
+    // Beside the other "act on this item" rows: the path of what was
+    // right-clicked, matching the button beside the path field.
+    items.push(command("Copy Path", Box::new(CopyPath), any));
+    // Only folders are places, so this is live only when one is the subject.
+    items.push(command(
+        "Add to Favorites",
+        Box::new(AddToFavorites),
+        facts.can_favorite,
+    ));
     items.extend([
         MenuItem::Separator,
         command("Cut", Box::new(Cut), any),
@@ -373,6 +385,14 @@ pub fn background_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     // "here" means with nothing selected.
     items.extend(open_with_submenu(facts, facts.has_dir));
     items.extend(open_terminal_item(facts, facts.has_dir));
+    // On the background this copies the open folder, which is what the path
+    // field shows when nothing is highlighted.
+    items.push(command("Copy Path", Box::new(CopyPath), facts.has_dir));
+    items.push(command(
+        "Add to Favorites",
+        Box::new(AddToFavorites),
+        facts.can_favorite,
+    ));
     items.extend([
         MenuItem::Separator,
         command("Refresh", Box::new(Refresh), facts.has_dir),
@@ -522,6 +542,7 @@ impl DirView {
             selection_tags: self.tags_on_whole_selection(),
             external_apps: self.external_apps(cx).to_vec(),
             has_terminal: self.terminal_app().is_some(),
+            can_favorite: self.favorite_target(cx).is_some(),
             paste_dest_inside_source: pane.as_ref().is_some_and(|pane| {
                 pane.read(cx)
                     .path()
@@ -881,6 +902,7 @@ mod tests {
             known_tags: fs_core::standard_tags(),
             external_apps: Vec::new(),
             has_terminal: false,
+            can_favorite: true,
             selection_tags: Vec::new(),
         }
     }
@@ -937,6 +959,8 @@ mod tests {
             named,
             vec![
                 "file_explorer::OpenSelected",
+                "file_explorer::CopyPath",
+                "file_explorer::AddToFavorites",
                 "file_explorer::Cut",
                 "file_explorer::Copy",
                 "file_explorer::Paste",

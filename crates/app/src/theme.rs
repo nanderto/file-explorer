@@ -416,7 +416,10 @@ mod tests {
     fn with_no_themes_folder_the_built_ins_are_the_whole_registry(cx: &mut TestAppContext) {
         boot(cx, json!({}));
         cx.update(|cx| {
-            assert_eq!(ActiveTheme::registry(cx).len(), 2);
+            assert_eq!(
+                ActiveTheme::registry(cx).len(),
+                ThemeRegistry::builtins_only().len()
+            );
             assert_eq!(theme(cx), &Theme::dark());
             assert!(ActiveTheme::diagnostics(cx).is_empty());
         });
@@ -429,7 +432,10 @@ mod tests {
             json!({ "themes": { "mine.json": theme_json("Mine", "hsl(0, 100%, 50%)") } }),
         );
         cx.update(|cx| {
-            assert_eq!(ActiveTheme::registry(cx).len(), 3);
+            assert_eq!(
+                ActiveTheme::registry(cx).len(),
+                ThemeRegistry::builtins_only().len() + 1
+            );
             assert!(ActiveTheme::registry(cx).get("Mine").is_some());
             // Not selected — only installed.
             assert_eq!(theme(cx).name, Theme::dark().name);
@@ -533,7 +539,10 @@ mod tests {
             } }),
         );
         cx.update(|cx| {
-            assert_eq!(ActiveTheme::registry(cx).len(), 3);
+            assert_eq!(
+                ActiveTheme::registry(cx).len(),
+                ThemeRegistry::builtins_only().len() + 1
+            );
             assert!(ActiveTheme::diagnostics(cx).is_empty());
         });
     }

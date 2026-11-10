@@ -1,0 +1,26 @@
+{
+  "name": "Slate Dark",
+  "appearance": "dark",
+  "colors": {
+    "surface": "hsl(222, 12%, 20%)",
+    "sidebar": "hsl(222, 12%, 23%)",
+    "panel": "hsl(222, 12%, 18%)",
+    "titlebar": "hsl(222, 12%, 23%)",
+    "text": "hsl(220, 12%, 86%)",
+    "muted": "hsl(220, 8%, 62%)",
+    "accent": "hsl(210, 70%, 60%)",
+    "selection": "hsla(210, 70%, 60%, 0.30)",
+    "border": "hsla(0, 0%, 0%, 0.22)",
+    "error": "hsl(0, 60%, 62%)"
+  },
+  "file_colors": {
+    "folder": "hsl(210, 70%, 66%)",
+    "image": "hsl(280, 45%, 72%)",
+    "code": "hsl(150, 40%, 64%)",
+    "archive": "hsl(35, 55%, 66%)",
+    "audio": "hsl(330, 45%, 70%)",
+    "video": "hsl(15, 55%, 67%)",
+    "document": "hsl(220, 10%, 76%)",
+    "other": "hsl(220, 8%, 62%)"
+  }
+}

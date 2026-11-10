@@ -1661,3 +1661,65 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   `fs_core::resolve_entered_path`. `AddressBarEvent::OpenFile` is new; the
   pane hands it to the global `Opener` and stays put, because the user asked
   for the file and not its folder.
+
+- `pane.rs`: `copy_display_path` is the single source for every Copy
+  affordance — the button beside the field, the path's own right-click menu,
+  and the listing's `Copy Path` row all put *what the field is showing* on the
+  clipboard, so they cannot disagree. `focus_address_bar` prefills from
+  `display_path` for the same reason; taking the open folder meant clicking
+  the path to copy it replaced the path you wanted.
+  `render_path_menu` is a one-item bespoke menu rather than a reuse of
+  `context_menu.rs` (built for, and bound to, `DirView`), positioned with
+  `deferred(anchored())` in **window** coordinates — `absolute` inside the
+  pane offsets it by the pane's own origin.
+- `icons.rs`: `Icon::Copy` (vendored ISC Lucide `copy.svg`).
+- `context_menu.rs` / `open_with.rs`: a `CopyPath` action, offered on both the
+  row menu (the right-clicked item) and the background menu (the open folder).
+
+- `tooltip.rs` (new): a one-line themed tooltip view. gpui's `.tooltip(..)`
+  takes a builder returning an `AnyView`, so a tooltip has to *be* a view —
+  there is no "just show this string" shorthand, and the app had none. Plain
+  by choice: Zed's richer tooltip is GPL and not a dependency here.
+- `pane.rs`: the chrome row's **path box** — a bordered field holding the
+  breadcrumb, the blank space that opens the editor, and the Copy button. The
+  button is inside it so its subject is unambiguous; beside the view switcher
+  it read as another toolbar control. In editing mode the editor draws that
+  border itself, so Copy sits just inside its right edge instead.
+- `workspace.rs`: `split_pane` seeds the new pane from the active pane's
+  **`display_path`** when it names a folder, so splitting opens what is
+  highlighted rather than a second copy of the current folder; a highlighted
+  file falls back to its folder. It also copies the active pane's view mode
+  rather than the complement — a deviation from plan §2, by request, because
+  comparing two places is harder when the halves are drawn differently.
+
+- `icons.rs`: `entry_icon_color` maps `fs_core::classify` onto the theme's
+  `file_colors` — the palette modelled since M7a and unpainted until now.
+  The `match` is exhaustive, so a new `FileKind` is a compile error rather
+  than a silently grey icon. **Entry icons are the only coloured icons**;
+  chrome stays monochrome so colour means "what this is", not "this is a
+  control".
+- `settings.rs` / `sidebar.rs`: the Trash is kept out of Recents on the way in
+  (`push_recent`) *and* filtered on the way out, because a profile written
+  before the change still contains it. `remove_recent` backs the Recents row's
+  right-click **Remove from Recents**, which persists immediately like
+  unpinning a favorite.
+
+- `sidebar.rs`: rows are `ROW_HEIGHT` 24 (see the constant's doc for why not
+  more), their icons are tinted by `location_color` / the folder colour, and
+  the Favorites section carries `flex_none` — without it the column shrank it
+  below its content once the sections outgrew the sidebar, and the Recents
+  header overdrew its last row.
+- `settings.rs`: `is_uninteresting_recent` keeps both the Trash and the
+  filesystem root out of Recents; both are reached from their own sections,
+  and the list is capped.
+- `open_with.rs` / `context_menu.rs`: `AddToFavorites`, offered for folders
+  only (`favorite_target`) — Favorites is a list of places, so a pinned file
+  would have nowhere to navigate to.
+
+- Packaging (M8): `scripts/bundle.sh` builds `File Explorer.app` (and a `.dmg`
+  with `--dmg`) from a release build; `.github/workflows/release.yml` runs the
+  same script on a `v*` tag. Hand-assembled rather than `cargo-bundle` (plan
+  §4) — a `.app` is a directory with an `Info.plist`, and this avoids a pinned
+  dependency while running identically locally and on CI. The release job
+  refuses a tag that disagrees with `Cargo.toml`'s version. Unsigned until an
+  Apple Developer membership exists; the release notes say so.

@@ -635,7 +635,30 @@ of `PathTarget::{Folder, File, Nearest, Nothing}`.
 - Every probe goes through `Vfs::metadata`, so it never blocks the UI thread
   and is testable against `FakeVfs`. 11 unit tests.
 
+### Classifying a file: `kind.rs`
+
+`classify(path, is_dir_like) -> FileKind` — the eight kinds the theme's
+`file_colors` palette names (folder, image, code, archive, audio, video,
+document, other).
+
+- **An extension table, not a UTI lookup or a content sniff.** Both of those
+  are OS calls, and this runs for every visible row on every repaint. Being
+  occasionally wrong and always free is the right trade for a *tint*.
+- In fs-core rather than the app so it is portable and testable headless, and
+  so the details list, the icon grid and the info panel cannot disagree about
+  what a `.rs` file is.
+- `Other` is a classification with its own colour, not a failure.
+- 7 unit tests (each family, case-insensitivity, last-extension-wins,
+  extensionless and dotfile names, and a directory named like a source file).
+
 ## theme (crate)
+
+**Four built-ins, two per appearance** (M8): `Graphite Dark`/`Graphite Light`
+are the original high-contrast pair; `Slate Dark` and `Parchment Light` are
+softer — a lifted, less-black dark and an off-white, slightly warm light —
+added by request. Two per appearance means `appearance: system` has a real
+choice on either side.
+
 
 `crates/theme` (lib name `theme`) — the theme **model and JSON loader**,
 built at M7a. Depends on gpui only for `Hsla`/`SharedString`: no windows, no

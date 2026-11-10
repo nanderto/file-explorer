@@ -1470,6 +1470,16 @@ impl Render for DirView {
                     this.handle_open_terminal_here(action, cx)
                 }),
             )
+            .on_action(
+                cx.listener(|this, action: &crate::actions::CopyPath, _, cx| {
+                    this.handle_copy_path(action, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &crate::actions::AddToFavorites, _, cx| {
+                    this.handle_add_to_favorites(action, cx)
+                }),
+            )
             // §0 cursor movement. In the details list `down`/`up` step one
             // row; in the icon grid they step one *line* (±cols) and
             // `right`/`left` take over horizontal movement from

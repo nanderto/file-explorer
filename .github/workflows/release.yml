@@ -1,0 +1,64 @@
+name: Release
+
+# Tag-driven: `git tag v0.1.0 && git push origin v0.1.0` builds the app and
+# attaches it to a GitHub Release. Nothing publishes from a branch push, so a
+# release is always a deliberate act.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish the .app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The same script you run locally, so "it bundles on CI only" cannot
+      # happen (scripts/bundle.sh).
+      - name: Bundle
+        run: ./scripts/bundle.sh --dmg
+
+      - name: Check the version matches the tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          gh release create "$TAG" \
+            --title "File Explorer $TAG" \
+            --notes "$(cat <<'NOTES'
+### Install
+
+Download the `.dmg`, open it, and drag **File Explorer** to Applications.
+
+> **This build is not signed or notarised yet.** macOS will refuse to open it
+> on the first try. Right-click the app in Applications and choose **Open**,
+> then confirm — you only need to do that once. Signing is tracked in M8.
+NOTES
+)" \
+            "target/bundle/FileExplorer-$VERSION.dmg" \
+            || gh release upload "$TAG" "target/bundle/FileExplorer-$VERSION.dmg" --clobber

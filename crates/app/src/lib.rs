@@ -30,6 +30,7 @@ pub mod sidebar;
 pub mod tags;
 pub mod theme;
 pub mod thumbnails;
+pub mod tooltip;
 pub mod views;
 pub mod visual_diff;
 pub(crate) mod watch_guard;

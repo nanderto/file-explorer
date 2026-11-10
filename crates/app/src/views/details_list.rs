@@ -323,7 +323,7 @@ fn render_row(
                 .mr(px(6.0))
                 .child(crate::icons::icon(
                     crate::icons::entry_icon(entry.is_dir_like()),
-                    theme.muted,
+                    crate::icons::entry_icon_color(&entry.path, entry.is_dir_like(), &theme),
                 )),
         )
         .child(
