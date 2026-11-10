@@ -974,6 +974,10 @@ mod tests {
             self.inner.terminal().await
         }
 
+        async fn http_get_text(&self, url: &str) -> Option<String> {
+            self.inner.http_get_text(url).await
+        }
+
         async fn open_with(
             &self,
             app: &fs_core::apps::ExternalApp,

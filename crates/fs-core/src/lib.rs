@@ -49,6 +49,7 @@ pub mod sort;
 pub mod tags;
 pub mod thumbnail;
 pub mod undo;
+pub mod update;
 pub mod vfs;
 pub mod watcher;
 
@@ -94,6 +95,7 @@ pub use thumbnail::{
     validate_px as validate_thumbnail_px,
 };
 pub use undo::{AttrGuard, Fingerprint, UndoEntry, UndoOutcome, UndoStack};
+pub use update::{Version, is_update};
 pub use vfs::{
     CopyCancelled, CreateOptions, PERM_BITS, ProgressFn, RealVfs, RemoveOptions, RenameOptions,
     TrashId, TrashRestoreError, Vfs, VolumeKey,

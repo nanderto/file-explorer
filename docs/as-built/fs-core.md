@@ -651,6 +651,21 @@ document, other).
 - 7 unit tests (each family, case-insensitivity, last-extension-wins,
   extensionless and dotfile names, and a directory named like a source file).
 
+### Version comparison: `update.rs`
+
+`Version::parse` + `is_update` — and nothing else. Fetching is an OS call
+behind `Platform::http_get_text`; parsing the release payload needs
+`serde_json` and lives in the app, which already has it. What is left is the
+part worth testing exhaustively: `0.10.0` is newer than `0.9.0`, a string
+comparison says it is not.
+
+- A tag parses with or without its `v`; missing components default to zero.
+- Pre-release metadata (`1.0.0-rc.1`) is accepted but ignored for ordering —
+  better to miss a release candidate than to nag about one.
+- An unreadable version is `None`, never "newer": a version we cannot read
+  must not prompt.
+- 9 unit tests.
+
 ## theme (crate)
 
 **Four built-ins, two per appearance** (M8): `Graphite Dark`/`Graphite Light`

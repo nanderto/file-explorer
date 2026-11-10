@@ -67,6 +67,7 @@ struct ChangedSinceBoot {
     theme: bool,
     confirm_delete_to_trash: bool,
     folders_first: bool,
+    check_for_updates: bool,
 }
 
 /// The complete document. Compiled in, so a setting always has a value.
@@ -99,6 +100,9 @@ pub struct SettingsContent {
     /// Plan §3: "Folders always grouped first (setting)". On by default,
     /// which is `SortSpec::default()`.
     pub folders_first: bool,
+    /// Whether to ask GitHub, once per launch, if a newer release exists.
+    /// On by default; the check is one GET and reports nothing when it fails.
+    pub check_for_updates: bool,
 }
 
 impl Default for SettingsContent {
@@ -123,6 +127,7 @@ struct SettingsPartial {
     theme: Option<ThemeSelection>,
     confirm_delete_to_trash: Option<bool>,
     folders_first: Option<bool>,
+    check_for_updates: Option<bool>,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -143,6 +148,9 @@ impl SettingsPartial {
         }
         if let Some(confirm) = self.confirm_delete_to_trash {
             base.confirm_delete_to_trash = confirm;
+        }
+        if let Some(check_for_updates) = self.check_for_updates {
+            base.check_for_updates = check_for_updates;
         }
         if let Some(folders_first) = self.folders_first {
             base.folders_first = folders_first;
@@ -291,6 +299,21 @@ impl AppSettings {
     }
 
     /// Plan §3's "folders always grouped first".
+    /// Whether the update check runs at launch.
+    pub fn check_for_updates(&self) -> bool {
+        self.content.check_for_updates
+    }
+
+    /// Returns whether anything changed.
+    pub fn set_check_for_updates(&mut self, value: bool) -> bool {
+        if self.content.check_for_updates == value {
+            return false;
+        }
+        self.content.check_for_updates = value;
+        self.changed.check_for_updates = true;
+        true
+    }
+
     pub fn folders_first(&self) -> bool {
         self.content.folders_first
     }

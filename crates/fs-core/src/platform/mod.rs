@@ -187,6 +187,19 @@ pub trait Platform: Send + Sync {
     /// folder — this list is curated out of necessity, not preference.
     async fn terminal(&self) -> Option<ExternalApp>;
 
+    /// Fetch `url` and return the body as text.
+    ///
+    /// The one network call in the app: the update check (plan §7 M8). It is
+    /// on the `Platform` seam for the same reason every OS call is — so a
+    /// headless test gets a deterministic answer and nothing in a test run
+    /// ever touches the network.
+    ///
+    /// Best-effort by contract: *any* failure is `None`. A missing network,
+    /// a rate limit and a malformed response are the same thing to the
+    /// caller — there is no update to report — and an app must never
+    /// interrupt someone because a check failed.
+    async fn http_get_text(&self, url: &str) -> Option<String>;
+
     /// Open `target` in `app`, **in a new window on the Space the user is
     /// currently looking at**.
     ///

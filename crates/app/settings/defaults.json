@@ -4,5 +4,6 @@
   "recents": [],
   "theme": "Graphite Dark",
   "confirm_delete_to_trash": false,
-  "folders_first": true
+  "folders_first": true,
+  "check_for_updates": true
 }

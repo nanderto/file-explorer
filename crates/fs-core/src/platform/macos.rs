@@ -177,6 +177,40 @@ impl Platform for MacPlatform {
             .await
     }
 
+    /// `curl`, rather than a Rust HTTP client.
+    ///
+    /// One GET, once per launch, against a known URL — an HTTP stack plus TLS
+    /// would be the heaviest dependency in the tree for that. `curl` ships
+    /// with macOS, the same way `diskutil` and `open` already do here.
+    ///
+    /// `--max-time` so a hung connection cannot keep a task alive for the
+    /// life of the process, and `--fail` so an HTTP error is an error rather
+    /// than a body we would try to parse.
+    async fn http_get_text(&self, url: &str) -> Option<String> {
+        let url = url.to_string();
+        self.spawner
+            .unblock(move || {
+                let output = Command::new("/usr/bin/curl")
+                    .args([
+                        "--silent",
+                        "--fail",
+                        "--location",
+                        "--max-time",
+                        "10",
+                        "--user-agent",
+                        concat!("file-explorer/", env!("CARGO_PKG_VERSION")),
+                        &url,
+                    ])
+                    .output()
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                String::from_utf8(output.stdout).ok()
+            })
+            .await
+    }
+
     async fn terminal(&self) -> Option<ExternalApp> {
         self.spawner
             .unblock(move || crate::apps::discover_terminal_in(&crate::apps::default_roots()))
