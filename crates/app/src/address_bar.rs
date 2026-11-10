@@ -18,6 +18,8 @@ use gpui::{
 };
 
 use crate::actions::{AcceptSuggestion, Cancel, Confirm};
+use fs_core::PathTarget;
+
 use crate::app_state::FsContext;
 use crate::input::text_input as ti;
 use crate::input::{InputEvent, InputState};
@@ -25,6 +27,9 @@ use crate::input::{InputEvent, InputState};
 /// Outcome of an edit, consumed by the owning Pane.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AddressBarEvent {
+    /// The typed path named a **file**: the pane hands it to the system's
+    /// default application rather than trying to navigate into it.
+    OpenFile(PathBuf),
     /// A valid directory path was confirmed.
     Navigated(PathBuf),
     /// Editing was abandoned with `escape` — restore the breadcrumb **and**
@@ -194,36 +199,37 @@ impl AddressBar {
         cx.notify();
     }
 
-    /// `enter` — validate on the background executor; a directory navigates,
-    /// anything else keeps editing with an inline error.
+    /// `enter` — resolve what was typed on the background executor and act on
+    /// the answer.
+    ///
+    /// Resolution has three useful outcomes rather than one (see
+    /// [`fs_core::resolve_entered_path`]): a folder navigates, a file opens in
+    /// its default application, and a path whose tail no longer exists lands
+    /// you at the deepest part that does. Only a path with no existing
+    /// ancestor at all is an error worth showing — anything else leaves the
+    /// user somewhere useful instead of deleting components by hand until it
+    /// works, which is the one thing they could already do.
     pub(crate) fn confirm(&mut self, cx: &mut Context<Self>) {
         let typed = self.text(cx);
-        let path = PathBuf::from(typed.trim());
-        if path.as_os_str().is_empty() {
+        if typed.trim().is_empty() {
             self.error = Some("Enter a path".into());
             cx.notify();
             return;
         }
         let vfs = FsContext::global(cx).vfs.clone();
-        let stat_path = path.clone();
         self._confirm_task = Some(cx.spawn(async move |this, cx| {
-            let meta = cx
-                .background_spawn(async move { vfs.metadata(&stat_path).await })
+            let target = cx
+                .background_spawn(async move { fs_core::resolve_entered_path(vfs, &typed).await })
                 .await;
-            this.update(cx, |this, cx| match meta {
-                Ok(Some(meta)) if meta.kind.is_dir_like() => {
+            this.update(cx, |this, cx| match target {
+                PathTarget::Folder(path) | PathTarget::Nearest(path) => {
                     cx.emit(AddressBarEvent::Navigated(path));
                 }
-                Ok(Some(_)) => {
-                    this.error = Some("Not a folder".into());
-                    cx.notify();
+                PathTarget::File(path) => {
+                    cx.emit(AddressBarEvent::OpenFile(path));
                 }
-                Ok(None) => {
+                PathTarget::Nothing => {
                     this.error = Some("Path does not exist".into());
-                    cx.notify();
-                }
-                Err(e) => {
-                    this.error = Some(SharedString::from(format!("Cannot open: {e}")));
                     cx.notify();
                 }
             })
@@ -536,7 +542,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn confirm_navigates_to_directories_and_rejects_files(cx: &mut TestAppContext) {
+    async fn confirm_resolves_folders_files_and_dead_tails(cx: &mut TestAppContext) {
         let (bar, cx) = setup(cx);
         let events = Rc::new(RefCell::new(Vec::new()));
         let sink = events.clone();
@@ -547,15 +553,19 @@ mod tests {
             .detach();
         });
 
-        // A directory navigates.
-        bar.update_in(cx, |bar, window, cx| {
-            bar.begin_editing(None, window, cx);
-            bar.input.update(cx, |input, cx| {
-                input.set_value(format!("{}home{}Documents", sep(), sep()), window, cx)
+        let enter = |bar: &Entity<AddressBar>, cx: &mut VisualTestContext, text: String| {
+            bar.update_in(cx, |bar, window, cx| {
+                bar.input
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+                bar.confirm(cx);
             });
-            bar.confirm(cx);
-        });
-        cx.run_until_parked();
+            cx.run_until_parked();
+        };
+
+        bar.update_in(cx, |bar, window, cx| bar.begin_editing(None, window, cx));
+
+        // A folder navigates.
+        enter(&bar, cx, format!("{}home{}Documents", sep(), sep()));
         assert_eq!(
             events.borrow().as_slice(),
             &[AddressBarEvent::Navigated(PathBuf::from(format!(
@@ -565,30 +575,50 @@ mod tests {
             )))]
         );
 
-        // A file shows an inline error and does not navigate.
-        bar.update_in(cx, |bar, window, cx| {
-            bar.input.update(cx, |input, cx| {
-                input.set_value(format!("{}home{}readme.md", sep(), sep()), window, cx)
-            });
-            bar.confirm(cx);
-        });
-        cx.run_until_parked();
-        bar.update(cx, |bar, _| {
-            assert_eq!(bar.error.as_deref(), Some("Not a folder"));
-        });
-        assert_eq!(events.borrow().len(), 1, "no second navigation");
+        // A file opens rather than being refused — the field doubles as a
+        // launcher, which is what "Not a folder" used to deny.
+        enter(&bar, cx, format!("{}home{}readme.md", sep(), sep()));
+        assert_eq!(
+            events.borrow().last(),
+            Some(&AddressBarEvent::OpenFile(PathBuf::from(format!(
+                "{}home{}readme.md",
+                sep(),
+                sep()
+            )))),
+            "a typed file path opens the file"
+        );
+        bar.update(cx, |bar, _| assert_eq!(bar.error, None));
 
-        // A missing path errors too.
-        bar.update_in(cx, |bar, window, cx| {
-            bar.input.update(cx, |input, cx| {
-                input.set_value(format!("{}nope", sep()), window, cx)
-            });
-            bar.confirm(cx);
-        });
-        cx.run_until_parked();
+        // A dead tail lands at the deepest part that does exist, instead of
+        // making the user delete components by hand.
+        enter(
+            &bar,
+            cx,
+            format!(
+                "{}home{}Documents{}gone{}deeper",
+                sep(),
+                sep(),
+                sep(),
+                sep()
+            ),
+        );
+        assert_eq!(
+            events.borrow().last(),
+            Some(&AddressBarEvent::Navigated(PathBuf::from(format!(
+                "{}home{}Documents",
+                sep(),
+                sep()
+            )))),
+            "the closest matching folder"
+        );
+
+        // Only a path with no existing ancestor at all is an error.
+        let before = events.borrow().len();
+        enter(&bar, cx, format!("{}nope{}at{}all", sep(), sep(), sep()));
         bar.update(cx, |bar, _| {
             assert_eq!(bar.error.as_deref(), Some("Path does not exist"));
         });
+        assert_eq!(events.borrow().len(), before, "and nothing moved");
     }
 
     #[gpui::test]

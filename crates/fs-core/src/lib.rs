@@ -40,6 +40,7 @@ pub mod entry;
 pub mod exec;
 pub mod listing;
 pub mod locations;
+pub mod navigate;
 pub mod ops;
 pub mod platform;
 pub mod search;
@@ -69,6 +70,7 @@ pub use listing::{
 pub use locations::{
     Location, LocationKind, fixed_candidates, onedrive_candidates, resolve_locations,
 };
+pub use navigate::{PathTarget, resolve_entered_path};
 pub use ops::{
     Conflict, ConflictChoice, FileOp, JobEvent, JobId, JobInfo, JobKind, JobQueue, OpReceipt,
     PrevAttrs, Resolution, keep_both_candidates, plan_keep_both_names, split_name,

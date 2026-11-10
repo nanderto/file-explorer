@@ -615,6 +615,26 @@ context menu's **Open with ▸** and **Open Terminal Here**.
   degradation, every launch command's flags, the anti-`open -a` guard,
   dedup and default-first ordering, terminal preference, `enclosing_directory`).
 
+### Resolving a typed path: `navigate.rs`
+
+`resolve_entered_path` turns whatever was typed into the address bar into one
+of `PathTarget::{Folder, File, Nearest, Nothing}`.
+
+- **Three useful answers, not one.** A path that is *nearly* right is far more
+  common than one that is exactly right. A folder navigates; a **file** opens
+  in its default application; a dead tail yields `Nearest` — the deepest
+  ancestor that exists — so a pasted stale path lands as close to the intent
+  as the filesystem allows.
+- **The bare root is not a match.** Every absolute path has `/` as an
+  ancestor, so accepting it would turn any typo into a silent trip to the
+  filesystem root. A path whose very first component is wrong is `Nothing`.
+  Found by a test, not by inspection.
+- An ancestor that is a *file* is climbed past — it is not somewhere to stand.
+- Trailing separators and surrounding whitespace are normalised, because that
+  is how paths arrive from a clipboard.
+- Every probe goes through `Vfs::metadata`, so it never blocks the UI thread
+  and is testable against `FakeVfs`. 11 unit tests.
+
 ## theme (crate)
 
 `crates/theme` (lib name `theme`) — the theme **model and JSON loader**,

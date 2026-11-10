@@ -270,6 +270,11 @@ impl Pane {
         });
         let pane = cx.weak_entity();
         let dir_view = cx.new(|cx| DirView::new(pane, cx));
+        // The path field names what is *highlighted*, so the pane's own
+        // chrome has to repaint when the cursor moves — the listing
+        // re-rendering itself is not enough, since the breadcrumb is drawn by
+        // the pane, not by the view.
+        let cursor_observation = cx.observe(&dir_view, |_, _, cx| cx.notify());
         // Events up, method calls down (§2): the DirView reports opened
         // folders; the pane navigates.
         let subscription = cx.subscribe(&dir_view, |this, _, event, cx| match event {
@@ -296,6 +301,13 @@ impl Pane {
                     this.navigate_to(path, cx);
                     window.focus(&this.focus_handle, cx);
                     cx.notify();
+                }
+                // A typed file path opens the file; the pane stays where it
+                // is, because the user asked for the file and not its folder.
+                AddressBarEvent::OpenFile(path) => {
+                    this.close_address_bar(cx);
+                    FsContext::global(cx).opener.open(path);
+                    window.focus(&this.focus_handle, cx);
                 }
                 AddressBarEvent::Cancelled => {
                     this.address_bar = AddressBarMode::Breadcrumb;
@@ -368,6 +380,7 @@ impl Pane {
                 bar_subscription,
                 search_subscription,
                 focus_subscription,
+                cursor_observation,
             ],
         }
     }
@@ -500,6 +513,30 @@ impl Pane {
         jobs.update(cx, |jobs, cx| {
             jobs.push_notice(COLUMNS_UNAVAILABLE_NOTICE.to_string(), cx);
         });
+    }
+
+    /// The path the field names: **what is highlighted**, not what is open.
+    ///
+    /// The listing expands folders in place (§2 disclosure triangles), so the
+    /// pane's open folder and the thing the user is looking at routinely
+    /// disagree — highlight something three levels into an expanded tree and
+    /// the open folder is still the one picked in the sidebar. A field that
+    /// named the open folder therefore just echoed the last sidebar click and
+    /// then went stale, which is useless.
+    ///
+    /// Falls back to the open folder when nothing is highlighted, which is
+    /// the only time the two coincide.
+    ///
+    /// Returns the path and whether it names a **directory** — the breadcrumb
+    /// uses that to decide whether the last segment is a place to go.
+    pub fn display_path(&self, cx: &App) -> Option<(PathBuf, bool)> {
+        let view = self.dir_view.read(cx);
+        if let Some(cursor) = view.cursor() {
+            let path = cursor.0.to_path_buf();
+            let is_dir = view.entry_is_dir_like(&path);
+            return Some((path, is_dir));
+        }
+        self.path.as_deref().map(|p| (p.to_path_buf(), true))
     }
 
     /// Put the breadcrumb back, if the editable path is showing.
@@ -1060,7 +1097,7 @@ impl Pane {
             .min_w(px(0.0))
             .overflow_hidden()
             .gap(px(2.0));
-        if let Some(path) = &self.path {
+        if let Some((path, ends_in_dir)) = self.display_path(cx) {
             let mut ancestor = PathBuf::new();
             let components: Vec<_> = path.components().collect();
             let count = components.len();
@@ -1075,22 +1112,29 @@ impl Pane {
                     segments = segments
                         .child(div().text_color(theme.muted).child(SharedString::from("›")));
                 }
-                segments = segments.child(
-                    div()
-                        .id(("breadcrumb-segment", i))
-                        .px(px(4.0))
-                        .rounded(px(3.0))
-                        .text_color(if i + 1 == count {
-                            theme.text
-                        } else {
-                            theme.muted
-                        })
+                // The last segment of a highlighted *file* is not somewhere
+                // to go, so it is painted as the terminus and does nothing —
+                // a stray click must not launch anything. Enter in the field
+                // is the deliberate way to open it.
+                let is_file_terminus = i + 1 == count && !ends_in_dir;
+                let mut segment = div()
+                    .id(("breadcrumb-segment", i))
+                    .px(px(4.0))
+                    .rounded(px(3.0))
+                    .text_color(if i + 1 == count {
+                        theme.text
+                    } else {
+                        theme.muted
+                    })
+                    .child(SharedString::from(label));
+                if !is_file_terminus {
+                    segment = segment
                         .hover(|s| s.bg(theme.accent.opacity(0.15)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.navigate_to(&target, cx);
-                        }))
-                        .child(SharedString::from(label)),
-                );
+                        }));
+                }
+                segments = segments.child(segment);
             }
         }
         row.child(segments)
@@ -1489,6 +1533,130 @@ mod tests {
 
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.path(), Some(Path::new("/other")));
+            assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // The path field names what is highlighted, not what is open.
+    // ------------------------------------------------------------------
+
+    /// With nothing highlighted the two coincide, which is the only time the
+    /// old behaviour was right.
+    #[gpui::test]
+    fn the_path_falls_back_to_the_open_folder(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let shown = pane.update(cx, |pane, cx| pane.display_path(cx));
+        assert_eq!(shown, Some((PathBuf::from("/root"), true)));
+    }
+
+    /// Highlighting a file names the **file**, in full — the whole point of
+    /// the change. The open folder is unchanged.
+    #[gpui::test]
+    fn the_path_names_the_highlighted_file(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        view.update(cx, |view, cx| {
+            view.set_cursor(Some(EntryId(Arc::from(Path::new("/root/file2.txt")))), cx)
+        });
+        cx.run_until_parked();
+
+        let shown = pane.update(cx, |pane, cx| pane.display_path(cx));
+        assert_eq!(
+            shown,
+            Some((PathBuf::from("/root/file2.txt"), false)),
+            "the field names the highlighted file, not the open folder"
+        );
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")), "location unchanged");
+        });
+    }
+
+    /// A highlighted folder is reported as a directory, so the breadcrumb
+    /// keeps its last segment clickable.
+    #[gpui::test]
+    fn a_highlighted_folder_is_reported_as_a_directory(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        view.update(cx, |view, cx| {
+            view.set_cursor(Some(EntryId(Arc::from(Path::new("/root/sub")))), cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.update(cx, |pane, cx| pane.display_path(cx)),
+            Some((PathBuf::from("/root/sub"), true))
+        );
+    }
+
+    /// Entering a path to a file opens it rather than refusing — and the
+    /// pane does not move, because the file is what was asked for.
+    #[gpui::test]
+    fn entering_a_file_path_opens_it_and_stays_put(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let opened: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
+        cx.update(|cx| {
+            crate::app_state::FsContext::global_mut(cx).opener =
+                Arc::new(crate::app_state::RecordingOpener(opened.clone()));
+        });
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        let bar = pane.read_with(cx, |pane, _| pane.address_bar_view.clone());
+        bar.update_in(cx, |bar, window, cx| {
+            bar.set_value_for_test("/root/file2.txt", window, cx);
+            bar.confirm(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            &[PathBuf::from("/root/file2.txt")],
+            "a typed file path opens the file"
+        );
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")), "and stays put");
+            assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
+        });
+    }
+
+    /// A pasted path whose tail is gone lands at the deepest part that
+    /// exists, instead of refusing.
+    #[gpui::test]
+    fn entering_a_dead_tail_lands_at_the_closest_matching_folder(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        let bar = pane.read_with(cx, |pane, _| pane.address_bar_view.clone());
+        bar.update_in(cx, |bar, window, cx| {
+            bar.set_value_for_test("/root/sub/gone/deeper", window, cx);
+            bar.confirm(cx);
+        });
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root/sub")));
             assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
         });
     }
