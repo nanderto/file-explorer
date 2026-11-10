@@ -644,6 +644,7 @@ impl Pane {
             .when(enabled, |el| {
                 el.cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
+                    .tooltip(crate::tooltip::Tooltip::text("Copy path"))
                     .on_click(cx.listener(|this, _, _, cx| this.copy_display_path(cx)))
             })
             .child(crate::icons::icon(
@@ -1180,9 +1181,19 @@ impl Pane {
             .text_size(px(13.0));
 
         if self.address_bar == AddressBarMode::Editing {
+            // The editor draws its own border, so the Copy button sits just
+            // inside its right edge rather than in a box of its own — the
+            // field *is* the path box in this mode.
             return row
-                .child(div().flex_1().child(self.address_bar_view.clone()))
-                .child(self.render_copy_path(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(div().flex_1().child(self.address_bar_view.clone()))
+                        .child(self.render_copy_path(cx)),
+                )
                 .child(self.render_view_switcher(cx))
                 .child(self.search_bar.clone());
         }
@@ -1239,32 +1250,53 @@ impl Pane {
                 segments = segments.child(segment);
             }
         }
-        row.on_mouse_down(
-            MouseButton::Right,
-            cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                this.path_menu = Some(event.position);
-                cx.notify();
-            }),
-        )
-        .child(segments)
-        .child(
-            // Blank filler: click to edit the path (cmd-l equivalent).
-            div()
-                .id("breadcrumb-blank")
-                .flex_1()
-                .h_full()
-                .min_h(px(20.0))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.focus_address_bar(window, cx);
-                })),
-        )
-        .child(self.render_copy_path(cx))
-        .child(self.render_view_switcher(cx))
-        // §0 "Search field focus": the blueprint screenshot's top-right
-        // toolbar control (M6a). Per-pane, at the right-hand end of the
-        // pane's own chrome row, so a split pane gets two independent
-        // searches rather than one that silently retargets.
-        .child(self.search_bar.clone())
+        // The path **box**: breadcrumb, the blank space that opens the
+        // editor, and Copy, inside one bordered field. The button lives in
+        // here rather than out in the toolbar so it is unambiguous *what* it
+        // copies — beside the view switcher it read as another toolbar
+        // control with no particular subject.
+        let path_box = div()
+            .id("path-box")
+            .debug_selector(|| "path-box".into())
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .min_w(px(0.0))
+            .h(px(24.0))
+            .px(px(6.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.path_menu = Some(event.position);
+                    cx.notify();
+                }),
+            )
+            .child(segments)
+            .child(
+                // Blank filler: click to edit the path (cmd-l equivalent).
+                div()
+                    .id("breadcrumb-blank")
+                    .flex_1()
+                    .h_full()
+                    .min_h(px(20.0))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus_address_bar(window, cx);
+                    })),
+            )
+            .child(self.render_copy_path(cx));
+
+        row.child(path_box)
+            .child(self.render_view_switcher(cx))
+            // §0 "Search field focus": the blueprint screenshot's top-right
+            // toolbar control (M6a). Per-pane, at the right-hand end of the
+            // pane's own chrome row, so a split pane gets two independent
+            // searches rather than one that silently retargets.
+            .child(self.search_bar.clone())
     }
 
     /// The §0 "View mode switcher" toolbar control: two segmented buttons

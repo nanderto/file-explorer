@@ -1675,3 +1675,19 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
 - `icons.rs`: `Icon::Copy` (vendored ISC Lucide `copy.svg`).
 - `context_menu.rs` / `open_with.rs`: a `CopyPath` action, offered on both the
   row menu (the right-clicked item) and the background menu (the open folder).
+
+- `tooltip.rs` (new): a one-line themed tooltip view. gpui's `.tooltip(..)`
+  takes a builder returning an `AnyView`, so a tooltip has to *be* a view —
+  there is no "just show this string" shorthand, and the app had none. Plain
+  by choice: Zed's richer tooltip is GPL and not a dependency here.
+- `pane.rs`: the chrome row's **path box** — a bordered field holding the
+  breadcrumb, the blank space that opens the editor, and the Copy button. The
+  button is inside it so its subject is unambiguous; beside the view switcher
+  it read as another toolbar control. In editing mode the editor draws that
+  border itself, so Copy sits just inside its right edge instead.
+- `workspace.rs`: `split_pane` seeds the new pane from the active pane's
+  **`display_path`** when it names a folder, so splitting opens what is
+  highlighted rather than a second copy of the current folder; a highlighted
+  file falls back to its folder. It also copies the active pane's view mode
+  rather than the complement — a deviation from plan §2, by request, because
+  comparing two places is harder when the halves are drawn differently.

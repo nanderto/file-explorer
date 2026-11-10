@@ -792,22 +792,34 @@ impl Workspace {
     /// selection, address bar and status line. Two things are seeded rather
     /// than defaulted:
     ///
-    /// * the **directory**, copied from the active pane, because a split whose
-    ///   new half showed "No folder open" would make the user re-navigate to
-    ///   the place they just split from; and
-    /// * the **view mode**, set to the *complement* of the active pane's, per
-    ///   plan §2, whose blueprint screenshot is a details list beside an icon
-    ///   grid. One `cmd-1`/`cmd-2` undoes it if that is not wanted.
+    /// * the **directory** — the highlighted folder if there is one,
+    ///   otherwise the active pane's own, because a split whose new half
+    ///   showed "No folder open" would make the user re-navigate to the place
+    ///   they just split from. A highlighted *file* is not somewhere to open,
+    ///   so it falls back to the folder; and
+    /// * the **view mode**, copied from the active pane. Plan §2's blueprint
+    ///   screenshot shows a details list beside an icon grid, and this used to
+    ///   seed the *complement* to match it — but a split is for comparing two
+    ///   places, and comparing is harder when the two halves are drawn
+    ///   differently. **Deviation from the plan, by request.** One
+    ///   `cmd-1`/`cmd-2` changes it.
     ///
     /// `show_hidden` is workspace-global (§0 `ToggleHiddenFiles` fans out), so
     /// the new pane adopts the current value instead of resetting it.
     fn split_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (path, view_mode) = {
-            let active = self.active_pane().read(cx);
-            (
-                active.path().map(Path::to_path_buf),
-                active.view_mode().complement(),
-            )
+            let active = self.active_pane().clone();
+            let view_mode = active.read(cx).view_mode();
+            // Split *into* the highlighted folder when there is one: the
+            // reason to split is almost always "show me that beside this",
+            // and opening a second copy of the folder you are already in
+            // makes the user navigate again. A highlighted **file** is not
+            // somewhere to open, so that falls back to the open folder.
+            let path = active.update(cx, |pane, cx| match pane.display_path(cx) {
+                Some((path, true)) => Some(path),
+                _ => pane.path().map(Path::to_path_buf),
+            });
+            (path, view_mode)
         };
         let show_hidden = self.show_hidden;
         let pane = cx.new(|cx| Pane::new(window, cx));
@@ -2355,6 +2367,72 @@ mod tests {
     // §0 Split-pane toggle: cmd-shift-o grows the pane Vec to two and back to
     // one, and the fresh pane opens on the same directory in the *other* view
     // mode (plan §2's list-beside-grid blueprint).
+    /// Splitting with a folder highlighted opens the split *into* that
+    /// folder — the reason to split is almost always "show me that beside
+    /// this", and opening a second copy of where you already are makes the
+    /// user navigate again.
+    #[gpui::test]
+    fn splitting_opens_the_highlighted_folder(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/root", json!({ "sub": {}, "file2.txt": "x" }));
+        let (workspace, cx) = build_workspace(cx);
+        let first = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        first.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        focus_workspace(&workspace, cx);
+        let view = first.read_with(cx, |pane, _| pane.dir_view().clone());
+        view.update(cx, |view, cx| {
+            view.set_cursor(
+                Some(fs_core::EntryId(Arc::from(Path::new("/root/sub")))),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-shift-o");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.panes()[1].read(cx).path(),
+                Some(Path::new("/root/sub")),
+                "the split opens the highlighted folder"
+            );
+        });
+    }
+
+    /// A highlighted *file* is not somewhere to open, so the split falls back
+    /// to the folder it lives in.
+    #[gpui::test]
+    fn splitting_on_a_highlighted_file_opens_its_folder(cx: &mut TestAppContext) {
+        let vfs = init_test(cx);
+        vfs.insert_tree("/root", json!({ "sub": {}, "file2.txt": "x" }));
+        let (workspace, cx) = build_workspace(cx);
+        let first = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        first.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        focus_workspace(&workspace, cx);
+        let view = first.read_with(cx, |pane, _| pane.dir_view().clone());
+        view.update(cx, |view, cx| {
+            view.set_cursor(
+                Some(fs_core::EntryId(Arc::from(Path::new("/root/file2.txt")))),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-shift-o");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.panes()[1].read(cx).path(),
+                Some(Path::new("/root")),
+                "a file is not somewhere to open"
+            );
+        });
+    }
+
     #[gpui::test]
     fn cmd_shift_o_splits_and_collapses(cx: &mut TestAppContext) {
         let vfs = init_test(cx);
@@ -2382,7 +2460,10 @@ mod tests {
                 Some(Path::new("/root")),
                 "the split opens where you split from"
             );
-            assert_eq!(second.read(cx).view_mode(), ViewMode::Icons);
+            // The split copies the parent's view mode rather than its
+            // complement: comparing two places is harder when the halves are
+            // drawn differently (deviation from plan §2, by request).
+            assert_eq!(second.read(cx).view_mode(), ViewMode::List);
             assert_eq!(workspace.panes()[0].read(cx).view_mode(), ViewMode::List);
             second
         });
