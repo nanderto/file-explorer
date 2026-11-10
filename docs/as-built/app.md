@@ -1715,3 +1715,11 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
 - `open_with.rs` / `context_menu.rs`: `AddToFavorites`, offered for folders
   only (`favorite_target`) — Favorites is a list of places, so a pinned file
   would have nowhere to navigate to.
+
+- Packaging (M8): `scripts/bundle.sh` builds `File Explorer.app` (and a `.dmg`
+  with `--dmg`) from a release build; `.github/workflows/release.yml` runs the
+  same script on a `v*` tag. Hand-assembled rather than `cargo-bundle` (plan
+  §4) — a `.app` is a directory with an `Info.plist`, and this avoids a pinned
+  dependency while running identically locally and on CI. The release job
+  refuses a tag that disagrees with `Cargo.toml`'s version. Unsigned until an
+  Apple Developer membership exists; the release notes say so.
