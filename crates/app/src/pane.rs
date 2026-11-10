@@ -286,8 +286,16 @@ impl Pane {
             window,
             |this, _, event: &AddressBarEvent, window, cx| match event {
                 AddressBarEvent::Navigated(path) => {
+                    // Committing always closes the editor, *before* the
+                    // navigation is attempted. `load` restores the breadcrumb
+                    // too, but it never runs when the committed path is the
+                    // one already open — `navigate_to` returns early — and the
+                    // editor would then stay open over a navigation that did
+                    // nothing, swallowing every keystroke after it.
+                    this.address_bar = AddressBarMode::Breadcrumb;
                     this.navigate_to(path, cx);
                     window.focus(&this.focus_handle, cx);
+                    cx.notify();
                 }
                 AddressBarEvent::Cancelled => {
                     this.address_bar = AddressBarMode::Breadcrumb;
@@ -373,6 +381,13 @@ impl Pane {
     /// forward stack.
     pub fn navigate_to(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.path.as_deref() == Some(path) {
+            // Going nowhere still ends any path edit. `load` is what normally
+            // restores the breadcrumb, and it does not run here — so without
+            // this, choosing the folder you are already in (committing the
+            // current path, or clicking it in the sidebar) left the editor
+            // open over a navigation that did nothing, swallowing every
+            // keystroke after it.
+            self.close_address_bar(cx);
             return;
         }
         let departed = self.current_nav_entry(cx);
@@ -485,6 +500,18 @@ impl Pane {
         jobs.update(cx, |jobs, cx| {
             jobs.push_notice(COLUMNS_UNAVAILABLE_NOTICE.to_string(), cx);
         });
+    }
+
+    /// Put the breadcrumb back, if the editable path is showing.
+    ///
+    /// Idempotent, and deliberately separate from [`Pane::load`]: the editor's
+    /// lifetime is tied to *a destination having been chosen*, not to the
+    /// listing actually changing.
+    fn close_address_bar(&mut self, cx: &mut Context<Self>) {
+        if self.address_bar == AddressBarMode::Editing {
+            self.address_bar = AddressBarMode::Breadcrumb;
+            cx.notify();
+        }
     }
 
     /// Swap the breadcrumb for the editable path input (`cmd-l`, forwarded by
@@ -1164,6 +1191,25 @@ impl Render for Pane {
             // The details view (header + uniform_list rows).
             self.dir_view.clone().into_any_element()
         };
+        // §3 "breadcrumb that becomes an editable text path": the editor is a
+        // *transient* mode, so pressing anywhere in the listing ends it.
+        //
+        // Capture phase, and a press rather than a click: a row's own handler
+        // consumes the event, and the gesture that matters (marquee, drag)
+        // may never produce a click at all. Focus events cannot serve here —
+        // the field lives inside the pane's own subtree, so moving between
+        // them never re-enters it.
+        //
+        // Without this the editor lingers over a folder it no longer
+        // describes, and keeps swallowing keystrokes.
+        let body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.close_address_bar(cx)))
+            .child(body)
+            .into_any_element();
 
         div()
             .track_focus(&self.focus_handle)
@@ -1356,6 +1402,177 @@ mod tests {
 
     fn entry_id(path: &str) -> EntryId {
         EntryId(Arc::from(Path::new(path)))
+    }
+
+    // ------------------------------------------------------------------
+    // The address bar closes on commit, and tracks the folder on screen.
+    // ------------------------------------------------------------------
+
+    /// Committing the path you are **already in** must still close the
+    /// editor. `navigate_to` returns early when the path is unchanged, and
+    /// `load` is the only thing that restores the breadcrumb — so the editor
+    /// used to stay open over a navigation that "did nothing", swallowing
+    /// every subsequent keystroke.
+    #[gpui::test]
+    fn committing_the_current_path_closes_the_address_bar(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.address_bar_mode()),
+            AddressBarMode::Editing
+        );
+
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.address_bar_mode()),
+            AddressBarMode::Breadcrumb,
+            "committing the current path must still close the editor"
+        );
+    }
+
+    /// The real path a user takes: `cmd-l`, then Enter on the folder they are
+    /// already in. Goes through `AddressBar::confirm` → the `Navigated` event
+    /// → the pane, rather than calling `navigate_to` directly, because that is
+    /// where the editor's lifetime is actually decided.
+    #[gpui::test]
+    fn confirming_the_current_path_through_the_editor_closes_it(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        // Commit the folder already open — the case that used to stick.
+        let bar = pane.read_with(cx, |pane, _| pane.address_bar_view.clone());
+        bar.update_in(cx, |bar, window, cx| {
+            bar.set_value_for_test("/root", window, cx);
+            bar.confirm(cx);
+        });
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/root")));
+            assert_eq!(
+                pane.address_bar_mode(),
+                AddressBarMode::Breadcrumb,
+                "Enter on the current folder must put the breadcrumb back"
+            );
+        });
+    }
+
+    /// And the ordinary case still works: Enter on a different folder both
+    /// navigates and closes.
+    #[gpui::test]
+    fn confirming_a_different_path_navigates_and_closes(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        let bar = pane.read_with(cx, |pane, _| pane.address_bar_view.clone());
+        bar.update_in(cx, |bar, window, cx| {
+            bar.set_value_for_test("/other", window, cx);
+            bar.confirm(cx);
+        });
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/other")));
+            assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
+        });
+    }
+
+    /// The editor is a transient mode: pressing in the listing must end it.
+    /// Without this it sits there showing a path that no longer describes
+    /// what you are doing — which is what "it shows the last thing chosen"
+    /// actually was.
+    #[gpui::test]
+    fn pressing_in_the_listing_dismisses_the_address_bar(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.address_bar_mode()),
+            AddressBarMode::Editing
+        );
+
+        // A press on a row, at the pixels the list actually painted.
+        let row = cx
+            .debug_bounds("dir-row-0")
+            .expect("the listing paints its first row");
+        cx.simulate_mouse_down(row.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.address_bar_mode(),
+                AddressBarMode::Breadcrumb,
+                "pressing in the listing ends the edit"
+            );
+            // The folder did not change, so the breadcrumb still shows it.
+            assert_eq!(pane.path(), Some(Path::new("/root")));
+        });
+    }
+
+    /// Opening the editor and then navigating elsewhere (a sidebar click, a
+    /// double-click, back/forward) must leave the breadcrumb showing the new
+    /// folder rather than a stale editable path.
+    #[gpui::test]
+    fn navigating_elsewhere_closes_the_address_bar(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.path(), Some(Path::new("/other")));
+            assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
+        });
+    }
+
+    /// Re-opening the editor after moving must show the folder you are in
+    /// now, not the one you were in when it was last opened.
+    #[gpui::test]
+    fn the_address_bar_reopens_on_the_current_folder(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/other"), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        cx.run_until_parked();
+
+        let text = pane.read_with(cx, |pane, cx| pane.address_bar_view.read(cx).text(cx));
+        assert_eq!(text, "/other", "the editor opens on the folder on screen");
     }
 
     #[gpui::test]
