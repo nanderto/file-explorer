@@ -42,9 +42,9 @@ use gpui::{
 };
 
 use crate::actions::{
-    Copy, Cut, DeletePermanently, DeleteToTrash, Duplicate, NewFile, NewFolder, OpenSelected,
-    OpenTerminalHere, OpenWith, Paste, Refresh, RenameSelected, SortBy, ToggleHiddenFiles,
-    ToggleTag,
+    Copy, CopyPath, Cut, DeletePermanently, DeleteToTrash, Duplicate, NewFile, NewFolder,
+    OpenSelected, OpenTerminalHere, OpenWith, Paste, Refresh, RenameSelected, SortBy,
+    ToggleHiddenFiles, ToggleTag,
 };
 use fs_core::apps::ExternalApp;
 
@@ -300,6 +300,9 @@ pub fn row_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     // where Finder's "Open With" and Explorer's "Open in Terminal" both are.
     items.extend(open_with_submenu(facts, any));
     items.extend(open_terminal_item(facts, any));
+    // Beside the other "act on this item" rows: the path of what was
+    // right-clicked, matching the button beside the path field.
+    items.push(command("Copy Path", Box::new(CopyPath), any));
     items.extend([
         MenuItem::Separator,
         command("Cut", Box::new(Cut), any),
@@ -373,6 +376,9 @@ pub fn background_menu(facts: &MenuFacts) -> Vec<MenuItem> {
     // "here" means with nothing selected.
     items.extend(open_with_submenu(facts, facts.has_dir));
     items.extend(open_terminal_item(facts, facts.has_dir));
+    // On the background this copies the open folder, which is what the path
+    // field shows when nothing is highlighted.
+    items.push(command("Copy Path", Box::new(CopyPath), facts.has_dir));
     items.extend([
         MenuItem::Separator,
         command("Refresh", Box::new(Refresh), facts.has_dir),
@@ -937,6 +943,7 @@ mod tests {
             named,
             vec![
                 "file_explorer::OpenSelected",
+                "file_explorer::CopyPath",
                 "file_explorer::Cut",
                 "file_explorer::Copy",
                 "file_explorer::Paste",

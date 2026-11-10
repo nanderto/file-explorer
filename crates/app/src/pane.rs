@@ -30,7 +30,8 @@ use fs_core::{
 use futures::StreamExt as _;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
-    NavigationDirection, Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    NavigationDirection, Pixels, Point, Render, SharedString, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 
 use crate::actions::{
@@ -229,6 +230,9 @@ pub struct Pane {
     /// Restore waiting for the fresh snapshot (cache misses).
     pending_restore: Option<NavEntry>,
     address_bar: AddressBarMode,
+    /// Where a right-click on the path landed, while its one-item menu is
+    /// showing. `None` when no menu is open.
+    path_menu: Option<Point<Pixels>>,
     /// Details list or icon grid (§0 "View mode switcher"). Lives here, not
     /// on the DirView, because the pane owns the toolbar control and the §0
     /// handler — and because the DirView's selection must survive the switch.
@@ -357,6 +361,7 @@ impl Pane {
             scroll_top: 0.0,
             pending_restore: None,
             address_bar: AddressBarMode::Breadcrumb,
+            path_menu: None,
             view_mode: ViewMode::default(),
             sort: SortSpec {
                 // Plan §3's "folders always grouped first (setting)" — read
@@ -555,11 +560,107 @@ impl Pane {
     /// the workspace). The input entity itself is the address-bar build step.
     pub fn focus_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.address_bar = AddressBarMode::Editing;
-        let path = self.path.clone();
+        // Prefill with what the breadcrumb was *showing*, not with the open
+        // folder. Those differ whenever something is highlighted, and taking
+        // the open folder meant clicking the path to copy it silently
+        // replaced the path you were looking at with a shorter one.
+        let path = self.display_path(cx).map(|(path, _)| path);
         self.address_bar_view.update(cx, |bar, cx| {
             bar.begin_editing(path.as_deref(), window, cx);
         });
         cx.notify();
+    }
+
+    /// The one-item menu a right-click on the path opens.
+    ///
+    /// Deliberately bespoke and tiny rather than reusing
+    /// [`crate::context_menu`], which is built for — and bound to — the
+    /// listing's `DirView`. One row does not justify making that generic.
+    fn render_path_menu(&self, at: Point<Pixels>, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
+        let hover_bg = theme.accent.opacity(0.15);
+        // `anchored` positions in **window** coordinates, which is what a
+        // `MouseDownEvent` carries. Placing it `absolute` inside the pane
+        // instead offsets it by the pane's own origin — the menu landed over
+        // the listing, a sidebar's width to the right of the pointer.
+        let panel = div()
+            .id("path-menu")
+            .occlude()
+            .w(px(150.0))
+            .p(px(4.0))
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(6.0))
+            .bg(theme.panel)
+            .child(
+                div()
+                    .id("path-menu-copy")
+                    .debug_selector(|| "path-menu-copy".into())
+                    .flex()
+                    .items_center()
+                    .h(px(22.0))
+                    .px(px(6.0))
+                    .rounded(px(3.0))
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.copy_display_path(cx);
+                        this.path_menu = None;
+                        cx.notify();
+                    }))
+                    .child("Copy Path"),
+            );
+        gpui::deferred(gpui::anchored().position(at).snap_to_window().child(panel)).with_priority(1)
+    }
+
+    /// Dismiss the path menu, if one is open.
+    fn close_path_menu(&mut self, cx: &mut Context<Self>) {
+        if self.path_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The Copy button beside the path: puts exactly what the field shows on
+    /// the clipboard.
+    ///
+    /// Beside the path rather than inside the breadcrumb because the
+    /// breadcrumb's segments are navigation targets — a control mixed in
+    /// among them would be one more thing to mis-click.
+    fn render_copy_path(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = crate::theme::theme(cx).clone();
+        let hover_bg = theme.accent.opacity(0.15);
+        let enabled = self.path.is_some();
+        div()
+            .id("copy-path")
+            .debug_selector(|| "copy-path".into())
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded(px(4.0))
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_display_path(cx)))
+            })
+            .child(crate::icons::icon(
+                crate::icons::Icon::Copy,
+                if enabled { theme.muted } else { theme.border },
+            ))
+    }
+
+    /// The path the Copy affordances put on the clipboard: exactly what the
+    /// field is showing.
+    pub fn copy_display_path(&mut self, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.display_path(cx) else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            path.to_string_lossy().into_owned(),
+        ));
     }
 
     /// §0 "New folder" (`cmd-shift-n`, context menu).
@@ -1081,6 +1182,7 @@ impl Pane {
         if self.address_bar == AddressBarMode::Editing {
             return row
                 .child(div().flex_1().child(self.address_bar_view.clone()))
+                .child(self.render_copy_path(cx))
                 .child(self.render_view_switcher(cx))
                 .child(self.search_bar.clone());
         }
@@ -1137,24 +1239,32 @@ impl Pane {
                 segments = segments.child(segment);
             }
         }
-        row.child(segments)
-            .child(
-                // Blank filler: click to edit the path (cmd-l equivalent).
-                div()
-                    .id("breadcrumb-blank")
-                    .flex_1()
-                    .h_full()
-                    .min_h(px(20.0))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.focus_address_bar(window, cx);
-                    })),
-            )
-            .child(self.render_view_switcher(cx))
-            // §0 "Search field focus": the blueprint screenshot's top-right
-            // toolbar control (M6a). Per-pane, at the right-hand end of the
-            // pane's own chrome row, so a split pane gets two independent
-            // searches rather than one that silently retargets.
-            .child(self.search_bar.clone())
+        row.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                this.path_menu = Some(event.position);
+                cx.notify();
+            }),
+        )
+        .child(segments)
+        .child(
+            // Blank filler: click to edit the path (cmd-l equivalent).
+            div()
+                .id("breadcrumb-blank")
+                .flex_1()
+                .h_full()
+                .min_h(px(20.0))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_address_bar(window, cx);
+                })),
+        )
+        .child(self.render_copy_path(cx))
+        .child(self.render_view_switcher(cx))
+        // §0 "Search field focus": the blueprint screenshot's top-right
+        // toolbar control (M6a). Per-pane, at the right-hand end of the
+        // pane's own chrome row, so a split pane gets two independent
+        // searches rather than one that silently retargets.
+        .child(self.search_bar.clone())
     }
 
     /// The §0 "View mode switcher" toolbar control: two segmented buttons
@@ -1251,7 +1361,10 @@ impl Render for Pane {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.close_address_bar(cx)))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.close_address_bar(cx);
+                this.close_path_menu(cx);
+            }))
             .child(body)
             .into_any_element();
 
@@ -1290,7 +1403,11 @@ impl Render for Pane {
             .flex()
             .flex_col()
             .flex_1()
+            .relative()
             .child(self.render_chrome_row(cx))
+            .when_some(self.path_menu, |el, at| {
+                el.child(self.render_path_menu(at, cx))
+            })
             .child(body)
             .child(
                 // Status line
@@ -1659,6 +1776,35 @@ mod tests {
             assert_eq!(pane.path(), Some(Path::new("/root/sub")));
             assert_eq!(pane.address_bar_mode(), AddressBarMode::Breadcrumb);
         });
+    }
+
+    /// Clicking the path to copy it must not replace what you were looking
+    /// at. The editor used to prefill from the *open folder*, so highlighting
+    /// a folder and then clicking the path silently shortened it — and the
+    /// thing you wanted to copy was gone.
+    #[gpui::test]
+    fn clicking_the_path_keeps_the_highlighted_path(cx: &mut TestAppContext) {
+        let _vfs = init_test(cx);
+        let (pane, cx) = build_pane(cx);
+        pane.update(cx, |pane, cx| pane.navigate_to(Path::new("/root"), cx));
+        cx.run_until_parked();
+
+        let view = pane.read_with(cx, |pane, _| pane.dir_view().clone());
+        view.update(cx, |view, cx| {
+            view.set_cursor(Some(EntryId(Arc::from(Path::new("/root/sub")))), cx)
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.focus_address_bar(window, cx));
+        });
+        cx.run_until_parked();
+
+        let text = pane.read_with(cx, |pane, cx| pane.address_bar_view.read(cx).text(cx));
+        assert_eq!(
+            text, "/root/sub",
+            "the editor opens on what the breadcrumb was showing"
+        );
     }
 
     /// The editor is a transient mode: pressing in the listing must end it.

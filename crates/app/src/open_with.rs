@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use fs_core::apps::{ExternalApp, enclosing_directory};
 use gpui::{App, Context, Task};
 
-use crate::actions::{OpenTerminalHere, OpenWith};
+use crate::actions::{CopyPath, OpenTerminalHere, OpenWith};
 use crate::app_state::FsContext;
 use crate::dir_view::DirView;
 
@@ -261,6 +261,23 @@ impl DirView {
     pub(crate) fn handle_open_with(&mut self, action: &OpenWith, cx: &mut Context<Self>) {
         let targets = self.open_with_targets(cx);
         self.launch(action.app.clone(), targets, cx);
+    }
+
+    /// `Copy Path`: the highlighted item's full path, or the open folder
+    /// when nothing is highlighted — the same thing the path field shows, so
+    /// the menu row and the button beside the field always agree.
+    pub(crate) fn handle_copy_path(&mut self, _: &CopyPath, cx: &mut Context<Self>) {
+        let path = match self.command_targets(cx).into_iter().next() {
+            Some((path, _)) => Some(path),
+            None => self
+                .pane_entity()
+                .and_then(|pane| pane.read(cx).path().map(|p| p.to_path_buf())),
+        };
+        if let Some(path) = path {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                path.to_string_lossy().into_owned(),
+            ));
+        }
     }
 
     /// `Open Terminal Here`.
@@ -541,6 +558,32 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(platform.launches().is_empty());
+    }
+
+    /// `Copy Path` puts the highlighted item's path on the clipboard.
+    #[gpui::test]
+    fn copy_path_copies_the_highlighted_item(cx: &mut TestAppContext) {
+        let (_platform, pane, cx) = open_root(cx);
+        let view = dir_view(&pane, cx);
+        view.update(cx, |view, cx| {
+            view.select_paths(&[Path::new("/root/a.txt")], cx);
+            view.handle_copy_path(&CopyPath, cx);
+        });
+        cx.run_until_parked();
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text()));
+        assert_eq!(copied.as_deref(), Some("/root/a.txt"));
+    }
+
+    /// With nothing highlighted it copies the open folder — the same thing
+    /// the path field shows.
+    #[gpui::test]
+    fn copy_path_falls_back_to_the_open_folder(cx: &mut TestAppContext) {
+        let (_platform, pane, cx) = open_root(cx);
+        let view = dir_view(&pane, cx);
+        view.update(cx, |view, cx| view.handle_copy_path(&CopyPath, cx));
+        cx.run_until_parked();
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|i| i.text()));
+        assert_eq!(copied.as_deref(), Some("/root"));
     }
 
     #[test]

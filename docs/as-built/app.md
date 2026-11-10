@@ -1661,3 +1661,17 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   `fs_core::resolve_entered_path`. `AddressBarEvent::OpenFile` is new; the
   pane hands it to the global `Opener` and stays put, because the user asked
   for the file and not its folder.
+
+- `pane.rs`: `copy_display_path` is the single source for every Copy
+  affordance — the button beside the field, the path's own right-click menu,
+  and the listing's `Copy Path` row all put *what the field is showing* on the
+  clipboard, so they cannot disagree. `focus_address_bar` prefills from
+  `display_path` for the same reason; taking the open folder meant clicking
+  the path to copy it replaced the path you wanted.
+  `render_path_menu` is a one-item bespoke menu rather than a reuse of
+  `context_menu.rs` (built for, and bound to, `DirView`), positioned with
+  `deferred(anchored())` in **window** coordinates — `absolute` inside the
+  pane offsets it by the pane's own origin.
+- `icons.rs`: `Icon::Copy` (vendored ISC Lucide `copy.svg`).
+- `context_menu.rs` / `open_with.rs`: a `CopyPath` action, offered on both the
+  row menu (the right-clicked item) and the background menu (the open folder).

@@ -16,6 +16,9 @@ actions!(
         OpenSelected,
         // M8: "Open Terminal Here" (context menu only; no chord in §0).
         OpenTerminalHere,
+        // Put the path of what is highlighted on the clipboard (context menu
+        // and the button beside the path field; no chord in §0).
+        CopyPath,
         GoUp,
         GoBack,
         GoForward,

@@ -81,6 +81,8 @@ pub enum Icon {
     Info,
     /// The settings pane toggle.
     Settings,
+    /// Copy the path to the clipboard.
+    Copy,
 }
 
 impl Icon {
@@ -91,6 +93,7 @@ impl Icon {
             Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
             Icon::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),
             Icon::Check => include_bytes!("../assets/icons/check.svg"),
+            Icon::Copy => include_bytes!("../assets/icons/copy.svg"),
             Icon::Folder => include_bytes!("../assets/icons/folder.svg"),
             Icon::Drive => include_bytes!("../assets/icons/hard-drive.svg"),
             Icon::Cloud => include_bytes!("../assets/icons/cloud.svg"),
@@ -118,6 +121,7 @@ impl Icon {
         Icon::ChevronDown,
         Icon::ChevronUp,
         Icon::Check,
+        Icon::Copy,
         Icon::Folder,
         Icon::Drive,
         Icon::Cloud,
