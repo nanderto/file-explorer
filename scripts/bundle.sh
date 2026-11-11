@@ -55,6 +55,20 @@ else
   echo "    (no AppIcon.icns yet — the bundle gets the generic icon)"
 fi
 
+# Ad-hoc sign the assembled bundle.
+#
+# Not a substitute for a Developer ID — Gatekeeper still calls this an
+# unidentified developer. It fixes a different problem: Rust's linker ad-hoc
+# signs the bare binary, and that signature stops matching the moment the
+# binary is put in a bundle with an Info.plist and a Resources folder.
+# `spctl` then reports "code has no resources but signature indicates they
+# must be present", and macOS can refuse to run the app at all — or call it
+# *damaged* — even when the user tries to allow it. Signing the whole bundle
+# makes it internally consistent.
+echo "==> ad-hoc signing"
+codesign --force --sign - --timestamp=none "$APP"
+codesign --verify --deep --strict "$APP" && echo "    signature is internally consistent"
+
 echo "==> $APP"
 
 if [ "${1:-}" = "--dmg" ]; then
