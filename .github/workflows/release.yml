@@ -33,22 +33,36 @@ jobs:
       - name: Bundle
         run: ./scripts/bundle.sh --dmg
 
+      # A tag may carry a pre-release suffix — `v0.1.0-beta.1` — but its
+      # numeric part must still match Cargo.toml, or the download would report
+      # a version the app does not.
       - name: Check the version matches the tag
+        id: version
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$TAG" != "v$VERSION" ]; then
+          BASE="${TAG#v}"           # v0.1.0-beta.1 -> 0.1.0-beta.1
+          NUM="${BASE%%-*}"         #                  -> 0.1.0
+          if [ "$NUM" != "$VERSION" ]; then
             echo "::error::tag $TAG does not match Cargo.toml version $VERSION"
             exit 1
           fi
+          # Anything after the first `-` makes this a pre-release, which
+          # GitHub should label as such rather than offering it as "Latest".
+          if [ "$BASE" = "$NUM" ]; then
+            echo "prerelease=" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          VERSION="${TAG#v}"
-          gh release create "$TAG" \
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "$TAG" ${{ steps.version.outputs.prerelease }} \
             --title "File Explorer $TAG" \
             --notes "$(cat <<'NOTES'
 ### Install
