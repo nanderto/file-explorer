@@ -1736,3 +1736,10 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
 - Packaging: `scripts/make_icon.swift` / `make_icon.sh` generate
   `AppIcon.icns` from the app's palette — code, not a committed binary, so it
   is diffable and regenerable.
+
+- Packaging (fix): `scripts/bundle.sh` ad-hoc signs the assembled bundle.
+  Without it the linker's signature on the bare binary no longer matches once
+  the binary sits in a bundle with resources, and `spctl` reports a *broken*
+  signature — which macOS may refuse to run even when the user allows it.
+  Ad-hoc signing is not a Developer ID: Gatekeeper still rejects the app as
+  unnotarised, which is the override-able case.
