@@ -64,30 +64,6 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           gh release create "$TAG" ${{ steps.version.outputs.prerelease }} \
             --title "File Explorer $TAG" \
-            --notes "$(cat <<'NOTES'
-### Install
-
-1. Download the `.dmg`, open it, and drag **File Explorer** to Applications.
-2. Open it once. macOS will refuse, because this build is **not notarised**.
-3. Go to **System Settings → Privacy & Security**, scroll to **Security**, and
-   click **Open Anyway** next to the message about File Explorer. Confirm.
-
-You only need that once.
-
-> Right-click → Open no longer works for this: macOS 15 removed that bypass
-> for software that is not notarised. System Settings is the way now.
-
-If you would rather use the Terminal, this does the same thing in one step:
-
-```
-xattr -dr com.apple.quarantine "/Applications/File Explorer.app"
-```
-
-**Why the warning?** Notarising requires an Apple Developer Program
-membership. The app is ad-hoc signed, so the bundle is intact and macOS can
-verify it has not been tampered with since it was built — but Apple has not
-vouched for it, and macOS says so.
-NOTES
-)" \
+            --notes-file .github/release-notes.md \
             "target/bundle/FileExplorer-$VERSION.dmg" \
             || gh release upload "$TAG" "target/bundle/FileExplorer-$VERSION.dmg" --clobber
