@@ -181,6 +181,11 @@ pub struct Workspace {
     /// replacing it cancels the pending flush, which is exactly what a further
     /// navigation should do.
     _recents_flush: Option<gpui::Task<()>>,
+    /// A newer release, once the one-shot check has found one. Dismissing
+    /// clears it for this launch only — the next launch asks again.
+    available_update: Option<crate::update::AvailableUpdate>,
+    /// The one-shot update check; a field, never detached (§5).
+    _update_check: Option<gpui::Task<()>>,
     /// The system light/dark switch, for `appearance: system` themes.
     _appearance_observer: Subscription,
     _subscriptions: Vec<Subscription>,
@@ -243,6 +248,8 @@ impl Workspace {
             _subscriptions: vec![sidebar_subscription, jobs_subscription],
             _settings_observer: settings_observer,
             _recents_flush: None,
+            available_update: None,
+            _update_check: None,
             _appearance_observer: appearance_observer,
         };
         // The panel opens describing the pane's state, not a stale default.
@@ -1318,6 +1325,93 @@ impl Focusable for Workspace {
     }
 }
 
+impl Workspace {
+    /// Ask once, in the background, whether a newer release exists.
+    ///
+    /// Skipped entirely when the user has turned it off — the request is not
+    /// made and then ignored, it is not made.
+    pub fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        if self._update_check.is_some() || !crate::update::enabled(cx) {
+            return;
+        }
+        let platform = crate::app_state::FsContext::global(cx).platform.clone();
+        let current = fs_core::Version::current();
+        self._update_check = Some(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(crate::update::check(platform, current))
+                .await;
+            if let Some(found) = found {
+                this.update(cx, |this, cx| {
+                    this.available_update = Some(found);
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
+    /// Stop showing the bar for this launch.
+    fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        self.available_update = None;
+        cx.notify();
+    }
+
+    /// A thin bar under the titlebar: what is available, and a link. It never
+    /// covers content — it is part of the column, so the panes shrink by its
+    /// height rather than being overdrawn.
+    fn render_update_banner(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        let update = self.available_update.clone()?;
+        let theme = crate::theme::theme(cx).clone();
+        let url = update.url.clone();
+        Some(
+            div()
+                .id("update-banner")
+                .debug_selector(|| "update-banner".into())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(28.0))
+                .px(px(12.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.accent.opacity(0.18))
+                .text_size(px(12.0))
+                .text_color(theme.text)
+                .child(SharedString::from(format!(
+                    "File Explorer {} is available — you have {}.",
+                    update.version,
+                    fs_core::Version::current()
+                )))
+                .child(
+                    div()
+                        .id("update-banner-open")
+                        .debug_selector(|| "update-banner-open".into())
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .hover(|s| s.opacity(0.8))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            crate::app_state::FsContext::global(cx)
+                                .opener
+                                .open(std::path::Path::new(url.as_ref()));
+                            this.dismiss_update(cx);
+                        }))
+                        .child("Release notes"),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("update-banner-dismiss")
+                        .debug_selector(|| "update-banner-dismiss".into())
+                        .cursor_pointer()
+                        .child(crate::icons::icon(crate::icons::Icon::Close, theme.muted))
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_update(cx))),
+                ),
+        )
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx).clone();
@@ -1389,6 +1483,7 @@ impl Render for Workspace {
                             .child(self.jobs_indicator.clone()),
                     ),
             )
+            .children(self.render_update_banner(cx))
             // Body: sidebar | pane(s) | info panel, separated by splitters
             .child(
                 div()
@@ -1443,6 +1538,23 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    /// `init_test`, but with a caller-supplied platform — the update tests
+    /// need one whose `http_get_text` they have seeded.
+    fn init_test_with_platform(cx: &mut TestAppContext, platform: Arc<fs_core::StubPlatform>) {
+        cx.update(|cx| {
+            let spawner: Arc<dyn Spawner> =
+                Arc::new(GpuiSpawner::new(cx.background_executor().clone()));
+            let vfs = FakeVfs::new(spawner.clone());
+            vfs.insert_tree("/root", json!({ "a.txt": "a" }));
+            crate::keymap::init(cx);
+            crate::app_state::install(cx, vfs, spawner, Arc::new(LoggingOpener), platform);
+            crate::settings::init_with_path(
+                cx,
+                std::path::PathBuf::from("/config/file-explorer/settings.json"),
+            );
+        })
+    }
+
     fn init_test(cx: &mut TestAppContext) -> Arc<FakeVfs> {
         cx.update(|cx| {
             let spawner: Arc<dyn Spawner> =
@@ -1469,6 +1581,72 @@ mod tests {
             );
             vfs
         })
+    }
+
+    // ------------------------------------------------------------------
+    // The update banner (notify-only; see `crate::update`).
+    // ------------------------------------------------------------------
+
+    /// The whole surface: a newer release is served, the check runs, and a
+    /// bar appears offering the release notes.
+    #[gpui::test]
+    fn a_newer_release_shows_a_dismissible_banner(cx: &mut TestAppContext) {
+        let platform = Arc::new(fs_core::StubPlatform::new());
+        platform.set_http_response(Some(
+            r#"{"tag_name":"v9.9.9","html_url":"https://example.invalid/r"}"#.to_string(),
+        ));
+        init_test_with_platform(cx, platform);
+        let (workspace, cx) = build_workspace(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.check_for_update(cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("update-banner").is_some(),
+            "the bar is showing"
+        );
+
+        let dismiss = cx
+            .debug_bounds("update-banner-dismiss")
+            .expect("the dismiss control painted");
+        cx.simulate_click(dismiss.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("update-banner").is_none(),
+            "dismissing hides it"
+        );
+    }
+
+    /// Nothing newer, nothing shown — the common case, and the one that must
+    /// never put a bar on screen.
+    #[gpui::test]
+    fn the_current_version_shows_no_banner(cx: &mut TestAppContext) {
+        let platform = Arc::new(fs_core::StubPlatform::new());
+        platform.set_http_response(Some(format!(
+            r#"{{"tag_name":"v{}"}}"#,
+            fs_core::Version::current()
+        )));
+        init_test_with_platform(cx, platform);
+        let (workspace, cx) = build_workspace(cx);
+        workspace.update(cx, |workspace, cx| workspace.check_for_update(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-banner").is_none());
+    }
+
+    /// Turned off means the request is never made, not made and ignored.
+    #[gpui::test]
+    fn the_check_does_not_run_when_switched_off(cx: &mut TestAppContext) {
+        let platform = Arc::new(fs_core::StubPlatform::new());
+        platform.set_http_response(Some(r#"{"tag_name":"v9.9.9"}"#.to_string()));
+        init_test_with_platform(cx, platform);
+        cx.update(|cx| {
+            cx.update_global::<crate::settings::AppSettings, bool>(|settings, _| {
+                settings.set_check_for_updates(false)
+            });
+        });
+        let (workspace, cx) = build_workspace(cx);
+        workspace.update(cx, |workspace, cx| workspace.check_for_update(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-banner").is_none());
     }
 
     fn build_workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {

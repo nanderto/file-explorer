@@ -1723,3 +1723,16 @@ Back to the index: [docs/AS_BUILT.md](../AS_BUILT.md).
   dependency while running identically locally and on CI. The release job
   refuses a tag that disagrees with `Cargo.toml`'s version. Unsigned until an
   Apple Developer membership exists; the release notes say so.
+
+- `update.rs` + `workspace.rs` (M8, notify-only): one GET to the GitHub
+  releases API at launch, compared against `CARGO_PKG_VERSION`, and a
+  dismissible bar under the titlebar if something newer exists. Silent on
+  every failure, once per launch, and skipped entirely when
+  `check_for_updates` is off. It does not download or install — that is
+  Sparkle's job, and this does not pre-empt it while building the pieces
+  (version comparison, the "tell the user" surface) a real updater reuses.
+  The bar is part of the column, so panes shrink by its height rather than
+  being overdrawn.
+- Packaging: `scripts/make_icon.swift` / `make_icon.sh` generate
+  `AppIcon.icns` from the app's palette — code, not a committed binary, so it
+  is diffable and regenerable.

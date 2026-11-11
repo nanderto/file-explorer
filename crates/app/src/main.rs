@@ -60,6 +60,9 @@ fn main() {
                 pane.update(cx, |pane, cx| pane.navigate_to(&home, cx));
                 let dir_view = pane.read(cx).dir_view().clone();
                 window.focus(&dir_view.focus_handle(cx), cx);
+                // One GET, once per launch, and silent unless there is
+                // something newer (see `file_explorer_app::update`).
+                workspace.check_for_update(cx);
             })
             .expect("failed to open the initial directory");
         cx.activate(true);

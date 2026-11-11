@@ -47,6 +47,9 @@ pub struct StubPlatform {
     /// never spawn a GUI application — so recording the request is the only
     /// way a test can assert that the right app got the right path.
     launches: Mutex<Vec<StubLaunch>>,
+    /// What [`Platform::http_get_text`] hands back; `None` by default, which
+    /// is the "no answer" every failure mode collapses to.
+    http_response: Mutex<Option<String>>,
 }
 
 /// One recorded launch request. [`StubLaunch::app`] is the bundle id, or
@@ -104,7 +107,13 @@ impl StubPlatform {
             tags: Mutex::new(BTreeMap::new()),
             ownership: Mutex::new(BTreeMap::new()),
             launches: Mutex::new(Vec::new()),
+            http_response: Mutex::new(None),
         }
+    }
+
+    /// Seed the body [`Platform::http_get_text`] returns.
+    pub fn set_http_response(&self, body: Option<String>) {
+        *self.http_response.lock().unwrap() = body;
     }
 
     /// Everything [`Platform::open_with`] / [`Platform::open_default`] was
@@ -291,6 +300,12 @@ impl Platform for StubPlatform {
                 strategy: LaunchStrategy::SystemOpen,
             },
         ]
+    }
+
+    /// Whatever [`StubPlatform::set_http_response`] was given, or `None`.
+    /// Never touches the network — a test run must not depend on one.
+    async fn http_get_text(&self, _url: &str) -> Option<String> {
+        self.http_response.lock().unwrap().clone()
     }
 
     async fn terminal(&self) -> Option<ExternalApp> {
