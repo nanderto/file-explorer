@@ -22,70 +22,53 @@ Keep it truthful — these files are only useful if they match the code.
 
 ## Status
 
-**M8 (partial) — the Open with ▸ list is now the system's own.** The submenu is
-populated from **Launch Services**, macOS's equivalent of the registry keys a
-Windows installer writes: an application declares its document types in
-`Info.plist`, the system registers them at install, and `NSWorkspace` reads
-them back. Install an editor and it appears with no code change.
+**v0.1.0 — M0–M7d complete, M8 substantially under way.** The app browses,
+operates on files, searches, tags, themes itself, and now packages into a real
+`.app` that installs and runs from `/Applications`.
 
-* **Type-aware**, which a hard-coded list cannot be. Verified on the
-  development Mac: a `.rs` file offers Zed and VS Code, a folder offers seven
-  applications, a `.txt` offers eighteen — default handler first, as Finder
-  does it.
-* **The Space guarantee survives, and is now explicit.** Launch Services says
-  *which* applications can open a file; it never says *how to open a new window*
-  in one, and that is what keeps the window on the Space the user is looking at.
-  So the two are separated: `RECIPES` (Zed, VS Code) carry
-  `LaunchStrategy::NewWindow` and the guarantee; everything else gets
-  `SystemOpen`, which is best-effort and may switch Spaces — the same thing
-  Finder does. `keeps_current_space()` makes the difference legible instead of
-  a surprise.
-* **Verified end to end in the running app**: right-click a `.txt`, the
-  submenu lists eighteen real applications, click Zed — the Space does not
-  change and a new Zed window holding that file appears on it.
-* **De-duplication is load-bearing**, not hygiene: this machine reports
-  **three** Microsoft Edge bundles from updater staging directories.
-* **Terminals stay curated** (iTerm, Ghostty, WezTerm, Terminal, in that
-  preference order) because a terminal is not a document handler and never
-  appears in Launch Services' answer for a folder.
-* A prefetch of every **visible** type backs the menu, because a right-click
-  changes the selection and opens the menu in one gesture — there is no moment
-  to await in. Caught by the end-to-end test, which failed exactly that way
-  first.
-* Cost: a new `objc2-app-kit` dependency (`default-features = false`, one
-  feature), and therefore a full workspace rebuild.
+Since the last milestone entry, by request and in this order:
 
-**M8 (partial) — Open with ▸ / Open Terminal Here, and "Open" finally opens.**
-Not a milestone, a feature landed ahead of M8's main lanes (see
-`docs/M8_PLAN.md`).
+* **The path field names what is highlighted**, not the folder that is open.
+  The listing expands folders *in place*, so those two routinely disagree; a
+  field naming the open folder just echoed the last sidebar click and went
+  stale. It names the cursor row — a folder, or a file in full. `Enter`
+  resolves three ways: a folder navigates, a **file opens in its default
+  application**, and a path whose tail no longer exists lands at the deepest
+  part that does.
+* **Copying the path** — a button inside the path box with a tooltip,
+  right-click → Copy Path on the path itself, and `Copy Path` in the listing's
+  context menu. All read the same source, so they cannot disagree.
+* **Colour.** The theme has carried a `file_colors` palette since M7a and
+  nothing painted it. `fs-core/src/kind.rs` classifies by extension and the
+  three views tint from it; the sidebar is coloured too, with the **Trash in
+  the error colour** — the one row where acting has consequences. Chrome stays
+  monochrome.
+* **Two softer themes** — `Slate Dark` and `Parchment Light` beside the
+  high-contrast graphite pair. Four built-ins, two per appearance.
+* **Sidebar** — roomier rows, `Add to Favorites` on folders, `Remove from
+  Recents`, and neither the Trash nor the filesystem root wasting a slot in a
+  capped Recents list.
+* **Packaging** — `scripts/bundle.sh` builds `File Explorer.app` and a `.dmg`;
+  `scripts/make_icon.sh` generates the icon from the app's own palette;
+  `.github/workflows/release.yml` publishes a GitHub Release from a `v*` tag.
+  The bundle is **ad-hoc signed** — not a Developer ID, but enough that the
+  bundle is internally consistent rather than *broken*, which macOS may refuse
+  to run even when the user allows it.
+* **Update notification** — one GET per launch against the GitHub releases
+  API, a dismissible bar if something newer exists. Silent on every failure,
+  once per launch, opt-out. It does **not** download or install: that is
+  Sparkle's job and this does not pre-empt it.
+* **Licensing and docs** — `LICENSE` (MIT), `THIRD-PARTY-NOTICES.md`, and a
+  `README.md`. Nothing in the tree is copyleft: the vendored text input is
+  MIT (`crates/app/VENDORED.md`), the icons are ISC, gpui is Apache-2.0, and
+  Zed's GPL application crates were read as reference but never copied.
 
-* **The point of it is Spaces.** macOS defaults to "when switching to an
-  application, switch to a Space with open windows for the application", so
-  `open -a Zed` **activates** Zed and drags you to whichever Space it already
-  has windows on. Every launch here asks the app for a **new window**
-  instead — `zed -n`, `code -n` — which macOS creates on the Space you are
-  actually looking at. Verified on the development Mac with the editors'
-  windows on another Space: the Space does not change and the new window
-  appears here. `fs_core::apps` documents it, and
-  `no_editor_is_launched_by_activating_the_application` fails if anyone
-  "simplifies" it back to `open -a`.
-* **In-bundle CLIs, not `$PATH`.** Homebrew's `zed`/`code` are symlinks into
-  the bundles, but a bundled `.app` does not inherit a login shell's `PATH` —
-  so once M8e ships, `/opt/homebrew/bin` is gone. The CLI is addressed through
-  the discovered bundle.
-* **Only what is installed** is offered, and a bundle whose CLI is missing is
-  refused rather than offered-and-degraded. Nothing discovered ⇒ the rows are
-  omitted entirely, not greyed.
-* **Terminal is a top-level row**, not a submenu entry: it is about the
-  folder, not the file under the pointer. It opens exactly **one** terminal —
-  a selected folder, a selected file's parent, or the folder on screen.
-* **"Open" was a stub until now.** `app_state.rs` still installed M1's
-  `LoggingOpener` in the shipped app, so the context menu's "Open", a
-  double-click and `enter` on a file printed to stderr and did nothing.
-  `PlatformOpener` replaces it. Shipping "Open with Zed" beside a dead "Open"
-  would have been absurd.
-* **Baselines**: `context_menu_open` gains two rows and **has not been
-  regenerated** — see Known gaps.
+**What M8 still owes**: tabs per pane, the full menu bar, a performance pass,
+and signing/notarisation — which needs a paid Apple Developer membership and
+is therefore a purchasing decision, not a coding one. See
+[`docs/M8_PLAN.md`](M8_PLAN.md), whose §0 records that
+`ARCHITECTURE.md` §10's claim that tabs are "nearly free" does not match
+`pane.rs`.
 
 M7d-b remains as built below — the sidebar is a peer of Finder's, and M7d is
 complete.
