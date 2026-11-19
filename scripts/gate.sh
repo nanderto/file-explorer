@@ -30,6 +30,23 @@ if [ "$MODE" != "ci-diff" ]; then
   fi
 fi
 
+# ---------- workflow YAML must parse ----------
+# A malformed workflow does not fail loudly: GitHub reports a 0-second run and
+# falls back to showing the file path instead of the workflow name, so a broken
+# release pipeline looks like a failed build. Caught here instead, since
+# nothing else in this gate reads these files.
+#
+# `ruby -ryaml` because it ships with macOS; python3 here has no yaml module
+# and actionlint would be another pinned tool for one check.
+if [ "$MODE" != "ci-diff" ] && command -v ruby >/dev/null 2>&1; then
+  for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -e "$wf" ] || continue
+    ruby -ryaml -e 'YAML.load_file(ARGV[0])' "$wf" >/dev/null 2>&1 \
+      || fail workflow "$wf is not valid YAML — GitHub would report a 0s failure"
+  done
+  echo "gate: workflow YAML parses"
+fi
+
 # ---------- diff checks: code changes must ship with tests and AS_BUILT.md updates ----------
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
   echo "gate: not a git repo yet — diff checks skipped"
